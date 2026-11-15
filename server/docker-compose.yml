@@ -14,7 +14,8 @@ services:
     container_name: shepit
     restart: unless-stopped
     ports:
-      - "8443:8443"
+      # За nginx на тій самій машині: SHEPIT_BIND=127.0.0.1 у .env (не відкривати порт назовні).
+      - "${SHEPIT_BIND:-0.0.0.0}:8443:8443"
     volumes:
       - ./data:/data
     mem_limit: 256m
