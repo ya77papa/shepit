@@ -1,4 +1,4 @@
-# Запуск сервера Шепіт на SRV.
+# Запуск сервера Шепіт.
 #
 #   mkdir -p data && sudo chown 10001:10001 data   # один раз: тут ключі сервера
 #   docker compose pull && docker compose up -d

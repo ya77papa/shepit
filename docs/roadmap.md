@@ -8,8 +8,8 @@
 - [~] ADR-0002: криптографія — 1:1 на libsignal вирішено; групи (Sender Keys vs OpenMLS) — відкрито
 - [ ] ADR-0003: формат конверта повідомлення
 - [x] Каркас Rust workspace у `core/`, `server/`, `clients/cli/`
-- [x] Docker-образ сервера (GitHub Actions → ghcr.io) і docker-compose для SRV
-- [x] Вихід в інтернет: VPS (nginx + Let's Encrypt) → Tailscale → SRV — див. docs/deploy.md
+- [x] Docker-образ сервера (GitHub Actions → ghcr.io) і docker-compose
+- [x] Вихід в інтернет: VPS (nginx + Let's Encrypt) — див. docs/deploy.md
 - [x] Прототип: два CLI-клієнти обмінюються зашифрованим повідомленням через сервер (PQXDH + Double Ratchet)
 - [x] Sealed sender: сервер не бачить відправника
 - [x] Автентифікація запитів підписом ключа ідентичності
