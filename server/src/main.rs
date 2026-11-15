@@ -8,7 +8,8 @@
 //! | GET   | /v0/keys/{identity}     | —      | пакет ключів людини (забирає 1 одноразовий) |
 //! | GET   | /v0/certificate         | так    | сертифікат відправника на 24 год |
 //! | POST  | /v0/send                | —      | покласти конверт у скриньку (sealed sender: відправник невідомий) |
-//! | GET   | /v0/mailbox/{id}        | так    | забрати конверти (тільки власник скриньки) |
+//! | GET   | /v0/mailbox/{id}        | так    | переглянути конверти (тільки власник скриньки) |
+//! | POST  | /v0/mailbox/{id}/ack    | так    | «отримав і зберіг до N» — сервер видаляє |
 //!
 //! Також роздає веб-клієнт зі `$SHEPIT_WEB` (типово `./web`, якщо тека існує).
 //!
@@ -33,7 +34,7 @@ use axum::{
 };
 use shepit_core::{
     auth::{now_ms, Auth, Issuer, HEADER, MAX_SKEW_MS},
-    wire::{Envelope, KeyUpload, MailboxId, PreKeyBundle},
+    wire::{Ack, Envelope, KeyUpload, MailboxId, MailboxItem, PreKeyBundle},
 };
 
 struct App {
@@ -54,6 +55,7 @@ type Shared = Arc<App>;
 const MAX_PAYLOAD_HEX: usize = 2 * 64 * 1024;
 const MAX_QUEUE: usize = 1000;
 const MAX_ONE_TIME: usize = 100;
+const FETCH_LIMIT: usize = 100;
 
 /// Перевірити підпис запиту і повернути ідентичність того, хто його підписав.
 fn authenticate(app: &App, headers: &HeaderMap, purpose: &str, body: &[u8]) -> Result<String, StatusCode> {
@@ -126,15 +128,33 @@ async fn send(State(app): State<Shared>, Json(env): Json<Envelope>) -> StatusCod
     }
 }
 
-async fn fetch(State(app): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> Result<Json<Vec<Envelope>>, StatusCode> {
-    let who = authenticate(&app, &headers, &format!("GET /v0/mailbox/{id}"), b"")?;
-    let mailbox = MailboxId::from_hex(&id).ok_or(StatusCode::BAD_REQUEST)?;
-    let who_bytes = hex::decode(&who).map_err(|_| StatusCode::BAD_REQUEST)?;
-    // Забрати пошту може лише власник скриньки.
+/// Скринька, якою володіє той, хто підписав запит (інакше 403).
+fn own_mailbox(who: &str, id: &str) -> Result<MailboxId, StatusCode> {
+    let mailbox = MailboxId::from_hex(id).ok_or(StatusCode::BAD_REQUEST)?;
+    let who_bytes = hex::decode(who).map_err(|_| StatusCode::BAD_REQUEST)?;
     if MailboxId::for_identity(&who_bytes) != mailbox {
         return Err(StatusCode::FORBIDDEN);
     }
-    Ok(Json(app.db.drain(&mailbox).map_err(internal)?))
+    Ok(mailbox)
+}
+
+async fn fetch(State(app): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> Result<Json<Vec<MailboxItem>>, StatusCode> {
+    let who = authenticate(&app, &headers, &format!("GET /v0/mailbox/{id}"), b"")?;
+    let mailbox = own_mailbox(&who, &id)?;
+    Ok(Json(app.db.list(&mailbox, FETCH_LIMIT).map_err(internal)?))
+}
+
+async fn ack(State(app): State<Shared>, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> StatusCode {
+    let r = (|| {
+        let who = authenticate(&app, &headers, &format!("POST /v0/mailbox/{id}/ack"), &body)?;
+        let mailbox = own_mailbox(&who, &id)?;
+        let a: Ack = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+        app.db.ack(&mailbox, a.upto).map_err(internal)
+    })();
+    match r {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(s) => s,
+    }
 }
 
 fn data_dir() -> PathBuf {
@@ -198,6 +218,7 @@ fn app(issuer: Issuer, db: db::Db) -> Router {
         .route("/v0/certificate", get(certificate))
         .route("/v0/send", post(send))
         .route("/v0/mailbox/{id}", get(fetch))
+        .route("/v0/mailbox/{id}/ack", post(ack))
         .with_state(shared)
         .layer(SetResponseHeaderLayer::overriding(header::CACHE_CONTROL, HeaderValue::from_static("no-store")));
 

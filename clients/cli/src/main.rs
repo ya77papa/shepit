@@ -13,7 +13,7 @@ use std::{path::PathBuf, process::exit};
 use shepit_core::{
     auth::HEADER,
     crypto::{self, Account},
-    wire::{self, Envelope, MailboxId, PreKeyBundle},
+    wire::{self, Ack, Envelope, MailboxId, MailboxItem, PreKeyBundle},
 };
 
 fn server() -> String {
@@ -161,21 +161,30 @@ fn main() {
             let mut acc = load(profile);
             ensure_keys(&mut acc, profile);
             let mb = acc.mailbox().to_hex();
-            let envs: Vec<Envelope> = ureq::get(format!("{}/v0/mailbox/{mb}", server()))
+            let items: Vec<MailboxItem> = ureq::get(format!("{}/v0/mailbox/{mb}", server()))
                 .header(HEADER, acc.auth_header(&format!("GET /v0/mailbox/{mb}"), b""))
                 .call()
                 .and_then(|mut r| r.body_mut().read_json())
                 .unwrap_or_else(|e| http_err("скринька", e));
-            if envs.is_empty() {
+            if items.is_empty() {
                 println!("Нових повідомлень немає.");
+                return;
             }
-            for env in envs {
+            for it in &items {
+                let env = &it.envelope;
                 match env.payload_bytes().ok_or(crypto::Error::Malformed("hex")).and_then(|p| acc.decrypt(&p)) {
                     Ok((from, text)) => println!("[{}…] {text}", short(&from)),
                     Err(e) => println!("(відкинуто: {e})"),
                 }
             }
+            // Спершу зберегти стан, потім підтвердити — тоді збій нічого не загубить.
             acc.save(&path(profile)).unwrap_or_else(|e| die(e));
+            let body = serde_json::to_vec(&Ack { upto: items.last().unwrap().id }).expect("serialize");
+            ureq::post(format!("{}/v0/mailbox/{mb}/ack", server()))
+                .header(HEADER, acc.auth_header(&format!("POST /v0/mailbox/{mb}/ack"), &body))
+                .header("content-type", "application/json")
+                .send(&body[..])
+                .unwrap_or_else(|e| http_err("підтвердження", e));
         }
         _ => usage(),
     }

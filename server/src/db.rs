@@ -6,7 +6,7 @@
 use std::{path::Path, sync::Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension};
-use shepit_core::wire::{Envelope, KeyUpload, MailboxId, PreKeyBundle};
+use shepit_core::wire::{Envelope, KeyUpload, MailboxId, MailboxItem, PreKeyBundle};
 
 pub struct Db(Mutex<Connection>);
 
@@ -85,19 +85,25 @@ impl Db {
         Ok(true)
     }
 
-    /// Забрати всі конверти зі скриньки (і видалити їх).
-    pub fn drain(&self, mailbox: &MailboxId) -> rusqlite::Result<Vec<Envelope>> {
-        let mut c = self.0.lock().unwrap();
-        let tx = c.transaction()?;
-        let mb = mailbox.to_hex();
-        let out = {
-            let mut st = tx.prepare("SELECT envelope FROM envelopes WHERE mailbox = ?1 ORDER BY id")?;
-            let rows = st.query_map([&mb], |r| r.get::<_, String>(0))?;
-            rows.filter_map(|r| r.ok().and_then(|j| serde_json::from_str(&j).ok())).collect()
-        };
-        tx.execute("DELETE FROM envelopes WHERE mailbox = ?1", [&mb])?;
-        tx.commit()?;
-        Ok(out)
+    /// Переглянути конверти у скриньці (до `limit`). НЕ видаляє — це робить [`Db::ack`].
+    pub fn list(&self, mailbox: &MailboxId, limit: usize) -> rusqlite::Result<Vec<MailboxItem>> {
+        let c = self.0.lock().unwrap();
+        let mut st = c.prepare("SELECT id, envelope FROM envelopes WHERE mailbox = ?1 ORDER BY id LIMIT ?2")?;
+        let rows = st.query_map(params![mailbox.to_hex(), limit as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(rows
+            .filter_map(|r| r.ok())
+            .filter_map(|(id, j)| Some(MailboxItem { id, envelope: serde_json::from_str(&j).ok()? }))
+            .collect())
+    }
+
+    /// Клієнт отримав і зберіг усе до `upto` — видалити.
+    pub fn ack(&self, mailbox: &MailboxId, upto: i64) -> rusqlite::Result<usize> {
+        self.0
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM envelopes WHERE mailbox = ?1 AND id <= ?2", params![mailbox.to_hex(), upto])
     }
 
     /// Видалити недоставлені конверти, старші за 30 днів.
@@ -137,8 +143,11 @@ mod tests {
         assert_eq!(db.one_time_left("05ab").unwrap(), Some(2));
         assert!(db.take_bundle("05ab").unwrap().unwrap().one_time.is_some());
         assert_eq!(db.one_time_left("05ab").unwrap(), Some(1));
-        assert_eq!(db.drain(&mb).unwrap().len(), 1);
-        assert_eq!(db.drain(&mb).unwrap().len(), 0);
+        let items = db.list(&mb, 100).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(db.list(&mb, 100).unwrap().len(), 1, "без ack нічого не зникає");
+        assert_eq!(db.ack(&mb, items[0].id).unwrap(), 1);
+        assert_eq!(db.list(&mb, 100).unwrap().len(), 0);
         assert_eq!(db.one_time_left("nobody").unwrap(), None);
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -118,7 +118,7 @@ impl WebAccount {
         serde_json::to_string(&Envelope::new(to, &payload)).map_err(js_err)
     }
 
-    /// Розшифрувати конверт (один елемент масиву з `GET /v0/mailbox/{id}`).
+    /// Розшифрувати конверт (поле `envelope` елемента з `GET /v0/mailbox/{id}`).
     /// Повертає JSON `{ "from": ключ-відправника, "text": текст }`.
     #[wasm_bindgen(js_name = openEnvelope)]
     pub fn open_envelope(&mut self, envelope_json: &str) -> Result<String, JsError> {

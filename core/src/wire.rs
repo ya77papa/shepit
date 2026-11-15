@@ -64,6 +64,19 @@ impl Envelope {
     }
 }
 
+/// Конверт у скриньці разом з його номером на сервері (для підтвердження доставки).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailboxItem {
+    pub id: i64,
+    pub envelope: Envelope,
+}
+
+/// Підтвердження: «усе до `upto` включно я отримав і зберіг — можна видаляти».
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ack {
+    pub upto: i64,
+}
+
 /// Одноразовий ключ (EC pre-key).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OneTimeKey {

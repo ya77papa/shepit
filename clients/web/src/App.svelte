@@ -149,11 +149,13 @@
 
   async function poll() {
     if (!me) return;
+    const known = new Set(contacts.map((c) => c.identity));
+    let firstFrom = '';
+    let delivered = 0;
     try {
-      const incoming = await me.receive();
-      if (!incoming.length) return;
-      const known = new Set(contacts.map((c) => c.identity));
-      for (const m of incoming) {
+      await me.receive(async (m) => {
+        firstFrom ||= m.from;
+        delivered++;
         const hello = m.text.startsWith(HELLO) ? m.text.slice(HELLO.length).trim().slice(0, 60) : null;
         if (!known.has(m.from)) {
           const fp = fingerprintOf(m.from);
@@ -163,14 +165,15 @@
         const text = hello !== null ? helloText(hello) : m.text;
         await messagesDb.add({ peer: m.from, out: false, text, at: Date.now() });
         if (current?.identity !== m.from) unread[m.from] = (unread[m.from] ?? 0) + 1;
-      }
-      await refreshContacts();
-      // Нікого не відкрито (напр. перше привітання після запрошення) — відкрити розмову.
-      const target = current ?? contacts.find((c) => c.identity === incoming[0].from) ?? null;
-      if (target) await openThread(target);
+      });
     } catch (e) {
-      fail(e);
+      fail(e); // повідомлення вже збережені локально — показуємо їх нижче
     }
+    if (!delivered) return;
+    await refreshContacts();
+    // Нікого не відкрито (напр. перше привітання після запрошення) — відкрити розмову.
+    const target = current ?? contacts.find((c) => c.identity === firstFrom) ?? null;
+    if (target) await openThread(target);
   }
 
   async function copy(text: string, what: string) {

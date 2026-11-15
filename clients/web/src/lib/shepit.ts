@@ -119,24 +119,37 @@ export class Shepit {
     });
   }
 
-  /** Забрати вхідні. Повертає розшифровані повідомлення; биті — пропускає. */
-  receive(): Promise<{ from: string; text: string }[]> {
+  /**
+   * Забрати вхідні. Для кожного розшифрованого повідомлення викликає `deliver`
+   * (там його треба зберегти). Сервер видаляє конверти лише ПІСЛЯ того, як і стан
+   * ключів, і самі повідомлення збережено — закрита вкладка нічого не загубить.
+   * Повертає кількість нових повідомлень.
+   */
+  receive(deliver: (m: { from: string; text: string }) => Promise<void>): Promise<number> {
     return serial(async () => {
       const mb = this.acc.mailbox();
       const r = await http('GET', `/v0/mailbox/${mb}`, {
         headers: { [AUTH]: this.acc.authHeader(`GET /v0/mailbox/${mb}`, new Uint8Array()) },
       });
-      const envelopes: unknown[] = await r.json();
-      const out: { from: string; text: string }[] = [];
-      for (const e of envelopes) {
+      const items: { id: number; envelope: unknown }[] = await r.json();
+      if (!items.length) return 0;
+      const opened: { from: string; text: string }[] = [];
+      for (const it of items) {
         try {
-          out.push(JSON.parse(this.acc.openEnvelope(JSON.stringify(e))));
+          opened.push(JSON.parse(this.acc.openEnvelope(JSON.stringify(it.envelope))));
         } catch (err) {
+          // Пошкоджене або вже оброблене (повтор після збою) — підтверджуємо, щоб не застрягло.
           console.warn('Відкинуто повідомлення:', err);
         }
       }
-      if (envelopes.length) await this.save();
-      return out;
+      await this.save();
+      for (const m of opened) await deliver(m);
+      const body = new TextEncoder().encode(JSON.stringify({ upto: items[items.length - 1].id }));
+      await http('POST', `/v0/mailbox/${mb}/ack`, {
+        body,
+        headers: { 'content-type': 'application/json', [AUTH]: this.acc.authHeader(`POST /v0/mailbox/${mb}/ack`, body) },
+      });
+      return opened.length;
     });
   }
 }
