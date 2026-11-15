@@ -1,0 +1,8 @@
+target/
+data/
+.git/
+*.shepit
+*.tmp
+docs/
+clients/android/
+clients/desktop/

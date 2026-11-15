@@ -1,22 +1,25 @@
-# Запуск на SRV. Образ сервера з'явиться після першої збірки на ПК.
-services:
-  db:
-    image: postgres:17-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: shepit
-      POSTGRES_USER: shepit
-      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
-    volumes:
-      - ./data/postgres:/var/lib/postgresql/data   # на SSD, не на /mnt/music
-    mem_limit: 512m
+# Запуск сервера Шепіт на SRV.
+#
+#   mkdir -p data && sudo chown 10001:10001 data   # один раз: тут ключі сервера
+#   docker compose pull && docker compose up -d
+#
+# УВАГА: data/issuer.json — приватні ключі сервера. Втратиш — усім доведеться
+# перереєструватися. Робити бекап, нікому не показувати.
+#
+# Черги повідомлень поки в пам'яті: перезапуск = недоставлені повідомлення зникають.
 
-  # server:
-  #   image: shepit-server:dev
-  #   restart: unless-stopped
-  #   depends_on: [db]
-  #   environment:
-  #     DATABASE_URL: postgres://shepit:${DB_PASSWORD}@db/shepit
-  #   ports:
-  #     - "8443:8443"
-  #   mem_limit: 512m
+services:
+  shepit:
+    image: ghcr.io/ya77papa/shepit-server:latest
+    container_name: shepit
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./data:/data
+    mem_limit: 256m
+    cpus: 1.0
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true

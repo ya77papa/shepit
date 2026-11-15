@@ -131,9 +131,19 @@ fn load_issuer() -> Issuer {
     }
     let issuer = Issuer::generate();
     std::fs::create_dir_all(&dir).expect("create data dir");
-    std::fs::write(&path, serde_json::to_vec_pretty(&issuer).unwrap()).expect("write issuer.json");
+    write_private(&path, &serde_json::to_vec_pretty(&issuer).unwrap()).expect("write issuer.json");
     println!("Створено нові ключі сервера: {}", path.display());
     issuer
+}
+
+/// Записати файл, доступний лише власнику (0600 на Linux).
+fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)?.write_all(data)
 }
 
 fn app(issuer: Issuer) -> Router {
