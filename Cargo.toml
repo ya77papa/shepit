@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "server", "clients/cli"]
+members = ["core", "server", "clients/cli", "clients/web-core"]
 
 [workspace.package]
 version = "0.0.1"

@@ -1,0 +1,23 @@
+[package]
+name = "shepit-web-core"
+description = "Ядро Шепіт для браузера (WebAssembly): та сама криптографія, що й у нативних клієнтах"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+shepit-core = { workspace = true, features = ["crypto"] }
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+wasm-bindgen = "0.2"
+
+# Випадкові числа в браузері — через crypto.getRandomValues (кілька версій getrandom у дереві).
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }

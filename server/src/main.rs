@@ -9,6 +9,8 @@
 //! | POST  | /v0/send                | —      | покласти конверт у скриньку (sealed sender: відправник невідомий) |
 //! | GET   | /v0/mailbox/{id}        | так    | забрати конверти (тільки власник скриньки) |
 //!
+//! Також роздає веб-клієнт зі `$SHEPIT_WEB` (типово `./web`, якщо тека існує).
+//!
 //! Сервер бачить: хто отримує (скринька) і розмір. НЕ бачить: текст і відправника.
 //! Етап 0: черги в пам'яті; ключі сертифікатів — у $SHEPIT_DATA/issuer.json.
 
@@ -22,7 +24,7 @@ use std::{
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     routing::{get, post, put},
     Json, Router,
 };
@@ -146,9 +148,21 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     opts.open(path)?.write_all(data)
 }
 
+/// Жорстка політика безпеки контенту: лише власні скрипти і WASM, жодних сторонніх доменів,
+/// вбудовування у фрейми заборонене. Головний захист веб-клієнта від XSS.
+const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; \
+    img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; \
+    form-action 'self'; frame-ancestors 'none'";
+
+fn web_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var("SHEPIT_WEB").unwrap_or_else(|_| "web".into()));
+    dir.join("index.html").is_file().then_some(dir)
+}
+
 fn app(issuer: Issuer) -> Router {
+    use tower_http::{services::{ServeDir, ServeFile}, set_header::SetResponseHeaderLayer};
     let shared = Arc::new(App { inner: Mutex::default(), issuer });
-    Router::new()
+    let api = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v0/trust-root", get(trust_root))
         .route("/v0/keys", put(put_keys))
@@ -157,6 +171,35 @@ fn app(issuer: Issuer) -> Router {
         .route("/v0/send", post(send))
         .route("/v0/mailbox/{id}", get(fetch))
         .with_state(shared)
+        .layer(SetResponseHeaderLayer::overriding(header::CACHE_CONTROL, HeaderValue::from_static("no-store")));
+
+    let router = match web_dir() {
+        Some(dir) => {
+            println!("Веб-клієнт: {}", dir.display());
+            // Файли в assets/ мають хеш в імені → кешуються назавжди; index.html — ніколи.
+            let assets = Router::new()
+                .fallback_service(ServeDir::new(dir.join("assets")))
+                .layer(SetResponseHeaderLayer::overriding(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("public, max-age=31536000, immutable"),
+                ));
+            let index = ServeFile::new(dir.join("index.html"));
+            api.nest("/assets", assets)
+                .route_service("/", index.clone())
+                .fallback_service(ServeDir::new(&dir).fallback(index))
+        }
+        None => api,
+    };
+    router
+        // index.html та інше без власного Cache-Control — завжди перевіряти свіжість.
+        .layer(SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, HeaderValue::from_static("no-cache")))
+        .layer(SetResponseHeaderLayer::overriding(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP)))
+        .layer(SetResponseHeaderLayer::overriding(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")))
+        .layer(SetResponseHeaderLayer::overriding(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer")))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::HeaderName::from_static("cross-origin-opener-policy"),
+            HeaderValue::from_static("same-origin"),
+        ))
 }
 
 /// Ctrl+C або SIGTERM (його надсилає `docker stop`).

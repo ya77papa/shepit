@@ -5,6 +5,7 @@
 //! - [`crypto`] — наскрізне шифрування на libsignal (PQXDH + Double Ratchet + sealed sender).
 //!   Тільки клієнт.
 
+pub mod clock;
 pub mod wire;
 
 #[cfg(feature = "auth")]

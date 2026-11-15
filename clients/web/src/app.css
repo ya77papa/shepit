@@ -1,0 +1,59 @@
+:root {
+  --bg: #0f1722; --panel: #16202e; --line: #243246; --text: #e6edf5; --muted: #8a9bb0;
+  --accent: #f5c542; --accent-text: #1f2a10; --out: #24456b; --in: #1d2a3b; --danger: #ff7a7a;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  color: var(--text); background: var(--bg);
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+button, input { font: inherit; color: inherit; }
+button { cursor: pointer; background: var(--line); border: 0; border-radius: 8px; padding: 8px 12px; }
+button:disabled { opacity: .5; cursor: default; }
+button.primary { background: var(--accent); color: var(--accent-text); font-weight: 600; }
+button.ghost { background: transparent; color: var(--muted); padding: 6px 8px; }
+input { width: 100%; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; outline: none; }
+input:focus { border-color: var(--accent); }
+.small { font-size: .82rem; }
+.muted { color: var(--muted); }
+.warn { color: #e0b45a; }
+.error { color: var(--danger); }
+.row { display: flex; gap: 8px; align-items: center; }
+.between { justify-content: space-between; }
+.label { color: var(--muted); font-size: .75rem; text-transform: uppercase; letter-spacing: .06em; }
+.fp { font-family: ui-monospace, 'Cascadia Mono', monospace; font-size: .9rem; word-spacing: .2em; line-height: 1.5; margin: 6px 0 10px; }
+.center { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
+.center-text { text-align: center; margin-top: 30vh; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 28px; }
+.welcome { max-width: 420px; text-align: center; }
+.welcome h1 { margin: 8px 0; }
+.welcome .primary { width: 100%; padding: 12px; margin: 12px 0; }
+
+.app { display: grid; grid-template-columns: 300px 1fr; height: 100vh; }
+aside { background: var(--panel); border-right: 1px solid var(--line); padding: 16px; display: flex; flex-direction: column; gap: 16px; overflow: auto; }
+.contacts ul { list-style: none; padding: 0; margin: 8px 0 0; }
+.contacts li button { width: 100%; text-align: left; background: transparent; display: grid; grid-template-columns: 1fr auto; padding: 10px; }
+.contacts li button.active, .contacts li button:hover { background: var(--line); }
+.contacts .name { font-weight: 600; }
+.contacts .sub { grid-column: 1; color: var(--muted); font-size: .78rem; font-family: ui-monospace, monospace; }
+.badge { grid-row: 1 / span 2; grid-column: 2; align-self: center; background: var(--accent); color: var(--accent-text); border-radius: 99px; padding: 0 8px; font-size: .8rem; font-weight: 700; }
+.add { display: grid; gap: 8px; margin-top: 8px; }
+
+.chat { display: flex; flex-direction: column; min-width: 0; position: relative; }
+.chat header { padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.chat header .title { background: transparent; font-size: 1.1rem; font-weight: 700; padding: 0 8px 0 0; }
+.safety { margin: 12px 16px 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; font-size: .9rem; color: var(--muted); }
+.safety .fp { color: var(--text); margin-bottom: 0; }
+.thread { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 6px; }
+.msg { display: flex; flex-direction: column; align-items: flex-start; max-width: 75%; }
+.msg.out { align-self: flex-end; align-items: flex-end; }
+.bubble { background: var(--in); padding: 8px 12px; border-radius: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.out .bubble { background: var(--out); }
+.time { font-size: .7rem; color: var(--muted); margin: 2px 6px; }
+.composer { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); }
+.toast { position: absolute; left: 16px; right: 16px; bottom: 72px; background: #3a1f24; color: var(--danger); border-radius: 10px; padding: 10px 12px; display: flex; justify-content: space-between; align-items: center; }
+
+@media (max-width: 720px) {
+  .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; height: auto; min-height: 100vh; }
+  aside { border-right: 0; border-bottom: 1px solid var(--line); max-height: 45vh; }
+  .chat { height: 55vh; }
+}

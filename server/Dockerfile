@@ -1,20 +1,39 @@
-# Образ сервера Шепіт. Збирається в GitHub Actions (не на SRV — там слабкий процесор).
+# Образ сервера Шепіт разом із веб-клієнтом. Збирається в GitHub Actions (не на слабких серверах).
 # Контекст збірки — корінь репозиторію:  docker build -f server/Dockerfile .
 
-FROM rust:1-bookworm AS build
+# 1) Rust: сервер + ядро для браузера (WASM)
+FROM rust:1-bookworm AS rust
 RUN apt-get update \
  && apt-get install -y --no-install-recommends protobuf-compiler \
  && rm -rf /var/lib/apt/lists/*
+RUN rustup target add wasm32-unknown-unknown
+# Версія мусить збігатися з wasm-bindgen у Cargo.lock
+RUN cargo install --locked wasm-bindgen-cli --version 0.2.130
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked -p shepit-server
+RUN cargo build --release --locked -p shepit-server \
+ && cargo build --release --locked -p shepit-web-core --target wasm32-unknown-unknown \
+ && wasm-bindgen --target web --out-dir clients/web/src/wasm \
+      target/wasm32-unknown-unknown/release/shepit_web_core.wasm
 
+# 2) Веб-інтерфейс
+FROM node:22-bookworm-slim AS web
+WORKDIR /web
+COPY clients/web/package.json clients/web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY clients/web/ ./
+COPY --from=rust /src/clients/web/src/wasm ./src/wasm
+RUN npm run build
+
+# 3) Мінімальний образ для запуску
 FROM debian:bookworm-slim
 RUN useradd --system --uid 10001 --no-create-home shepit \
  && mkdir /data && chown shepit /data
-COPY --from=build /src/target/release/shepit-server /usr/local/bin/shepit-server
+COPY --from=rust /src/target/release/shepit-server /usr/local/bin/shepit-server
+COPY --from=web /web/dist /web
 USER shepit
 ENV SHEPIT_DATA=/data \
+    SHEPIT_WEB=/web \
     SHEPIT_LISTEN=0.0.0.0:8443
 VOLUME /data
 EXPOSE 8443

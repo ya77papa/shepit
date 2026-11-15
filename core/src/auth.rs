@@ -37,12 +37,7 @@ impl std::fmt::Display for AuthError {
     }
 }
 
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+pub use crate::clock::now_ms;
 
 fn signing_input(purpose: &str, time_ms: u64, nonce: &str, body: &[u8]) -> Vec<u8> {
     format!("shepit-auth-v0\n{purpose}\n{time_ms}\n{nonce}\n{}", hex::encode(Sha256::digest(body)))

@@ -22,3 +22,6 @@ libsignal-protocol = { workspace = true, optional = true }
 async-trait = { version = "0.1", optional = true }
 futures = { version = "0.3", default-features = false, features = ["executor"], optional = true }
 rand = { version = "0.9", optional = true }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+js-sys = "0.3"

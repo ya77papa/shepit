@@ -8,7 +8,7 @@
 
 mod store;
 
-use std::{fs, path::Path, time::SystemTime};
+use std::{fs, path::Path};
 
 use futures::executor::block_on;
 use libsignal_protocol::{
@@ -23,6 +23,7 @@ use rand::{rngs::OsRng, Rng, TryRngCore};
 
 use crate::{
     auth::{now_ms, Auth},
+    clock,
     wire::{self, KeyUpload, MailboxId, OneTimeKey, PreKeyBundle},
 };
 use store::{Identities, KyberPreKeys, PreKeys, Sessions, SignedPreKeys, State};
@@ -160,15 +161,24 @@ impl Account {
         })
     }
 
-    pub fn load(path: &Path) -> Result<Self> {
-        let st = serde_json::from_slice(&fs::read(path)?).map_err(|_| Error::Malformed("файл акаунта"))?;
+    /// Відновити з байтів, отриманих через [`Account::to_bytes`] (браузер: IndexedDB).
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let st = serde_json::from_slice(data).map_err(|_| Error::Malformed("стан акаунта"))?;
         Ok(Self { st })
     }
 
+    /// Увесь стан акаунта, включно з секретними ключами.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(&self.st).expect("serialize state")
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        Self::from_bytes(&fs::read(path)?)
+    }
+
     pub fn save(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_vec_pretty(&self.st).expect("serialize state");
         let tmp = path.with_extension("tmp");
-        fs::write(&tmp, json)?;
+        fs::write(&tmp, self.to_bytes())?;
         fs::rename(tmp, path)?;
         Ok(())
     }
@@ -233,7 +243,7 @@ impl Account {
             .ok()
             .flatten()
             .is_some_and(|s| {
-                s.has_usable_sender_chain(SystemTime::now(), SessionUsabilityRequirements::EstablishedWithPqxdh)
+                s.has_usable_sender_chain(clock::now(), SessionUsabilityRequirements::EstablishedWithPqxdh)
                     .unwrap_or(false)
             })
     }
@@ -264,7 +274,7 @@ impl Account {
             &mut self.st.sessions,
             &mut self.st.ids,
             &bundle,
-            SystemTime::now(),
+            clock::now(),
             &mut rng(),
         ))?;
         Ok(())
@@ -279,7 +289,7 @@ impl Account {
             text.as_bytes(),
             &mut self.st.sessions,
             &mut self.st.ids,
-            SystemTime::now(),
+            clock::now(),
             &mut rng(),
         ))?)
     }
