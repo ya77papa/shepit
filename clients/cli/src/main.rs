@@ -1,47 +1,29 @@
 //! Консольний клієнт прототипу.
 //!
-//!   shepit keygen <профіль>                 створити ключ (файл <профіль>.key)
-//!   shepit whoami <профіль>                 показати публічний ключ і відбиток
-//!   shepit send   <профіль> <ключ> <текст>  надіслати повідомлення
-//!   shepit recv   <профіль>                 забрати вхідні
+//!   shepit keygen <профіль>                 створити акаунт і опублікувати ключі
+//!   shepit whoami <профіль>                 показати свій ключ і відбиток
+//!   shepit send   <профіль> <ключ> <текст>  надіслати зашифроване повідомлення
+//!   shepit recv   <профіль>                 забрати й розшифрувати вхідні
 //!
+//! Акаунт зберігається у <профіль>.shepit (секретні ключі! етап 0 — файл не зашифрований).
 //! Адреса сервера: змінна SHEPIT_SERVER (типово http://127.0.0.1:8443).
-//! УВАГА: етап 0 — повідомлення підписані, але ще не зашифровані.
 
-use std::{fs, path::PathBuf, process::exit};
+use std::{path::PathBuf, process::exit};
 
 use shepit_core::{
-    envelope::Envelope,
-    identity::{Identity, PublicIdentity},
-    message,
+    crypto::{self, Account},
+    wire::{self, Envelope, MailboxId, PreKeyBundle},
 };
 
 fn server() -> String {
     std::env::var("SHEPIT_SERVER").unwrap_or_else(|_| "http://127.0.0.1:8443".into())
 }
 
-fn key_path(profile: &str) -> PathBuf {
-    PathBuf::from(format!("{profile}.key"))
+fn path(profile: &str) -> PathBuf {
+    PathBuf::from(format!("{profile}.shepit"))
 }
 
-fn load(profile: &str) -> Identity {
-    let path = key_path(profile);
-    let hex_secret = fs::read_to_string(&path).unwrap_or_else(|_| {
-        die(&format!("немає {} — спершу: shepit keygen {profile}", path.display()))
-    });
-    let secret: [u8; 32] = hex::decode(hex_secret.trim())
-        .ok()
-        .and_then(|v| v.try_into().ok())
-        .unwrap_or_else(|| die("пошкоджений файл ключа"));
-    Identity::from_secret(&secret)
-}
-
-fn show(id: &PublicIdentity) {
-    println!("Ключ:     {}", hex::encode(id.to_bytes()));
-    println!("Відбиток: {}", id.fingerprint());
-}
-
-fn die(msg: &str) -> ! {
+fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("Помилка: {msg}");
     exit(1)
 }
@@ -54,56 +36,85 @@ fn usage() -> ! {
     exit(2)
 }
 
+fn load(profile: &str) -> Account {
+    Account::load(&path(profile)).unwrap_or_else(|e| match e {
+        crypto::Error::Io(_) => die(format!("немає {} — спершу: shepit keygen {profile}", path(profile).display())),
+        e => die(e),
+    })
+}
+
+fn show(acc: &Account) {
+    println!("Ключ:     {}", acc.identity_hex());
+    println!("Відбиток: {}", acc.fingerprint());
+}
+
+fn short(identity_hex: &str) -> String {
+    let fp = hex::decode(identity_hex).map(|b| wire::fingerprint(&b)).unwrap_or_default();
+    fp.chars().take(11).collect()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg = |i: usize| args.get(i).map(String::as_str).unwrap_or_else(|| usage());
 
     match arg(0) {
         "keygen" => {
-            let profile = arg(1);
-            let path = key_path(profile);
-            if path.exists() {
-                die(&format!("{} вже існує", path.display()));
+            let p = path(arg(1));
+            if p.exists() {
+                die(format!("{} вже існує", p.display()));
             }
-            let id = Identity::generate();
-            fs::write(&path, hex::encode(id.secret_bytes())).unwrap_or_else(|e| die(&e.to_string()));
-            println!("Створено {} (секретний ключ, нікому не показуй)", path.display());
-            show(&id.public());
+            let (acc, upload) = Account::create().unwrap_or_else(|e| die(e));
+            ureq::put(format!("{}/v0/keys", server()))
+                .send_json(&upload)
+                .unwrap_or_else(|e| die(format!("сервер: {e}")));
+            acc.save(&p).unwrap_or_else(|e| die(e));
+            println!("Створено {} і опубліковано {} одноразових ключів.", p.display(), crypto::ONE_TIME_KEYS);
+            show(&acc);
         }
-        "whoami" => show(&load(arg(1)).public()),
+        "whoami" => show(&load(arg(1))),
         "send" => {
-            let me = load(arg(1));
-            let to: [u8; 32] = hex::decode(arg(2))
-                .ok()
-                .and_then(|v| v.try_into().ok())
-                .unwrap_or_else(|| die("ключ отримувача — 64 hex-символи"));
-            let to = PublicIdentity::from_bytes(&to).unwrap_or_else(|_| die("невалідний ключ"));
+            let profile = arg(1);
+            let peer = arg(2).to_owned();
+            crypto::parse_identity(&peer).unwrap_or_else(|_| die("невалідний ключ отримувача"));
             let text = args[3..].join(" ");
             if text.is_empty() {
                 usage();
             }
-            let env = Envelope::new(to.mailbox(), message::seal(&me, &text));
+            let mut acc = load(profile);
+            if !acc.has_session(&peer) {
+                let bundle: PreKeyBundle = ureq::get(format!("{}/v0/keys/{peer}", server()))
+                    .call()
+                    .and_then(|mut r| r.body_mut().read_json())
+                    .unwrap_or_else(|e| die(format!("ключі отримувача: {e}")));
+                acc.start_session(&bundle).unwrap_or_else(|e| die(e));
+                println!("Нова сесія з [{}…] (PQXDH)", short(&peer));
+            }
+            let payload = acc.encrypt(&peer, &text).unwrap_or_else(|e| die(e));
+            let to = MailboxId::for_identity(&hex::decode(&peer).unwrap());
             ureq::post(format!("{}/v0/send", server()))
-                .send_json(&env)
-                .unwrap_or_else(|e| die(&format!("сервер: {e}")));
-            println!("Надіслано.");
+                .send_json(&Envelope::new(to, &payload))
+                .unwrap_or_else(|e| die(format!("сервер: {e}")));
+            acc.save(&path(profile)).unwrap_or_else(|e| die(e));
+            println!("Надіслано (зашифровано, {} байтів).", payload.len());
         }
         "recv" => {
-            let me = load(arg(1));
-            let url = format!("{}/v0/mailbox/{}", server(), me.public().mailbox().to_hex());
+            let profile = arg(1);
+            let mut acc = load(profile);
+            let url = format!("{}/v0/mailbox/{}", server(), acc.mailbox().to_hex());
             let envs: Vec<Envelope> = ureq::get(url)
                 .call()
                 .and_then(|mut r| r.body_mut().read_json())
-                .unwrap_or_else(|e| die(&format!("сервер: {e}")));
+                .unwrap_or_else(|e| die(format!("сервер: {e}")));
             if envs.is_empty() {
                 println!("Нових повідомлень немає.");
             }
             for env in envs {
-                match message::open(&env.payload) {
-                    Ok(m) => println!("[{}…] {}", &m.from.fingerprint()[..11], m.text),
-                    Err(e) => println!("(відкинуто: {e:?})"),
+                match env.payload_bytes().ok_or(crypto::Error::Malformed("hex")).and_then(|p| acc.decrypt(&p)) {
+                    Ok((from, text)) => println!("[{}…] {text}", short(&from)),
+                    Err(e) => println!("(відкинуто: {e})"),
                 }
             }
+            acc.save(&path(profile)).unwrap_or_else(|e| die(e));
         }
         _ => usage(),
     }

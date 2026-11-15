@@ -1,15 +1,22 @@
 [package]
 name = "shepit-core"
-description = "Ядро Шепіт: ідентичність, конверти, (згодом) криптографія"
+description = "Ядро Шепіт: формат конвертів і пакетів ключів, E2EE на libsignal"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["crypto"]
+# Сервер вимикає цю фічу: йому не потрібна криптографія, лише формати даних.
+crypto = ["dep:libsignal-protocol", "dep:async-trait", "dep:futures", "dep:rand"]
+
 [dependencies]
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
-sha2 = "0.10"
 serde.workspace = true
-hex.workspace = true
 serde_json.workspace = true
+hex.workspace = true
+sha2.workspace = true
+libsignal-protocol = { workspace = true, optional = true }
+async-trait = { version = "0.1", optional = true }
+futures = { version = "0.3", default-features = false, features = ["executor"], optional = true }
+rand = { version = "0.9", optional = true }

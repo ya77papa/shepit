@@ -1,8 +1,9 @@
 //! Ядро месенджера Шепіт.
 //!
-//! Етап 0: ідентичність на ключах, підписані повідомлення і транспортно-незалежний конверт.
-//! Шифрування (libsignal / OpenMLS) додамо після ADR-0002.
+//! - [`wire`] — формати, спільні для клієнта й сервера (конверт, пакет ключів). Без криптографії.
+//! - [`crypto`] — наскрізне шифрування на libsignal (PQXDH + Double Ratchet). Тільки клієнт.
 
-pub mod envelope;
-pub mod identity;
-pub mod message;
+pub mod wire;
+
+#[cfg(feature = "crypto")]
+pub mod crypto;

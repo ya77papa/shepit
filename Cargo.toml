@@ -9,7 +9,10 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/ya77papa/shepit"
 
 [workspace.dependencies]
-shepit-core = { path = "core" }
+shepit-core = { path = "core", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
+sha2 = "0.10"
+# Pin: Signal не гарантує стабільність API поза своїми застосунками (ADR-0001)
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.108.0" }

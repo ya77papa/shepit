@@ -11,6 +11,6 @@ name = "shepit"
 path = "src/main.rs"
 
 [dependencies]
-shepit-core.workspace = true
+shepit-core = { workspace = true, features = ["crypto"] }
 hex.workspace = true
 ureq = { version = "3", features = ["json"] }

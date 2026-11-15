@@ -1,11 +1,13 @@
 //! Прототип сервера доставки.
 //!
-//! - POST /v0/send            — покласти конверт у скриньку отримувача
-//! - GET  /v0/mailbox/{id}    — забрати всі конверти (і видалити їх із сервера)
+//! - PUT  /v0/keys                   — опублікувати свої ключі (KeyUpload)
+//! - GET  /v0/keys/{identity}        — отримати пакет ключів людини (забирає 1 одноразовий ключ)
+//! - POST /v0/send                   — покласти конверт у скриньку
+//! - GET  /v0/mailbox/{id}           — забрати конверти (і видалити їх із сервера)
 //! - GET  /health
 //!
-//! Етап 0: зберігання в пам'яті, без автентифікації. Нічого не логуємо про
-//! відправників і отримувачів.
+//! Сервер бачить лише шифротекст. Етап 0: зберігання в пам'яті, без автентифікації
+//! (TODO: підписувати KeyUpload і запити до скриньки ключем ідентичності).
 
 use std::{
     collections::HashMap,
@@ -16,22 +18,47 @@ use std::{
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
-use shepit_core::envelope::{Envelope, MailboxId};
+use shepit_core::wire::{Envelope, KeyUpload, MailboxId, PreKeyBundle};
 
-type Store = Arc<Mutex<HashMap<MailboxId, Vec<Envelope>>>>;
+#[derive(Default)]
+struct Inner {
+    mailboxes: HashMap<MailboxId, Vec<Envelope>>,
+    keys: HashMap<String, KeyUpload>,
+}
 
-const MAX_PAYLOAD: usize = 64 * 1024;
+type Store = Arc<Mutex<Inner>>;
+
+const MAX_PAYLOAD_HEX: usize = 2 * 64 * 1024;
 const MAX_QUEUE: usize = 1000;
+const MAX_ONE_TIME: usize = 100;
 
-async fn send(State(store): State<Store>, Json(env): Json<Envelope>) -> StatusCode {
-    if env.payload.len() > MAX_PAYLOAD {
+async fn put_keys(State(st): State<Store>, Json(up): Json<KeyUpload>) -> StatusCode {
+    if up.one_time.len() > MAX_ONE_TIME || hex_len_bad(&up.identity, 66) {
+        return StatusCode::BAD_REQUEST;
+    }
+    st.lock().unwrap().keys.insert(up.identity.clone(), up);
+    StatusCode::NO_CONTENT
+}
+
+fn hex_len_bad(s: &str, len: usize) -> bool {
+    s.len() != len || !s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+async fn get_keys(State(st): State<Store>, Path(identity): Path<String>) -> Result<Json<PreKeyBundle>, StatusCode> {
+    let mut st = st.lock().unwrap();
+    let up = st.keys.get_mut(&identity).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(up.take_bundle()))
+}
+
+async fn send(State(st): State<Store>, Json(env): Json<Envelope>) -> StatusCode {
+    if env.payload.len() > MAX_PAYLOAD_HEX {
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
-    let mut map = store.lock().unwrap();
-    let queue = map.entry(env.to).or_default();
+    let mut st = st.lock().unwrap();
+    let queue = st.mailboxes.entry(env.to).or_default();
     if queue.len() >= MAX_QUEUE {
         return StatusCode::TOO_MANY_REQUESTS;
     }
@@ -39,22 +66,19 @@ async fn send(State(store): State<Store>, Json(env): Json<Envelope>) -> StatusCo
     StatusCode::ACCEPTED
 }
 
-async fn fetch(
-    State(store): State<Store>,
-    Path(id): Path<String>,
-) -> Result<Json<Vec<Envelope>>, StatusCode> {
+async fn fetch(State(st): State<Store>, Path(id): Path<String>) -> Result<Json<Vec<Envelope>>, StatusCode> {
     let id = MailboxId::from_hex(&id).ok_or(StatusCode::BAD_REQUEST)?;
-    let envelopes = store.lock().unwrap().remove(&id).unwrap_or_default();
-    Ok(Json(envelopes))
+    Ok(Json(st.lock().unwrap().mailboxes.remove(&id).unwrap_or_default()))
 }
 
-pub fn app() -> Router {
-    let store: Store = Arc::default();
+fn app() -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/v0/keys", put(put_keys))
+        .route("/v0/keys/{identity}", get(get_keys))
         .route("/v0/send", post(send))
         .route("/v0/mailbox/{id}", get(fetch))
-        .with_state(store)
+        .with_state(Store::default())
 }
 
 #[tokio::main]
