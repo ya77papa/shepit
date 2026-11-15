@@ -139,4 +139,9 @@ pub struct State {
     pub signed: SignedPreKeys,
     pub kyber: KyberPreKeys,
     pub sessions: Sessions,
+    /// Закріплений корінь довіри сервера (hex). Задається при реєстрації.
+    pub trust_root: String,
+    /// Поточний сертифікат відправника (hex), видається сервером.
+    #[serde(default)]
+    pub sender_cert: Option<String>,
 }

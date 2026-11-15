@@ -7,8 +7,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Без криптографії: серверу вона не потрібна, і він не може розшифрувати повідомлення.
-shepit-core.workspace = true
+# Лише підписи і сертифікати. Модуля шифрування (`crypto`) у сервера немає —
+# він фізично не може розшифрувати повідомлення.
+shepit-core = { workspace = true, features = ["auth"] }
 serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }

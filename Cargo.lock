@@ -2011,6 +2011,7 @@ name = "shepit-cli"
 version = "0.0.1"
 dependencies = [
  "hex",
+ "serde_json",
  "shepit-core",
  "ureq",
 ]
@@ -2034,7 +2035,9 @@ name = "shepit-server"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "hex",
  "serde",
+ "serde_json",
  "shepit-core",
  "tokio",
 ]

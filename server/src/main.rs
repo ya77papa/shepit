@@ -1,64 +1,110 @@
-//! Прототип сервера доставки.
+//! Прототип сервера доставки Шепіт.
 //!
-//! - PUT  /v0/keys                   — опублікувати свої ключі (KeyUpload)
-//! - GET  /v0/keys/{identity}        — отримати пакет ключів людини (забирає 1 одноразовий ключ)
-//! - POST /v0/send                   — покласти конверт у скриньку
-//! - GET  /v0/mailbox/{id}           — забрати конверти (і видалити їх із сервера)
-//! - GET  /health
+//! | Метод | Шлях                    | Підпис | Що робить |
+//! |-------|-------------------------|--------|-----------|
+//! | GET   | /v0/trust-root          | —      | корінь довіри для сертифікатів відправника |
+//! | PUT   | /v0/keys                | так    | опублікувати свої ключі (тільки власник ключа) |
+//! | GET   | /v0/keys/{identity}     | —      | пакет ключів людини (забирає 1 одноразовий) |
+//! | GET   | /v0/certificate         | так    | сертифікат відправника на 24 год |
+//! | POST  | /v0/send                | —      | покласти конверт у скриньку (sealed sender: відправник невідомий) |
+//! | GET   | /v0/mailbox/{id}        | так    | забрати конверти (тільки власник скриньки) |
 //!
-//! Сервер бачить лише шифротекст. Етап 0: зберігання в пам'яті, без автентифікації
-//! (TODO: підписувати KeyUpload і запити до скриньки ключем ідентичності).
+//! Сервер бачить: хто отримує (скринька) і розмір. НЕ бачить: текст і відправника.
+//! Етап 0: черги в пам'яті; ключі сертифікатів — у $SHEPIT_DATA/issuer.json.
 
 use std::{
     collections::HashMap,
     net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
 use axum::{
+    body::Bytes,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{get, post, put},
     Json, Router,
 };
-use shepit_core::wire::{Envelope, KeyUpload, MailboxId, PreKeyBundle};
+use shepit_core::{
+    auth::{now_ms, Auth, Issuer, HEADER, MAX_SKEW_MS},
+    wire::{Envelope, KeyUpload, MailboxId, PreKeyBundle},
+};
 
 #[derive(Default)]
 struct Inner {
     mailboxes: HashMap<MailboxId, Vec<Envelope>>,
     keys: HashMap<String, KeyUpload>,
+    /// Використані nonce → час. Захист від повторного відтворення підписаних запитів.
+    nonces: HashMap<String, u64>,
 }
 
-type Store = Arc<Mutex<Inner>>;
+struct App {
+    inner: Mutex<Inner>,
+    issuer: Issuer,
+}
+
+type Shared = Arc<App>;
 
 const MAX_PAYLOAD_HEX: usize = 2 * 64 * 1024;
 const MAX_QUEUE: usize = 1000;
 const MAX_ONE_TIME: usize = 100;
 
-async fn put_keys(State(st): State<Store>, Json(up): Json<KeyUpload>) -> StatusCode {
-    if up.one_time.len() > MAX_ONE_TIME || hex_len_bad(&up.identity, 66) {
+/// Перевірити підпис запиту і повернути ідентичність того, хто його підписав.
+fn authenticate(app: &App, headers: &HeaderMap, purpose: &str, body: &[u8]) -> Result<String, StatusCode> {
+    let raw = headers.get(HEADER).and_then(|v| v.to_str().ok()).ok_or(StatusCode::UNAUTHORIZED)?;
+    let auth = Auth::parse(raw).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let now = now_ms();
+    auth.verify(purpose, body, now).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let mut inner = app.inner.lock().unwrap();
+    inner.nonces.retain(|_, t| now.saturating_sub(*t) <= 2 * MAX_SKEW_MS);
+    if inner.nonces.insert(auth.nonce.clone(), now).is_some() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(auth.identity)
+}
+
+async fn trust_root(State(app): State<Shared>) -> String {
+    app.issuer.trust_root_hex()
+}
+
+async fn put_keys(State(app): State<Shared>, headers: HeaderMap, body: Bytes) -> StatusCode {
+    let who = match authenticate(&app, &headers, "PUT /v0/keys", &body) {
+        Ok(w) => w,
+        Err(s) => return s,
+    };
+    let Ok(up) = serde_json::from_slice::<KeyUpload>(&body) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    // Опублікувати ключі можна лише для себе: identity у тілі = той, хто підписав.
+    if up.identity != who {
+        return StatusCode::FORBIDDEN;
+    }
+    if up.one_time.len() > MAX_ONE_TIME {
         return StatusCode::BAD_REQUEST;
     }
-    st.lock().unwrap().keys.insert(up.identity.clone(), up);
+    app.inner.lock().unwrap().keys.insert(up.identity.clone(), up);
     StatusCode::NO_CONTENT
 }
 
-fn hex_len_bad(s: &str, len: usize) -> bool {
-    s.len() != len || !s.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-async fn get_keys(State(st): State<Store>, Path(identity): Path<String>) -> Result<Json<PreKeyBundle>, StatusCode> {
-    let mut st = st.lock().unwrap();
-    let up = st.keys.get_mut(&identity).ok_or(StatusCode::NOT_FOUND)?;
+async fn get_keys(State(app): State<Shared>, Path(identity): Path<String>) -> Result<Json<PreKeyBundle>, StatusCode> {
+    let mut inner = app.inner.lock().unwrap();
+    let up = inner.keys.get_mut(&identity).ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(up.take_bundle()))
 }
 
-async fn send(State(st): State<Store>, Json(env): Json<Envelope>) -> StatusCode {
+async fn certificate(State(app): State<Shared>, headers: HeaderMap) -> Result<String, StatusCode> {
+    let who = authenticate(&app, &headers, "GET /v0/certificate", b"")?;
+    let cert = app.issuer.issue(&who, now_ms()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(hex::encode(cert))
+}
+
+async fn send(State(app): State<Shared>, Json(env): Json<Envelope>) -> StatusCode {
     if env.payload.len() > MAX_PAYLOAD_HEX {
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
-    let mut st = st.lock().unwrap();
-    let queue = st.mailboxes.entry(env.to).or_default();
+    let mut inner = app.inner.lock().unwrap();
+    let queue = inner.mailboxes.entry(env.to).or_default();
     if queue.len() >= MAX_QUEUE {
         return StatusCode::TOO_MANY_REQUESTS;
     }
@@ -66,19 +112,41 @@ async fn send(State(st): State<Store>, Json(env): Json<Envelope>) -> StatusCode 
     StatusCode::ACCEPTED
 }
 
-async fn fetch(State(st): State<Store>, Path(id): Path<String>) -> Result<Json<Vec<Envelope>>, StatusCode> {
-    let id = MailboxId::from_hex(&id).ok_or(StatusCode::BAD_REQUEST)?;
-    Ok(Json(st.lock().unwrap().mailboxes.remove(&id).unwrap_or_default()))
+async fn fetch(State(app): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> Result<Json<Vec<Envelope>>, StatusCode> {
+    let who = authenticate(&app, &headers, &format!("GET /v0/mailbox/{id}"), b"")?;
+    let mailbox = MailboxId::from_hex(&id).ok_or(StatusCode::BAD_REQUEST)?;
+    let who_bytes = hex::decode(&who).map_err(|_| StatusCode::BAD_REQUEST)?;
+    // Забрати пошту може лише власник скриньки.
+    if MailboxId::for_identity(&who_bytes) != mailbox {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(Json(app.inner.lock().unwrap().mailboxes.remove(&mailbox).unwrap_or_default()))
 }
 
-fn app() -> Router {
+fn load_issuer() -> Issuer {
+    let dir = PathBuf::from(std::env::var("SHEPIT_DATA").unwrap_or_else(|_| "data".into()));
+    let path = dir.join("issuer.json");
+    if let Ok(raw) = std::fs::read(&path) {
+        return serde_json::from_slice(&raw).expect("issuer.json пошкоджений");
+    }
+    let issuer = Issuer::generate();
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    std::fs::write(&path, serde_json::to_vec_pretty(&issuer).unwrap()).expect("write issuer.json");
+    println!("Створено нові ключі сервера: {}", path.display());
+    issuer
+}
+
+fn app(issuer: Issuer) -> Router {
+    let shared = Arc::new(App { inner: Mutex::default(), issuer });
     Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/v0/trust-root", get(trust_root))
         .route("/v0/keys", put(put_keys))
         .route("/v0/keys/{identity}", get(get_keys))
+        .route("/v0/certificate", get(certificate))
         .route("/v0/send", post(send))
         .route("/v0/mailbox/{id}", get(fetch))
-        .with_state(Store::default())
+        .with_state(shared)
 }
 
 #[tokio::main]
@@ -87,9 +155,11 @@ async fn main() {
         .unwrap_or_else(|_| "0.0.0.0:8443".into())
         .parse()
         .expect("SHEPIT_LISTEN: invalid address");
+    let issuer = load_issuer();
+    println!("Корінь довіри: {}", issuer.trust_root_hex());
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     println!("shepit-server listening on {addr}");
-    axum::serve(listener, app())
+    axum::serve(listener, app(issuer))
         .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.ok(); })
         .await
         .unwrap();

@@ -8,8 +8,10 @@ repository.workspace = true
 
 [features]
 default = ["crypto"]
-# Сервер вимикає цю фічу: йому не потрібна криптографія, лише формати даних.
-crypto = ["dep:libsignal-protocol", "dep:async-trait", "dep:futures", "dep:rand"]
+# Підписи запитів і сертифікати відправника. Потрібна і клієнту, і серверу.
+auth = ["dep:libsignal-protocol", "dep:rand"]
+# Наскрізне шифрування. Тільки клієнт: сервер не має чим розшифрувати повідомлення.
+crypto = ["auth", "dep:async-trait", "dep:futures"]
 
 [dependencies]
 serde.workspace = true
