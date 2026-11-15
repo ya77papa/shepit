@@ -1,0 +1,4 @@
+# Зберігаємо LF у репозиторії: код збирається і запускається на Linux (SRV, Docker)
+* text=auto eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf

@@ -1,0 +1,16 @@
+[package]
+name = "shepit-cli"
+description = "Консольний клієнт Шепіт для прототипу"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "shepit"
+path = "src/main.rs"
+
+[dependencies]
+shepit-core.workspace = true
+hex.workspace = true
+ureq = { version = "3", features = ["json"] }

@@ -6,3 +6,6 @@ server/data/
 .vscode/
 build/
 .gradle/
+
+# Секретні ключі профілів CLI — НІКОЛИ не комітити
+*.key
