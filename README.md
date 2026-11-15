@@ -16,6 +16,8 @@ docs/      Архітектура, рішення (ADR), план
 
 - [План розробки](docs/roadmap.md)
 - [ADR-0001: Базова архітектура](docs/adr/0001-architecture.md)
+- [ADR-0002: Криптографія](docs/adr/0002-crypto.md)
+- [Розгортання](docs/deploy.md)
 
 ## Принципи
 
