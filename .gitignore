@@ -1,0 +1,8 @@
+target/
+server/data/
+.env
+*.db
+.idea/
+.vscode/
+build/
+.gradle/

@@ -1,0 +1,22 @@
+# Запуск на SRV. Образ сервера з'явиться після першої збірки на ПК.
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: shepit
+      POSTGRES_USER: shepit
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data   # на SSD, не на /mnt/music
+    mem_limit: 512m
+
+  # server:
+  #   image: shepit-server:dev
+  #   restart: unless-stopped
+  #   depends_on: [db]
+  #   environment:
+  #     DATABASE_URL: postgres://shepit:${DB_PASSWORD}@db/shepit
+  #   ports:
+  #     - "8443:8443"
+  #   mem_limit: 512m
