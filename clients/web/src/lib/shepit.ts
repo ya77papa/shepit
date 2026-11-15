@@ -6,6 +6,7 @@ export { fingerprintOf, isValidIdentity };
 
 const API = ''; // той самий домен, що й веб-клієнт
 const AUTH = 'x-shepit-auth';
+const MIN_ONE_TIME = 5;
 
 let ready: Promise<unknown> | null = null;
 export const loadWasm = () => (ready ??= init());
@@ -48,15 +49,34 @@ export class Shepit {
     await loadWasm();
     const root = (await (await http('GET', '/v0/trust-root')).text()).trim();
     const acc = WebAccount.create(root);
-    const body = new TextEncoder().encode(acc.keyUploadJson()!);
-    await http('PUT', '/v0/keys', {
-      body,
-      headers: { 'content-type': 'application/json', [AUTH]: acc.authHeader('PUT /v0/keys', body) },
-    });
     const s = new Shepit(acc);
+    await s.publishKeys(acc.keyUploadJson()!);
     await s.ensureCertificate();
     await s.save();
     return s;
+  }
+
+  private async publishKeys(uploadJson: string) {
+    const body = new TextEncoder().encode(uploadJson);
+    await http('PUT', '/v0/keys', {
+      body,
+      headers: { 'content-type': 'application/json', [AUTH]: this.acc.authHeader('PUT /v0/keys', body) },
+    });
+  }
+
+  /** Перевірити, що сервер має мої ключі і їх вистачає; інакше опублікувати нові. */
+  ensureKeys(): Promise<void> {
+    return serial(async () => {
+      const r = await fetch(`${API}/v0/keys/status`, {
+        cache: 'no-store',
+        headers: { [AUTH]: this.acc.authHeader('GET /v0/keys/status', new Uint8Array()) },
+      });
+      if (r.ok && (await r.json()).one_time >= MIN_ONE_TIME) return;
+      if (!r.ok && r.status !== 404) throw new Error(`статус ключів: ${r.status}`);
+      const upload = this.acc.refreshKeysJson();
+      await this.save(); // нові приватні ключі — до публікації
+      await this.publishKeys(upload);
+    });
   }
 
   private async ensureCertificate() {

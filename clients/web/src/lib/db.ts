@@ -46,6 +46,7 @@ export const contacts = {
 export const messages = {
   forPeer: async (peer: string) => req<Message[]>((await store('messages')).index('peer').getAll(peer)),
   add: async (m: Message) => req((await store('messages', 'readwrite')).add(m)),
+  all: async () => req<Message[]>((await store('messages')).getAll()),
 };
 
 /** Повністю стерти локальні дані (вихід з акаунта). */

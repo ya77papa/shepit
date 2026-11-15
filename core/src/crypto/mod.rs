@@ -118,14 +118,31 @@ impl Account {
                 sessions: Sessions::default(),
                 trust_root: trust_root_hex.to_owned(),
                 sender_cert: None,
+                next_key_id: 1,
             },
         };
-        let upload = block_on(acc.generate_keys(&ik))?;
+        let upload = block_on(acc.generate_keys())?;
         Ok((acc, upload))
     }
 
-    async fn generate_keys(&mut self, ik: &IdentityKeyPair) -> Result<KeyUpload> {
+    /// Новий набір ключів для публікації: свіжі signed/Kyber pre-key і одноразові ключі.
+    /// Потрібно, коли сервер їх втратив або одноразові закінчуються.
+    /// Старі ключі лишаються в сховищі — на них ще можуть прийти повідомлення.
+    pub fn refresh_keys(&mut self) -> Result<KeyUpload> {
+        block_on(self.generate_keys())
+    }
+
+    fn alloc_ids(&mut self, n: u32) -> u32 {
+        let start = if self.st.next_key_id == 0 { ONE_TIME_KEYS + 1 } else { self.st.next_key_id };
+        self.st.next_key_id = start + n;
+        start
+    }
+
+    async fn generate_keys(&mut self) -> Result<KeyUpload> {
         use libsignal_protocol::{KyberPreKeyStore, PreKeyStore, SignedPreKeyStore};
+        let ik = self.key_pair();
+        let base = self.alloc_ids(ONE_TIME_KEYS + 1);
+        let key_id = base; // signed і Kyber мають окремі простори ID — беремо той самий номер
         let mut r = rng();
         let ts = Timestamp::from_epoch_millis(now_ms());
         let sign = |data: &[u8], r: &mut _| {
@@ -134,14 +151,14 @@ impl Account {
 
         let spk = KeyPair::generate(&mut r);
         let spk_sig = sign(&spk.public_key.serialize(), &mut r)?;
-        self.st.signed.save_signed_pre_key(1.into(), &SignedPreKeyRecord::new(1.into(), ts, &spk, &spk_sig)).await?;
+        self.st.signed.save_signed_pre_key(key_id.into(), &SignedPreKeyRecord::new(key_id.into(), ts, &spk, &spk_sig)).await?;
 
         let kpk = kem::KeyPair::generate(kem::KeyType::Kyber1024, &mut r);
         let kpk_sig = sign(&kpk.public_key.serialize(), &mut r)?;
-        self.st.kyber.save_kyber_pre_key(1.into(), &KyberPreKeyRecord::new(1.into(), ts, &kpk, &kpk_sig)).await?;
+        self.st.kyber.save_kyber_pre_key(key_id.into(), &KyberPreKeyRecord::new(key_id.into(), ts, &kpk, &kpk_sig)).await?;
 
         let mut one_time = Vec::new();
-        for id in 1..=ONE_TIME_KEYS {
+        for id in (base + 1)..=(base + ONE_TIME_KEYS) {
             let kp = KeyPair::generate(&mut r);
             self.st.pre.save_pre_key(id.into(), &PreKeyRecord::new(id.into(), &kp)).await?;
             one_time.push(OneTimeKey { id, key: hex::encode(kp.public_key.serialize()) });
@@ -151,10 +168,10 @@ impl Account {
             identity: self.identity_hex(),
             registration_id: self.st.ids.registration_id,
             device_id: DEVICE as u32,
-            signed_prekey_id: 1,
+            signed_prekey_id: key_id,
             signed_prekey: hex::encode(spk.public_key.serialize()),
             signed_prekey_sig: hex::encode(&spk_sig),
-            kyber_prekey_id: 1,
+            kyber_prekey_id: key_id,
             kyber_prekey: hex::encode(kpk.public_key.serialize()),
             kyber_prekey_sig: hex::encode(&kpk_sig),
             one_time,
@@ -376,6 +393,23 @@ mod tests {
         let mut alice = Account::load(&dir.join("a")).unwrap();
         assert_eq!(alice.decrypt(&c2).unwrap().1, "Привіт, Алісо!");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn refreshed_keys_work_and_old_ones_still_decrypt() {
+        let issuer = Issuer::generate();
+        let (mut alice, _) = account(&issuer);
+        let (mut carol, _) = account(&issuer);
+        let (mut bob, mut old_keys) = account(&issuer);
+        // Аліса почала сесію за старими ключами, але Боб тим часом оновив ключі (сервер їх втратив).
+        alice.start_session(&old_keys.take_bundle()).unwrap();
+        let mut new_keys = bob.refresh_keys().unwrap();
+        assert_ne!(new_keys.signed_prekey_id, old_keys.signed_prekey_id);
+        let c_old = alice.encrypt(&bob.identity_hex(), "за старими").unwrap();
+        carol.start_session(&new_keys.take_bundle()).unwrap();
+        let c_new = carol.encrypt(&bob.identity_hex(), "за новими").unwrap();
+        assert_eq!(bob.decrypt(&c_old).unwrap().1, "за старими");
+        assert_eq!(bob.decrypt(&c_new).unwrap().1, "за новими");
     }
 
     #[test]

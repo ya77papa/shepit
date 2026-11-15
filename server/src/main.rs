@@ -4,6 +4,7 @@
 //! |-------|-------------------------|--------|-----------|
 //! | GET   | /v0/trust-root          | —      | корінь довіри для сертифікатів відправника |
 //! | PUT   | /v0/keys                | так    | опублікувати свої ключі (тільки власник ключа) |
+//! | GET   | /v0/keys/status         | так    | скільки моїх одноразових ключів лишилось (404 — ключів немає) |
 //! | GET   | /v0/keys/{identity}     | —      | пакет ключів людини (забирає 1 одноразовий) |
 //! | GET   | /v0/certificate         | так    | сертифікат відправника на 24 год |
 //! | POST  | /v0/send                | —      | покласти конверт у скриньку (sealed sender: відправник невідомий) |
@@ -12,7 +13,9 @@
 //! Також роздає веб-клієнт зі `$SHEPIT_WEB` (типово `./web`, якщо тека існує).
 //!
 //! Сервер бачить: хто отримує (скринька) і розмір. НЕ бачить: текст і відправника.
-//! Етап 0: черги в пам'яті; ключі сертифікатів — у $SHEPIT_DATA/issuer.json.
+//! Дані — у $SHEPIT_DATA: issuer.json (ключі сертифікатів) і shepit.db (SQLite: ключі, черги).
+
+mod db;
 
 use std::{
     collections::HashMap,
@@ -33,17 +36,17 @@ use shepit_core::{
     wire::{Envelope, KeyUpload, MailboxId, PreKeyBundle},
 };
 
-#[derive(Default)]
-struct Inner {
-    mailboxes: HashMap<MailboxId, Vec<Envelope>>,
-    keys: HashMap<String, KeyUpload>,
+struct App {
+    db: db::Db,
     /// Використані nonce → час. Захист від повторного відтворення підписаних запитів.
-    nonces: HashMap<String, u64>,
+    /// У пам'яті: після перезапуску старі запити все одно відсіче вікно часу.
+    nonces: Mutex<HashMap<String, u64>>,
+    issuer: Issuer,
 }
 
-struct App {
-    inner: Mutex<Inner>,
-    issuer: Issuer,
+fn internal(e: rusqlite::Error) -> StatusCode {
+    eprintln!("db: {e}");
+    StatusCode::INTERNAL_SERVER_ERROR
 }
 
 type Shared = Arc<App>;
@@ -58,9 +61,9 @@ fn authenticate(app: &App, headers: &HeaderMap, purpose: &str, body: &[u8]) -> R
     let auth = Auth::parse(raw).map_err(|_| StatusCode::UNAUTHORIZED)?;
     let now = now_ms();
     auth.verify(purpose, body, now).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let mut inner = app.inner.lock().unwrap();
-    inner.nonces.retain(|_, t| now.saturating_sub(*t) <= 2 * MAX_SKEW_MS);
-    if inner.nonces.insert(auth.nonce.clone(), now).is_some() {
+    let mut nonces = app.nonces.lock().unwrap();
+    nonces.retain(|_, t| now.saturating_sub(*t) <= 2 * MAX_SKEW_MS);
+    if nonces.insert(auth.nonce.clone(), now).is_some() {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(auth.identity)
@@ -85,14 +88,25 @@ async fn put_keys(State(app): State<Shared>, headers: HeaderMap, body: Bytes) ->
     if up.one_time.len() > MAX_ONE_TIME {
         return StatusCode::BAD_REQUEST;
     }
-    app.inner.lock().unwrap().keys.insert(up.identity.clone(), up);
-    StatusCode::NO_CONTENT
+    match app.db.put_keys(&up) {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(e) => internal(e),
+    }
 }
 
 async fn get_keys(State(app): State<Shared>, Path(identity): Path<String>) -> Result<Json<PreKeyBundle>, StatusCode> {
-    let mut inner = app.inner.lock().unwrap();
-    let up = inner.keys.get_mut(&identity).ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(up.take_bundle()))
+    app.db.take_bundle(&identity).map_err(internal)?.map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+#[derive(serde::Serialize)]
+struct KeyStatus {
+    one_time: usize,
+}
+
+async fn key_status(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<KeyStatus>, StatusCode> {
+    let who = authenticate(&app, &headers, "GET /v0/keys/status", b"")?;
+    let n = app.db.one_time_left(&who).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(KeyStatus { one_time: n }))
 }
 
 async fn certificate(State(app): State<Shared>, headers: HeaderMap) -> Result<String, StatusCode> {
@@ -105,13 +119,11 @@ async fn send(State(app): State<Shared>, Json(env): Json<Envelope>) -> StatusCod
     if env.payload.len() > MAX_PAYLOAD_HEX {
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
-    let mut inner = app.inner.lock().unwrap();
-    let queue = inner.mailboxes.entry(env.to).or_default();
-    if queue.len() >= MAX_QUEUE {
-        return StatusCode::TOO_MANY_REQUESTS;
+    match app.db.push(&env, MAX_QUEUE, now_ms()) {
+        Ok(true) => StatusCode::ACCEPTED,
+        Ok(false) => StatusCode::TOO_MANY_REQUESTS,
+        Err(e) => internal(e),
     }
-    queue.push(env);
-    StatusCode::ACCEPTED
 }
 
 async fn fetch(State(app): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> Result<Json<Vec<Envelope>>, StatusCode> {
@@ -122,11 +134,15 @@ async fn fetch(State(app): State<Shared>, headers: HeaderMap, Path(id): Path<Str
     if MailboxId::for_identity(&who_bytes) != mailbox {
         return Err(StatusCode::FORBIDDEN);
     }
-    Ok(Json(app.inner.lock().unwrap().mailboxes.remove(&mailbox).unwrap_or_default()))
+    Ok(Json(app.db.drain(&mailbox).map_err(internal)?))
+}
+
+fn data_dir() -> PathBuf {
+    PathBuf::from(std::env::var("SHEPIT_DATA").unwrap_or_else(|_| "data".into()))
 }
 
 fn load_issuer() -> Issuer {
-    let dir = PathBuf::from(std::env::var("SHEPIT_DATA").unwrap_or_else(|_| "data".into()));
+    let dir = data_dir();
     let path = dir.join("issuer.json");
     if let Ok(raw) = std::fs::read(&path) {
         return serde_json::from_slice(&raw).expect("issuer.json пошкоджений");
@@ -159,13 +175,25 @@ fn web_dir() -> Option<PathBuf> {
     dir.join("index.html").is_file().then_some(dir)
 }
 
-fn app(issuer: Issuer) -> Router {
+fn app(issuer: Issuer, db: db::Db) -> Router {
     use tower_http::{services::{ServeDir, ServeFile}, set_header::SetResponseHeaderLayer};
-    let shared = Arc::new(App { inner: Mutex::default(), issuer });
+    let shared = Arc::new(App { db, nonces: Mutex::default(), issuer });
+    // Раз на годину прибирати недоставлені конверти старші за 30 днів.
+    let pruner = shared.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            tick.tick().await;
+            if let Ok(n @ 1..) = pruner.db.prune(now_ms()) {
+                println!("Прибрано старих конвертів: {n}");
+            }
+        }
+    });
     let api = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v0/trust-root", get(trust_root))
         .route("/v0/keys", put(put_keys))
+        .route("/v0/keys/status", get(key_status))
         .route("/v0/keys/{identity}", get(get_keys))
         .route("/v0/certificate", get(certificate))
         .route("/v0/send", post(send))
@@ -224,10 +252,11 @@ async fn main() {
         .parse()
         .expect("SHEPIT_LISTEN: invalid address");
     let issuer = load_issuer();
+    let db = db::Db::open(&data_dir().join("shepit.db")).expect("open shepit.db");
     println!("Корінь довіри: {}", issuer.trust_root_hex());
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     println!("shepit-server listening on {addr}");
-    axum::serve(listener, app(issuer))
+    axum::serve(listener, app(issuer, db))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();

@@ -56,6 +56,13 @@ impl WebAccount {
         self.upload.clone()
     }
 
+    /// Новий набір ключів для `PUT /v0/keys` (коли сервер їх втратив або одноразові закінчуються).
+    #[wasm_bindgen(js_name = refreshKeysJson)]
+    pub fn refresh_keys_json(&mut self) -> Result<String, JsError> {
+        let up = self.inner.refresh_keys().map_err(js_err)?;
+        serde_json::to_string(&up).map_err(js_err)
+    }
+
     pub fn identity(&self) -> String {
         self.inner.identity_hex()
     }

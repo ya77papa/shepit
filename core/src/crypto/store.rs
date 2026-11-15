@@ -144,4 +144,7 @@ pub struct State {
     /// Поточний сертифікат відправника (hex), видається сервером.
     #[serde(default)]
     pub sender_cert: Option<String>,
+    /// Наступний вільний ID для pre-key (0 = старий акаунт, де вже зайняті 1..=20).
+    #[serde(default)]
+    pub next_key_id: u32,
 }

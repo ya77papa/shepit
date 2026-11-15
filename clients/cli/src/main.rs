@@ -76,6 +76,31 @@ fn ensure_certificate(acc: &mut Account) {
     acc.set_certificate(&cert).unwrap_or_else(|e| die(e));
 }
 
+/// Перевірити, що сервер має мої ключі (і їх вистачає); інакше опублікувати нові.
+fn ensure_keys(acc: &mut Account, profile: &str) {
+    let status = ureq::get(format!("{}/v0/keys/status", server()))
+        .header(HEADER, acc.auth_header("GET /v0/keys/status", b""))
+        .call();
+    let left = match status {
+        Ok(mut r) => r.body_mut().read_json::<serde_json::Value>().ok()
+            .and_then(|v| v["one_time"].as_u64()).unwrap_or(0),
+        Err(ureq::Error::StatusCode(404)) => 0,
+        Err(e) => http_err("статус ключів", e),
+    };
+    if left >= 5 {
+        return;
+    }
+    let upload = acc.refresh_keys().unwrap_or_else(|e| die(e));
+    acc.save(&path(profile)).unwrap_or_else(|e| die(e));
+    let body = serde_json::to_vec(&upload).expect("serialize");
+    ureq::put(format!("{}/v0/keys", server()))
+        .header(HEADER, acc.auth_header("PUT /v0/keys", &body))
+        .header("content-type", "application/json")
+        .send(&body[..])
+        .unwrap_or_else(|e| http_err("публікація ключів", e));
+    println!("Опубліковано нові ключі (на сервері лишалось {left}).");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg = |i: usize| args.get(i).map(String::as_str).unwrap_or_else(|| usage());
@@ -134,6 +159,7 @@ fn main() {
         "recv" => {
             let profile = arg(1);
             let mut acc = load(profile);
+            ensure_keys(&mut acc, profile);
             let mb = acc.mailbox().to_hex();
             let envs: Vec<Envelope> = ureq::get(format!("{}/v0/mailbox/{mb}", server()))
                 .header(HEADER, acc.auth_header(&format!("GET /v0/mailbox/{mb}"), b""))

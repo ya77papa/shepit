@@ -24,6 +24,8 @@ docker logs shepit
 - `.env` — `SHEPIT_BIND=127.0.0.1`.
 - `docker-compose.override.yml` — `user: "<uid>:<gid>"` користувача `shepit`.
 - `data/issuer.json` — **приватні ключі сервера** (корінь довіри). Бекап обов'язковий.
+- `data/shepit.db` — SQLite: опубліковані публічні ключі та недоставлені (зашифровані) конверти.
+  Втрата не критична: клієнти самі перепублікують ключі, загубляться лише недоставлені повідомлення.
   Резервна копія — на SRV у `/home/shepit/shepit-server/data/` (контейнер там зупинено).
 
 nginx: `/etc/nginx/sites-available/shepit`, `proxy_pass http://127.0.0.1:8443`,
