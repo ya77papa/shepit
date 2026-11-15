@@ -255,6 +255,25 @@ impl Account {
         Ok(())
     }
 
+    /// Код безпеки для пари «я — `peer`», як у Signal: 60 цифр (12 груп по 5),
+    /// **однаковий на обох пристроях**. Зміниться, якщо підмінять ключ будь-кого з двох.
+    pub fn safety_number(&self, peer: &str) -> Result<String> {
+        let mine = self.identity_bytes();
+        let theirs = unhex(peer, "identity")?;
+        let peer_key = IdentityKey::decode(&theirs)?;
+        let fp = libsignal_protocol::Fingerprint::new(
+            2,
+            5200,
+            &mine,
+            self.key_pair().identity_key(),
+            &theirs,
+            &peer_key,
+        )
+        .map_err(|_| Error::Malformed("safety number"))?;
+        let digits = fp.display_string().map_err(|_| Error::Malformed("safety number"))?;
+        Ok(digits.as_bytes().chunks(5).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join(" "))
+    }
+
     pub fn has_session(&self, peer: &str) -> bool {
         block_on(self.st.sessions.load_session(&address(peer)))
             .ok()
@@ -410,6 +429,19 @@ mod tests {
         let c_new = carol.encrypt(&bob.identity_hex(), "за новими").unwrap();
         assert_eq!(bob.decrypt(&c_old).unwrap().1, "за старими");
         assert_eq!(bob.decrypt(&c_new).unwrap().1, "за новими");
+    }
+
+    #[test]
+    fn safety_number_is_symmetric_and_pairwise() {
+        let issuer = Issuer::generate();
+        let (alice, _) = account(&issuer);
+        let (bob, _) = account(&issuer);
+        let (carol, _) = account(&issuer);
+        let ab = alice.safety_number(&bob.identity_hex()).unwrap();
+        assert_eq!(ab, bob.safety_number(&alice.identity_hex()).unwrap());
+        assert_eq!(ab.split(' ').count(), 12);
+        assert_ne!(ab, alice.safety_number(&carol.identity_hex()).unwrap());
+        assert_ne!(ab, alice.fingerprint());
     }
 
     #[test]

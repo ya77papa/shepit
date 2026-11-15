@@ -92,6 +92,12 @@ impl WebAccount {
         self.inner.set_certificate(&cert).map_err(js_err)
     }
 
+    /// Спільний код безпеки з `peer` (однаковий на обох пристроях).
+    #[wasm_bindgen(js_name = safetyNumber)]
+    pub fn safety_number(&self, peer: &str) -> Result<String, JsError> {
+        self.inner.safety_number(peer).map_err(js_err)
+    }
+
     #[wasm_bindgen(js_name = hasSession)]
     pub fn has_session(&self, peer: &str) -> bool {
         self.inner.has_session(peer)

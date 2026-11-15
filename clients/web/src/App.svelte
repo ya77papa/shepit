@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { renderSVG } from 'uqr';
-  import { Shepit, fingerprintOf, isValidIdentity, loadWasm } from './lib/shepit';
+  import { Shepit, announceAccountChange, fingerprintOf, isValidIdentity, loadWasm, onAccountChangedElsewhere } from './lib/shepit';
   import { contacts as contactsDb, kv, messages as messagesDb, wipe, type Contact, type Message } from './lib/db';
   import { exportBackup, importBackup, MIN_PASSWORD } from './lib/backup';
 
@@ -230,6 +230,7 @@
     error = '';
     try {
       await importBackup(restoreFile, password);
+      announceAccountChange();
       password = '';
       me = await Shepit.restore();
       myName = (await kv.get<string>('myName')) ?? '';
@@ -248,6 +249,7 @@
   async function logout() {
     if (!confirm('Видалити акаунт з цього браузера? Без резервної копії ключі буде втрачено назавжди.')) return;
     await wipe();
+    announceAccountChange();
     location.reload();
   }
 
@@ -259,6 +261,7 @@
       if (inv) invite = inv;
     };
     window.addEventListener('hashchange', onHash);
+    onAccountChangedElsewhere(() => location.reload());
     (async () => {
       try {
         await loadWasm();
@@ -319,8 +322,7 @@
     <aside>
       <section class="me">
         <input class="myname" placeholder="Твоє ім'я (для запрошень)" bind:value={myName} onchange={saveName} maxlength="60" />
-        <div class="label">Мій відбиток</div>
-        <div class="fp">{me.fingerprint}</div>
+        <div class="myid small muted" title="Короткий ідентифікатор твого ключа. Для перевірки співрозмовника використовуй «код безпеки» в розмові.">Мій ID: <span class="mono">{short(me.fingerprint)}</span></div>
         <div class="row wrap">
           <button class="primary" onclick={() => (panel = 'invite')}>Запросити друга</button>
           <button onclick={() => (panel = 'backup')} title="Зашифрована резервна копія ключів">Резервна копія</button>
@@ -365,8 +367,8 @@
         </header>
         {#if showSafety}
           <div class="safety">
-            Порівняйте цей код з {current.name} наживо або по телефону. Якщо збігається — ніхто не стоїть посередині.
-            <div class="fp">{current.fingerprint}</div>
+            Цей код <b>однаковий у вас обох</b>. Порівняйте його з {current.name} наживо або по телефону: якщо збігається — ніхто не підмінив ключі.
+            <div class="fp">{me.safetyNumber(current.identity)}</div>
           </div>
         {/if}
         <div class="thread" bind:this={threadEl}>

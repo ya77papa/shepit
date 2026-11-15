@@ -81,3 +81,4 @@ aside { background: var(--panel); border-right: 1px solid var(--line); padding: 
 .qr svg { width: 100%; height: auto; }
 .linkbox { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px; font-size: .75rem; word-break: break-all; user-select: all; }
 .file input { padding: 8px; }
+.myid { margin-bottom: 12px; }

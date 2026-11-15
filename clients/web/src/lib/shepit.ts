@@ -27,11 +27,24 @@ async function http(method: string, path: string, init: RequestInit = {}): Promi
   return r;
 }
 
+// Усі вкладки цього браузера ділять одне сховище. Якщо акаунт змінився в одній —
+// інші перезавантажуються, щоб не працювати зі старими ключами в пам'яті.
+const tabs = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('shepit-account') : null;
+export function announceAccountChange() {
+  tabs?.postMessage('changed');
+}
+export function onAccountChangedElsewhere(f: () => void) {
+  if (tabs) tabs.onmessage = () => f();
+}
+
 export class Shepit {
   private constructor(private acc: WebAccount) {}
 
   get identity() { return this.acc.identity(); }
   get fingerprint() { return this.acc.fingerprint(); }
+
+  /** Спільний з `peer` код безпеки (однаковий на обох пристроях). */
+  safetyNumber(peer: string): string { return this.acc.safetyNumber(peer); }
 
   private async save() {
     await kv.set('account', this.acc.export());
@@ -47,12 +60,16 @@ export class Shepit {
   /** Створити акаунт: ключі генеруються тут, у браузері. Сервер бачить лише публічні. */
   static async register(): Promise<Shepit> {
     await loadWasm();
+    // Акаунт уже створено в іншій вкладці цього браузера — не перезаписувати його!
+    const existing = await Shepit.restore();
+    if (existing) return existing;
     const root = (await (await http('GET', '/v0/trust-root')).text()).trim();
     const acc = WebAccount.create(root);
     const s = new Shepit(acc);
     await s.publishKeys(acc.keyUploadJson()!);
     await s.ensureCertificate();
     await s.save();
+    announceAccountChange();
     return s;
   }
 
