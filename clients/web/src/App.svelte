@@ -4,6 +4,7 @@
   import { Shepit, announceAccountChange, fingerprintOf, isValidIdentity, loadWasm, onAccountChangedElsewhere } from './lib/shepit';
   import { contacts as contactsDb, kv, messages as messagesDb, wipe, type Contact, type Message } from './lib/db';
   import { exportBackup, importBackup, MIN_PASSWORD } from './lib/backup';
+  import { COMMIT, SHORT, commitUrl, compareUrl, registerServiceWorker } from './lib/pwa';
 
   const POLL_MS = 3000;
   // Службове «привітання» після прийняття запрошення: несе ім'я, щоб той, хто запросив,
@@ -37,6 +38,8 @@
   let copied = $state('');
   let showSafety = $state(false);
   let threadEl: HTMLElement | undefined = $state();
+  let applyUpdate: (() => void) | null = $state(null); // є нова версія, чекає згоди
+  let updatedFrom = $state(''); // версію щойно змінено (показати, з якої)
 
   const short = (fp: string) => fp.split(' ').slice(0, 2).join(' ');
   const inviteUrl = $derived(
@@ -265,8 +268,12 @@
     };
     window.addEventListener('hashchange', onHash);
     onAccountChangedElsewhere(() => location.reload());
+    registerServiceWorker((apply) => (applyUpdate = apply)).catch((e) => console.warn('service worker:', e));
     (async () => {
       try {
+        const prev = await kv.get<string>('version');
+        if (prev && prev !== COMMIT) updatedFrom = prev;
+        await kv.set('version', COMMIT);
         await loadWasm();
         invite = readInviteFromUrl();
         me = await Shepit.restore();
@@ -290,6 +297,25 @@
   });
 </script>
 
+{#if applyUpdate}
+  <div class="update-bar" role="status">
+    <span>Доступна нова версія Шепоту. Код нової версії вже перевірено браузером, але ввімкнеться вона лише з твоєї згоди.</span>
+    <span class="row">
+      <a href={commitUrl(COMMIT)} target="_blank" rel="noopener">Поточна: {SHORT}</a>
+      <button class="primary" onclick={() => applyUpdate?.()}>Оновити</button>
+      <button class="ghost" onclick={() => (applyUpdate = null)}>Пізніше</button>
+    </span>
+  </div>
+{/if}
+{#if updatedFrom}
+  <div class="update-bar ok" role="status">
+    <span>Шепіт оновлено: {updatedFrom === 'dev' ? 'dev' : updatedFrom.slice(0, 7)} → {SHORT}.</span>
+    <span class="row">
+      {#if updatedFrom !== 'dev' && COMMIT !== 'dev'}<a href={compareUrl(updatedFrom, COMMIT)} target="_blank" rel="noopener">Що змінилось</a>{/if}
+      <button class="ghost" onclick={() => (updatedFrom = '')}>✕</button>
+    </span>
+  </div>
+{/if}
 {#if loading}
   <main class="center"><p class="muted">Завантаження…</p></main>
 {:else if !me}
@@ -317,6 +343,7 @@
         </div>
       {/if}
       {#if error}<p class="error">{error}</p>{/if}
+      <p class="muted small">Версія <a href={commitUrl(COMMIT)} target="_blank" rel="noopener">{SHORT}</a> · відкритий код</p>
       <p class="warn small">Веб-версія зручна, але менш захищена за нативний застосунок: код завантажується з сервера. Для максимального захисту — дочекайся застосунку для Android.</p>
     </div>
   </main>
@@ -351,6 +378,7 @@
         </ul>
       </section>
       <p class="warn small">Веб-версія: ключі зберігаються в цьому браузері. Зроби резервну копію, інакше очищення даних сайту = втрата акаунта.</p>
+      <p class="muted small version">Версія <a href={commitUrl(COMMIT)} target="_blank" rel="noopener">{SHORT}</a> · <a href="/version.json" target="_blank">хеш збірки</a></p>
     </aside>
 
     <main class="chat">

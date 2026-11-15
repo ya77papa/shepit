@@ -18,6 +18,9 @@ RUN cargo build --release --locked -p shepit-server \
 
 # 2) Веб-інтерфейс
 FROM node:22-bookworm-slim AS web
+# Коміт, з якого зібрано: показується в застосунку і потрапляє у version.json
+ARG SHEPIT_COMMIT=dev
+ENV SHEPIT_COMMIT=$SHEPIT_COMMIT
 WORKDIR /web
 COPY clients/web/package.json clients/web/package-lock.json ./
 RUN npm ci --no-audit --no-fund

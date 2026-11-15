@@ -39,9 +39,22 @@ jobs:
           context: .
           file: server/Dockerfile
           platforms: linux/amd64
+          build-args: SHEPIT_COMMIT=${{ github.sha }}
           push: true
           tags: |
             ghcr.io/${{ github.repository_owner }}/shepit-server:latest
             ghcr.io/${{ github.repository_owner }}/shepit-server:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Хеш збірки веб-клієнта
+        run: |
+          IMAGE=ghcr.io/${{ github.repository_owner }}/shepit-server:${{ github.sha }}
+          docker run --rm --entrypoint cat "$IMAGE" /web/version.json > version.json
+          BUILD=$(jq -r .build version.json)
+          echo "Хеш збірки: $BUILD"
+          {
+            echo "### Веб-клієнт"
+            echo "- Коміт: \`${{ github.sha }}\`"
+            echo "- Хеш збірки: \`$BUILD\`"
+            echo "- Перевірити сервер: \`curl -s https://shepit.razom.isroot.in/version.json | jq -r .build\`"
+          } >> "$GITHUB_STEP_SUMMARY"
