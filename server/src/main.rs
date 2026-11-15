@@ -159,6 +159,21 @@ fn app(issuer: Issuer) -> Router {
         .with_state(shared)
 }
 
+/// Ctrl+C або SIGTERM (його надсилає `docker stop`).
+async fn shutdown_signal() {
+    let ctrl_c = async { tokio::signal::ctrl_c().await.ok(); };
+    #[cfg(unix)]
+    let term = async {
+        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            s.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
+    println!("shepit-server: зупинка");
+}
+
 #[tokio::main]
 async fn main() {
     let addr: SocketAddr = std::env::var("SHEPIT_LISTEN")
@@ -170,7 +185,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     println!("shepit-server listening on {addr}");
     axum::serve(listener, app(issuer))
-        .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.ok(); })
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
 }

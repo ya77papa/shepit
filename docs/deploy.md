@@ -1,17 +1,19 @@
 # Розгортання
 
 ```
-Клієнт ──HTTPS──▶ VPS (nginx, Let's Encrypt) ──Tailscale──▶ SRV (Docker: shepit-server)
-                  shepit.razom.isroot.in          100.81.235.117:8443
+Клієнт ──HTTPS──▶ VPS: nginx (Let's Encrypt) ──▶ 127.0.0.1:8443 shepit-server (Docker)
+                  shepit.razom.isroot.in
 ```
 
-- **SRV** не відкритий в інтернет: ні проброшених портів, ні публічної IP.
-- **VPS** лише проксює. Логи доступу вимкнені (`access_log off`), `X-Forwarded-For` не передається —
-  сервер Шепіт не знає IP клієнтів.
-- Трафік VPS → SRV іде через Tailscale (WireGuard), тобто зашифрований.
-- Поверх цього все одно E2EE + sealed sender: навіть VPS і SRV бачать лише шифротекст.
+Чому VPS, а не домашній SRV: сервер має працювати під час блекаутів.
 
-## SRV (`/home/shepit/shepit-server`, користувач `shepit` у групі docker)
+- Контейнер слухає лише `127.0.0.1` — доступ ззовні тільки через nginx.
+- nginx: логи доступу вимкнені (`access_log off`), `X-Forwarded-For` не передається —
+  сервер Шепіт не знає IP клієнтів.
+- Поверх TLS — E2EE + sealed sender: хостинг бачить лише шифротекст. Навіть з ключами сервера
+  неможливо видати себе за іншу людину (клієнт перевіряє «адреса = ключ»).
+
+## VPS (`/home/shepit/shepit-server`, користувач `shepit` у групі docker)
 
 ```bash
 docker compose pull && docker compose up -d     # оновлення до свіжого образу з ghcr.io
@@ -19,12 +21,13 @@ docker logs shepit
 ```
 
 - `docker-compose.yml` — з репозиторію (`server/docker-compose.yml`).
-- `docker-compose.override.yml` — локальний: `user: "<uid>:<gid>"` користувача `shepit`.
+- `.env` — `SHEPIT_BIND=127.0.0.1`.
+- `docker-compose.override.yml` — `user: "<uid>:<gid>"` користувача `shepit`.
 - `data/issuer.json` — **приватні ключі сервера** (корінь довіри). Бекап обов'язковий.
+  Резервна копія — на SRV у `/home/shepit/shepit-server/data/` (контейнер там зупинено).
 
-## VPS (`/etc/nginx/sites-available/shepit`)
-
-nginx `proxy_pass http://100.81.235.117:8443`, сертифікат — certbot (`--nginx`, автопоновлення).
+nginx: `/etc/nginx/sites-available/shepit`, `proxy_pass http://127.0.0.1:8443`,
+сертифікат — certbot (`--nginx`, автопоновлення).
 
 ## Образ
 
