@@ -102,3 +102,8 @@ button.big { padding: 12px 18px; }
 .call-card { text-align: center; justify-items: center; }
 .call-avatar { font-size: 48px; }
 .notify-cta { width: 100%; text-align: left; background: #2b2a14; border: 1px solid #6b5f1f; line-height: 1.35; }
+.who-name { font-weight: 700; font-size: 1.05rem; }
+.gear { font-size: 1.3rem; padding: 4px 8px; }
+.wide { width: 100%; margin-top: 12px; }
+.field { display: grid; gap: 6px; padding: 10px 0; border-top: 1px solid var(--line); }
+.field .mono { font-size: .85rem; word-spacing: .2em; }

@@ -4,7 +4,7 @@
   import { Shepit, announceAccountChange, fingerprintOf, isValidIdentity, loadWasm, onAccountChangedElsewhere } from './lib/shepit';
   import { contacts as contactsDb, kv, messages as messagesDb, wipe, type Contact, type Message } from './lib/db';
   import { exportBackup, importBackup, MIN_PASSWORD } from './lib/backup';
-  import { COMMIT, SHORT, commitUrl, compareUrl, registerServiceWorker } from './lib/pwa';
+  import { COMMIT, REPO, SHORT, commitUrl, compareUrl, registerServiceWorker } from './lib/pwa';
   import { decode, encode, fromBase64, toBase64, fmtDuration } from './lib/content';
   import { VoiceRecorder, MAX_VOICE_MS } from './lib/recorder';
   import { CallManager, checkRelay, type RelayCheck } from './lib/call.svelte';
@@ -33,7 +33,7 @@
   let unread: Record<string, number> = $state({});
 
   let invite: Invite | null = $state(null); // прийшли за посиланням-запрошенням
-  let panel: '' | 'invite' | 'backup' | 'add' | 'restore' | 'calltest' = $state('');
+  let panel: '' | 'invite' | 'backup' | 'add' | 'restore' | 'calltest' | 'settings' = $state('');
   let relayResults: RelayCheck[] | null = $state(null);
   let pushState: 'unsupported' | 'off' | 'on' | 'denied' | 'busy' = $state('unsupported');
   let newName = $state('');
@@ -507,14 +507,21 @@
   <div class="app">
     <aside>
       <section class="me">
-        <input class="myname" placeholder="Твоє ім'я (для запрошень)" bind:value={myName} onchange={saveName} maxlength="60" />
-        <div class="myid small muted" title="Короткий ідентифікатор твого ключа. Для перевірки співрозмовника використовуй «код безпеки» в розмові.">Мій ID: <span class="mono">{short(me.fingerprint)}</span></div>
-        <div class="row wrap">
-          <button class="primary" onclick={() => (panel = 'invite')}>Запросити друга</button>
-          <button onclick={() => (panel = 'backup')} title="Зашифрована резервна копія ключів">Резервна копія</button>
-          <button class="ghost" title="Вийти і стерти ключі з цього браузера" onclick={logout}>Вийти</button>
+        <div class="row between">
+          <div class="who">
+            <div class="who-name">{myName || 'Без імені'}</div>
+            <div class="small muted">Мій ID: <span class="mono">{short(me.fingerprint)}</span></div>
+          </div>
+          <button class="ghost gear" title="Налаштування" aria-label="Налаштування" onclick={() => (panel = 'settings')}>⚙️</button>
         </div>
+        <button class="primary wide" onclick={() => (panel = 'invite')}>Запросити друга</button>
       </section>
+
+      {#if pushState === 'off'}
+        <button class="notify-cta" onclick={enablePush}>🔔 Увімкнути сповіщення — щоб дзвінки доходили, коли Шепіт закритий</button>
+      {:else if pushState === 'denied'}
+        <p class="small warn">🔕 Сповіщення заборонені для цього сайту в налаштуваннях браузера — дзвінки не дійдуть, коли Шепіт закритий.</p>
+      {/if}
 
       <section class="contacts">
         <div class="row between">
@@ -533,19 +540,6 @@
           {/each}
         </ul>
       </section>
-      <p class="warn small">Веб-версія: ключі зберігаються в цьому браузері. Зроби резервну копію, інакше очищення даних сайту = втрата акаунта.</p>
-      {#if pushState === 'off'}
-        <button class="notify-cta" onclick={enablePush}>🔔 Увімкнути сповіщення — щоб дзвінки доходили, коли Шепіт закритий</button>
-      {:else if pushState === 'busy'}
-        <p class="small muted">🔔 Вмикаю сповіщення…</p>
-      {:else if pushState === 'denied'}
-        <p class="small warn">🔕 Сповіщення заборонені в налаштуваннях браузера для цього сайту — без них дзвінки не дійдуть, коли Шепіт закритий.</p>
-      {/if}
-      <p class="small row wrap">
-        <button class="ghost small" onclick={runCallTest}>📞 Перевірити дзвінки</button>
-        {#if pushState === 'on'}<button class="ghost small" onclick={disablePush}>🔔 Сповіщення увімкнено · вимкнути</button>{/if}
-      </p>
-      <p class="muted small version">Версія <a href={commitUrl(COMMIT)} target="_blank" rel="noopener">{SHORT}</a> · <a href="/version.json" target="_blank">хеш збірки</a></p>
     </aside>
 
     <main class="chat">
@@ -640,6 +634,45 @@
             <button onclick={() => copy(inviteUrl, 'link')}>Копіювати</button>
             <button onclick={() => copy(me!.identity, 'key')}>{copied === 'key' ? 'Скопійовано ✓' : 'Лише ключ'}</button>
           </div>
+        {:else if panel === 'settings'}
+          <h2>Налаштування</h2>
+          <label class="field">
+            <span class="label">Моє ім'я</span>
+            <input placeholder="Як тебе називати" bind:value={myName} onchange={saveName} maxlength="60" />
+            <span class="small muted">Бачать лише ті, кого ти запрошуєш. Сервер його не знає.</span>
+          </label>
+          <div class="field">
+            <span class="label">Мій ID</span>
+            <span class="mono">{me.fingerprint}</span>
+          </div>
+          <div class="field">
+            <span class="label">Сповіщення</span>
+            {#if pushState === 'on'}
+              <span class="row wrap">✅ Увімкнено <button class="ghost small" onclick={disablePush}>Вимкнути</button></span>
+            {:else if pushState === 'off'}
+              <button onclick={enablePush}>🔔 Увімкнути</button>
+            {:else if pushState === 'busy'}
+              <span class="muted">Вмикаю…</span>
+            {:else if pushState === 'denied'}
+              <span class="warn small">Заборонені в налаштуваннях браузера для цього сайту.</span>
+            {:else}
+              <span class="muted small">Цей браузер не підтримує сповіщення.</span>
+            {/if}
+          </div>
+          <div class="field">
+            <span class="label">Дзвінки</span>
+            <button onclick={runCallTest}>📞 Перевірити дзвінки</button>
+          </div>
+          <div class="field">
+            <span class="label">Резервна копія</span>
+            <button onclick={() => (panel = 'backup')}>💾 Зберегти ключі у файл</button>
+            <span class="small warn">Ключі зберігаються лише в цьому браузері. Без копії очищення даних сайту = втрата акаунта.</span>
+          </div>
+          <div class="field">
+            <span class="label">Версія</span>
+            <span class="small"><a href={commitUrl(COMMIT)} target="_blank" rel="noopener">{SHORT}</a> · <a href="/version.json" target="_blank">хеш збірки</a> · <a href={REPO} target="_blank" rel="noopener">відкритий код</a></span>
+          </div>
+          <button class="danger" onclick={logout}>Вийти й стерти ключі з цього браузера</button>
         {:else if panel === 'calltest'}
           <h2>Перевірка дзвінків</h2>
           <p class="small muted">Перевіряємо, чи цей пристрій досягає ретранслятора голосу.</p>

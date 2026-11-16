@@ -20,15 +20,24 @@
   let ringer: ReturnType<typeof setInterval> | null = null;
   function beep() {
     ctx ??= new AudioContext();
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-    o.frequency.value = calls.state === 'incoming' ? 660 : 440;
-    g.gain.setValueAtTime(0.0001, ctx.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.15, ctx.currentTime + 0.05);
-    g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.6);
-    o.connect(g).connect(ctx.destination);
-    o.start();
-    o.stop(ctx.currentTime + 0.65);
+    // Вхідний — гучна подвійна трель; вихідний — тихий гудок.
+    const incoming = calls.state === 'incoming';
+    const peak = incoming ? 0.9 : 0.12;
+    const tones = incoming ? [0, 0.35] : [0];
+    for (const at of tones) {
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = incoming ? 'square' : 'sine';
+      o.frequency.value = incoming ? 880 : 440;
+      const t0 = ctx.currentTime + at;
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(peak, t0 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.3);
+      o.connect(g).connect(ctx.destination);
+      o.start(t0);
+      o.stop(t0 + 0.32);
+    }
+    if (incoming) navigator.vibrate?.([400, 200, 400]);
   }
   $effect(() => {
     const ringing = calls.state === 'incoming' || calls.state === 'outgoing';
