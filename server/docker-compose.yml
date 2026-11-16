@@ -33,6 +33,8 @@ services:
   #   COMPOSE_PROFILES=calls
   #   SHEPIT_TURN_SECRET=<openssl rand -hex 32>
   #   SHEPIT_TURN_URLS=turn:<домен>:3478?transport=udp,turn:<домен>:3478?transport=tcp
+  #   SHEPIT_TURN_IP=<публічна IP сервера>   (обов'язково: інакше coturn може віддати
+  #                                          адресу docker- чи VPN-інтерфейсу, і дзвінок не з'єднається)
   # Потрібні відкриті порти: 3478/udp+tcp і 49160-49400/udp.
   # Ретранслятор пересилає лише зашифрований звук і не знає, хто дзвонить
   # (логіни тимчасові й не містять ідентичності).
@@ -47,6 +49,8 @@ services:
       - /var/lib/coturn
     command:
       - --listening-port=3478
+      - --listening-ip=${SHEPIT_TURN_IP:-127.0.0.1}
+      - --relay-ip=${SHEPIT_TURN_IP:-127.0.0.1}
       - --min-port=49160
       - --max-port=49400
       - --use-auth-secret

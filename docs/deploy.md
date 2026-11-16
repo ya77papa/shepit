@@ -39,7 +39,11 @@ nginx: `/etc/nginx/sites-available/shepit`, `proxy_pass http://127.0.0.1:8443`,
 COMPOSE_PROFILES=calls
 SHEPIT_TURN_SECRET=<openssl rand -hex 32>
 SHEPIT_TURN_URLS=turn:shepit.razom.isroot.in:3478?transport=udp,turn:shepit.razom.isroot.in:3478?transport=tcp
+SHEPIT_TURN_IP=<публічна IP VPS>
 ```
+
+`SHEPIT_TURN_IP` обов'язковий: на сервері з кількома інтерфейсами (Docker, VPN) coturn інакше
+може віддати клієнтам недосяжну адресу ретранслятора, і дзвінок зависне на «З'єднання…».
 
 Порти: 3478/udp+tcp, 49160–49400/udp. Без TURN дзвінки йдуть напряму (IP видно співрозмовнику).
 

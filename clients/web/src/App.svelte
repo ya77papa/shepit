@@ -445,7 +445,7 @@
         <div class="row wrap">
           <button class="primary" onclick={() => (panel = 'invite')}>Запросити друга</button>
           <button onclick={() => (panel = 'backup')} title="Зашифрована резервна копія ключів">Резервна копія</button>
-          <button class="ghost" title="Вийти і стерти ключі з цього браузера" onclick={logout}>⏻</button>
+          <button class="ghost" title="Вийти і стерти ключі з цього браузера" onclick={logout}>Вийти</button>
         </div>
       </section>
 
