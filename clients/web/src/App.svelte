@@ -7,7 +7,7 @@
   import { COMMIT, SHORT, commitUrl, compareUrl, registerServiceWorker } from './lib/pwa';
   import { decode, encode, fromBase64, toBase64, fmtDuration } from './lib/content';
   import { VoiceRecorder, MAX_VOICE_MS } from './lib/recorder';
-  import { CallManager } from './lib/call.svelte';
+  import { CallManager, checkRelay, type RelayCheck } from './lib/call.svelte';
   import VoiceMsg from './VoiceMsg.svelte';
   import CallOverlay from './CallOverlay.svelte';
 
@@ -33,7 +33,8 @@
   let unread: Record<string, number> = $state({});
 
   let invite: Invite | null = $state(null); // прийшли за посиланням-запрошенням
-  let panel: '' | 'invite' | 'backup' | 'add' | 'restore' = $state('');
+  let panel: '' | 'invite' | 'backup' | 'add' | 'restore' | 'calltest' = $state('');
+  let relayResults: RelayCheck[] | null = $state(null);
   let newName = $state('');
   let newKey = $state('');
   let password = $state('');
@@ -45,8 +46,6 @@
   let applyUpdate: (() => void) | null = $state(null); // є нова версія, чекає згоди
   let updatedFrom = $state(''); // версію щойно змінено (показати, з якої)
   let streamOk = $state(false); // відкритий потік подій — пошта приходить миттєво
-  let pttOn: Record<string, boolean> = $state({}); // режим «рація» по контактах
-  let autoplayId: number | null = $state(null);
   const recorder = new VoiceRecorder();
   let recording = $state(false);
   let recStart = $state(0);
@@ -177,13 +176,13 @@
     }
   }
 
-  async function sendVoice(blob: Blob, mime: string, dur: number, ptt: boolean) {
+  async function sendVoice(blob: Blob, mime: string, dur: number) {
     if (!me || !current) return;
     const peer = current;
     busy = true;
     try {
-      await me.send(peer.identity, encode({ t: 'voice', mime, dur, data: toBase64(await blob.arrayBuffer()), ptt }));
-      await messagesDb.add({ peer: peer.identity, out: true, text: ptt ? '📻 Рація' : '🎤 Голосове', at: Date.now(), kind: 'voice', voice: { blob, mime, dur, ptt } });
+      await me.send(peer.identity, encode({ t: 'voice', mime, dur, data: toBase64(await blob.arrayBuffer()) }));
+      await messagesDb.add({ peer: peer.identity, out: true, text: '🎤 Голосове', at: Date.now(), kind: 'voice', voice: { blob, mime, dur } });
       if (current?.identity === peer.identity) await openThread(peer);
     } catch (e) {
       fail(e);
@@ -205,12 +204,23 @@
     }
   }
 
-  async function stopRecording(cancel: boolean, ptt = false) {
+  async function stopRecording(cancel: boolean) {
     if (!recording) return;
     recording = false;
     if (recTimer) clearInterval(recTimer);
     const rec = await recorder.stop(cancel);
-    if (rec) await sendVoice(rec.blob, rec.mime, rec.dur, ptt);
+    if (rec) await sendVoice(rec.blob, rec.mime, rec.dur);
+  }
+
+  async function runCallTest() {
+    if (!me) return;
+    panel = 'calltest';
+    relayResults = null;
+    try {
+      relayResults = await checkRelay(me);
+    } catch (e) {
+      relayResults = [{ url: '—', ok: false, detail: String(e) }];
+    }
   }
 
   async function poll() {
@@ -236,14 +246,10 @@
         delivered++;
         if (body.t === 'voice') {
           const blob = new Blob([fromBase64(body.data)], { type: body.mime });
-          const id = await messagesDb.add({
-            peer: m.from, out: false, text: body.ptt ? '📻 Рація' : '🎤 Голосове', at: Date.now(), kind: 'voice',
-            voice: { blob, mime: body.mime, dur: body.dur, ptt: body.ptt },
+          await messagesDb.add({
+            peer: m.from, out: false, text: '🎤 Голосове', at: Date.now(), kind: 'voice',
+            voice: { blob, mime: body.mime, dur: body.dur },
           });
-          // Рація: якщо розмова відкрита й режим увімкнено — програти одразу.
-          if (body.ptt && pttOn[m.from] && current?.identity === m.from && document.visibilityState === 'visible') {
-            autoplayId = id as number;
-          }
         } else {
           const text = body.t === 'hello' ? helloText(body.name.trim()) : body.text;
           await messagesDb.add({ peer: m.from, out: false, text, at: Date.now() });
@@ -467,6 +473,7 @@
         </ul>
       </section>
       <p class="warn small">Веб-версія: ключі зберігаються в цьому браузері. Зроби резервну копію, інакше очищення даних сайту = втрата акаунта.</p>
+      <p class="small"><button class="ghost small" onclick={runCallTest}>📞 Перевірити дзвінки</button></p>
       <p class="muted small version">Версія <a href={commitUrl(COMMIT)} target="_blank" rel="noopener">{SHORT}</a> · <a href="/version.json" target="_blank">хеш збірки</a></p>
     </aside>
 
@@ -485,7 +492,6 @@
           <button class="title" onclick={rename} title="Перейменувати">{current.name} ✎</button>
           <button class="ghost small" onclick={() => (showSafety = !showSafety)}>🔒 код безпеки</button>
           <span class="spacer"></span>
-          <button class="ghost" class:on={pttOn[current.identity]} title="Рація: затисни і говори; голос співрозмовника грає одразу" onclick={() => (pttOn[current!.identity] = !pttOn[current!.identity])}>📻 Рація</button>
           <button class="ghost" title="Голосовий дзвінок" disabled={calls.state !== 'idle'} onclick={() => calls.start(current!.identity)}>📞</button>
         </header>
         {#if showSafety}
@@ -498,7 +504,7 @@
           {#each thread as m (m.id)}
             <div class="msg" class:out={m.out} class:system={m.kind === 'call'}>
               {#if m.kind === 'voice' && m.voice}
-                <div class="bubble"><VoiceMsg voice={m.voice} autoplay={m.id === autoplayId} /></div>
+                <div class="bubble"><VoiceMsg voice={m.voice} /></div>
               {:else}
                 <div class="bubble">{m.text}</div>
               {/if}
@@ -508,17 +514,7 @@
             <p class="muted center-text">Повідомлень ще немає. Усе, що ви напишете, шифрується на пристрої — сервер бачить лише шифротекст.</p>
           {/each}
         </div>
-        {#if pttOn[current.identity]}
-          <div class="composer">
-            <button
-              class="ptt" class:recording
-              onpointerdown={(e) => { e.preventDefault(); startRecording(); }}
-              onpointerup={() => stopRecording(false, true)}
-              onpointerleave={() => stopRecording(false, true)}
-              oncontextmenu={(e) => e.preventDefault()}
-            >{recording ? `📻 Говори… ${fmtDuration(recNow - recStart)} — відпусти, щоб надіслати` : '📻 Затисни і говори'}</button>
-          </div>
-        {:else if recording}
+        {#if recording}
           <div class="composer recording-bar">
             <span class="rec-dot"></span>
             <span>Запис {fmtDuration(recNow - recStart)} / {fmtDuration(MAX_VOICE_MS)}</span>
@@ -573,6 +569,18 @@
             <button onclick={() => copy(inviteUrl, 'link')}>Копіювати</button>
             <button onclick={() => copy(me!.identity, 'key')}>{copied === 'key' ? 'Скопійовано ✓' : 'Лише ключ'}</button>
           </div>
+        {:else if panel === 'calltest'}
+          <h2>Перевірка дзвінків</h2>
+          <p class="small muted">Перевіряємо, чи цей пристрій досягає ретранслятора голосу.</p>
+          {#if !relayResults}
+            <p>Перевіряю…</p>
+          {:else}
+            <ul class="small">
+              {#each relayResults as r}
+                <li>{r.ok ? '✅' : '❌'} <span class="mono">{r.url}</span> — {r.detail}</li>
+              {/each}
+            </ul>
+          {/if}
         {:else if panel === 'add'}
           <h2>Додати за ключем</h2>
           <form class="form" onsubmit={(e) => { e.preventDefault(); addContact(); }}>

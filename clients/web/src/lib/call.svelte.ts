@@ -14,6 +14,57 @@ export type CallLog = (peer: string, text: string) => Promise<void>;
 const RING_MS = 45_000;
 const OFFER_MAX_AGE_MS = 60_000;
 const GATHER_MS = 5_000;
+const CONNECT_MS = 25_000;
+
+export type RelayCheck = { url: string; ok: boolean; detail: string };
+
+/**
+ * Перевірити ретранслятор: для кожної адреси TURN окремо спробувати отримати relay-кандидата.
+ * Показує, чи сервер досяжний, чи приймає логін і яку адресу він віддає.
+ */
+export async function checkRelay(me: Shepit): Promise<RelayCheck[]> {
+  const ice = await me.iceServers();
+  if (!ice) return [{ url: '—', ok: false, detail: 'Ретранслятор на сервері не налаштований' }];
+  const { urls, username, credential } = ice[0] as { urls: string[]; username: string; credential: string };
+  return Promise.all(
+    (Array.isArray(urls) ? urls : [urls]).map(
+      (url) =>
+        new Promise<RelayCheck>((resolve) => {
+          const pc = new RTCPeerConnection({ iceServers: [{ urls: url, username, credential }], iceTransportPolicy: 'relay' });
+          const relays: string[] = [];
+          const errors: string[] = [];
+          pc.onicecandidate = (e) => {
+            const c = e.candidate;
+            if (c && c.type === 'relay') relays.push(`${c.address}:${c.port}`);
+          };
+          pc.onicecandidateerror = (e) => errors.push(`${(e as RTCPeerConnectionIceErrorEvent).errorCode} ${(e as RTCPeerConnectionIceErrorEvent).errorText}`.trim());
+          const done = () => {
+            pc.close();
+            resolve(
+              relays.length
+                ? { url, ok: true, detail: `адреса ретранслятора ${relays.join(', ')}` }
+                : { url, ok: false, detail: errors.length ? `помилка: ${errors.join('; ')}` : 'немає відповіді (порт закритий або сервер не працює)' },
+            );
+          };
+          const t = setTimeout(done, 8000);
+          pc.onicegatheringstatechange = () => {
+            if (pc.iceGatheringState === 'complete') {
+              clearTimeout(t);
+              done();
+            }
+          };
+          pc.createDataChannel('probe');
+          pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(() => done());
+        }),
+    ),
+  );
+}
+
+/** Які типи кандидатів є в SDP (host/srflx/relay) — для діагностики. */
+function candidateTypes(sdp: string): string {
+  const types = [...sdp.matchAll(/ typ (\w+)/g)].map((m) => m[1]);
+  return types.length ? [...new Set(types)].join(', ') : 'жодного';
+}
 
 function newId() {
   return Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, '0')).join('');
@@ -34,6 +85,29 @@ export class CallManager {
   private pendingOffer: string | null = null;
   private ringTimer: ReturnType<typeof setTimeout> | null = null;
   private outgoing = false;
+  private connectTimer: ReturnType<typeof setTimeout> | null = null;
+  private localTypes = '';
+  private remoteTypes = '';
+
+  private watchConnect() {
+    if (this.connectTimer) clearTimeout(this.connectTimer);
+    this.connectTimer = setTimeout(() => {
+      if (this.state !== 'active') this.hangupWithError(this.diagnose());
+    }, CONNECT_MS);
+  }
+
+  private diagnose(): string {
+    const ice = this.pc?.iceConnectionState ?? '—';
+    if (!this.localTypes.includes('relay') && this.relayed) return `Не вдалося з'єднатися: ретранслятор не відповідає (твої кандидати: ${this.localTypes || 'жодного'}). Перевір «Перевірити дзвінки».`;
+    if (!this.remoteTypes.includes('relay') && this.relayed) return `Не вдалося з'єднатися: у співрозмовника ретранслятор не відповідає (його кандидати: ${this.remoteTypes || 'жодного'}).`;
+    return `Не вдалося з'єднатися (ICE: ${ice}; мої: ${this.localTypes}; співрозмовника: ${this.remoteTypes}).`;
+  }
+
+  private async hangupWithError(text: string) {
+    const peer = this.peer;
+    await this.signal(peer, { t: 'call', op: 'end', id: this.id, at: Date.now() }).catch(() => {});
+    this.finish(text, true);
+  }
 
   constructor(private me: () => Shepit | null, private log: CallLog) {}
 
@@ -52,7 +126,7 @@ export class CallManager {
         this.state = 'active';
         this.startedAt = Date.now();
       }
-      if (pc.connectionState === 'failed') this.finish('Не вдалося з\'єднатися', true);
+      if (pc.connectionState === 'failed') this.hangupWithError(this.diagnose());
     };
     this.local = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -88,6 +162,7 @@ export class CallManager {
       const pc = await this.makePc();
       await pc.setLocalDescription(await pc.createOffer());
       const sdp = await this.gathered(pc);
+      this.localTypes = candidateTypes(sdp);
       if (this.state !== 'outgoing') return; // скасували, поки збирали кандидатів
       await this.signal(peer, { t: 'call', op: 'offer', id: this.id, at: Date.now(), sdp });
       this.ringTimer = setTimeout(() => this.hangup('Без відповіді'), RING_MS);
@@ -119,6 +194,8 @@ export class CallManager {
     if (b.op === 'answer' && this.state === 'outgoing' && this.pc && b.sdp) {
       if (this.ringTimer) clearTimeout(this.ringTimer);
       this.state = 'connecting';
+      this.remoteTypes = candidateTypes(b.sdp);
+      this.watchConnect();
       await this.pc.setRemoteDescription({ type: 'answer', sdp: b.sdp });
     } else if (b.op === 'reject') {
       this.finish('📞 Дзвінок відхилено');
@@ -135,9 +212,12 @@ export class CallManager {
     this.state = 'connecting';
     try {
       const pc = await this.makePc();
+      this.remoteTypes = candidateTypes(this.pendingOffer);
       await pc.setRemoteDescription({ type: 'offer', sdp: this.pendingOffer });
       await pc.setLocalDescription(await pc.createAnswer());
       const sdp = await this.gathered(pc);
+      this.localTypes = candidateTypes(sdp);
+      this.watchConnect();
       await this.signal(this.peer, { t: 'call', op: 'answer', id: this.id, at: Date.now(), sdp });
     } catch (e) {
       await this.signal(this.peer, { t: 'call', op: 'end', id: this.id, at: Date.now() }).catch(() => {});
@@ -176,6 +256,7 @@ export class CallManager {
   private finish(text: string, isError = false) {
     const peer = this.peer;
     if (this.ringTimer) clearTimeout(this.ringTimer);
+    if (this.connectTimer) clearTimeout(this.connectTimer);
     this.pc?.close();
     this.local?.getTracks().forEach((t) => t.stop());
     this.pc = null;

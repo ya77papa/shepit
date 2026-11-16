@@ -95,8 +95,6 @@ button.big { padding: 12px 18px; }
 .msg.system .bubble { background: transparent; color: var(--muted); font-size: .85rem; padding: 2px 8px; }
 .voice { display: flex; align-items: center; gap: 8px; }
 .voice audio { height: 34px; max-width: 220px; }
-.ptt { flex: 1; padding: 16px; font-size: 1rem; font-weight: 600; background: var(--line); user-select: none; touch-action: none; -webkit-user-select: none; }
-.ptt.recording { background: #b4464b; color: white; }
 .recording-bar { align-items: center; }
 .rec-dot { width: 10px; height: 10px; border-radius: 50%; background: #ff5a5a; animation: blink 1s infinite; }
 @keyframes blink { 50% { opacity: .2; } }
