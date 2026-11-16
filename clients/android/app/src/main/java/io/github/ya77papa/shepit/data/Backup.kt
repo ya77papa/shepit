@@ -18,7 +18,10 @@ object Backup {
     private const val ITER = 600_000
     const val MIN_PASSWORD = 10
 
-    class Restored(val account: ByteArray, val contacts: List<Contact>, val messages: List<Message>, val myName: String)
+    class Restored(
+        val account: ByteArray, val contacts: List<Contact>, val messages: List<Message>, val myName: String,
+        val groups: List<Group> = emptyList(), val channels: List<ChannelRec> = emptyList(), val myAvatar: String = "",
+    )
 
     private fun b64(b: ByteArray) = Base64.encodeToString(b, Base64.NO_WRAP)
     private fun unb64(s: String) = Base64.decode(s, Base64.DEFAULT)
@@ -34,7 +37,9 @@ object Backup {
         val payload = JSONObject().apply {
             put("account", b64(account))
             put("contacts", JSONArray().apply {
-                db.contacts().forEach { put(JSONObject().put("identity", it.identity).put("name", it.name).put("fingerprint", it.fingerprint)) }
+                db.contacts().forEach { c ->
+                    put(JSONObject().put("identity", c.identity).put("name", c.name).put("fingerprint", c.fingerprint).apply { c.avatar?.let { put("avatar", it) } })
+                }
             })
             put("messages", JSONArray().apply {
                 db.allMessages().forEach { m ->
@@ -42,11 +47,16 @@ object Backup {
                         put("peer", m.peer); put("out", m.out); put("text", m.text); put("at", m.at)
                         if (m.kind != "text") put("kind", m.kind)
                         if (m.mid != null) put("mid", m.mid)
+                        if (m.sender != null) put("from", m.sender)
                         if (m.voice != null) put("voice", JSONObject().put("data", b64(m.voice)).put("mime", m.voiceMime).put("dur", m.voiceDur))
                     })
                 }
             })
             put("myName", myName)
+            put("groups", JSONArray().apply { db.groups().forEach { put(it.toJson()) } })
+            // Містить ключі моїх каналів — без них писати в канал неможливо.
+            put("channels", JSONArray().apply { db.channels().forEach { put(it.toJson()) } })
+            put("myAvatar", db.get("myAvatar") ?: "")
             put("exportedAt", System.currentTimeMillis())
         }
         val rnd = SecureRandom()
@@ -69,7 +79,7 @@ object Backup {
         val plain = runCatching { c.doFinal(unb64(f.getString("data"))) }.getOrElse { error("Невірний пароль або пошкоджений файл") }
         val p = JSONObject(String(plain))
         val contacts = p.getJSONArray("contacts").let { a ->
-            (0 until a.length()).map { a.getJSONObject(it) }.map { Contact(it.getString("identity"), it.getString("name"), it.getString("fingerprint")) }
+            (0 until a.length()).map { a.getJSONObject(it) }.map { Contact(it.getString("identity"), it.getString("name"), it.getString("fingerprint"), Content.avatar(it.opt("avatar"))) }
         }
         val messages = p.getJSONArray("messages").let { a ->
             (0 until a.length()).map { a.getJSONObject(it) }.map { o ->
@@ -79,9 +89,12 @@ object Backup {
                     kind = o.optString("kind", if (v != null) "voice" else "text"),
                     voiceMime = v?.optString("mime"), voiceDur = v?.optLong("dur") ?: 0, voice = v?.let { unb64(it.getString("data")) },
                     mid = o.optString("mid").takeIf { it.length == 32 },
+                    sender = o.optString("from").ifEmpty { null },
                 )
             }
         }
-        return Restored(unb64(p.getString("account")), contacts, messages, p.optString("myName"))
+        val groups = p.optJSONArray("groups")?.let { a -> (0 until a.length()).mapNotNull { runCatching { Group.fromJson(a.getJSONObject(it)) }.getOrNull() } } ?: emptyList()
+        val channels = p.optJSONArray("channels")?.let { a -> (0 until a.length()).mapNotNull { runCatching { ChannelRec.fromJson(a.getJSONObject(it)) }.getOrNull() } } ?: emptyList()
+        return Restored(unb64(p.getString("account")), contacts, messages, p.optString("myName"), groups, channels, p.optString("myAvatar"))
     }
 }

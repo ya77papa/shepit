@@ -68,7 +68,7 @@ android {
         unitTests.isReturnDefaultValues = true
         unitTests.all {
             it.systemProperty("jna.library.path", rootProject.file("../../target/debug").absolutePath)
-            listOf("SHEPIT_TEST_SERVER", "SHEPIT_TEST_INVITE_SERVER").forEach { k -> System.getenv(k)?.let { v -> it.environment(k, v) } }
+            listOf("SHEPIT_TEST_SERVER", "SHEPIT_TEST_INVITE_SERVER", "SHEPIT_TEST_OPEN_SERVER").forEach { k -> System.getenv(k)?.let { v -> it.environment(k, v) } }
         }
     }
 

@@ -57,6 +57,19 @@ class Repo(context: Context) {
         get() = db.get("myName") ?: ""
         set(v) = db.set("myName", v.trim().take(60))
 
+    /** Моє фото (JPEG base64), порожньо — немає. */
+    var myAvatar: String
+        get() = db.get("myAvatar") ?: ""
+        set(v) = db.set("myAvatar", v)
+
+    private val _groups = MutableStateFlow<List<Group>>(emptyList())
+    val groups = _groups.asStateFlow()
+    private val _channels = MutableStateFlow<List<ChannelRec>>(emptyList())
+    val channels = _channels.asStateFlow()
+
+    fun refreshGroups() { _groups.value = db.groups() }
+    fun refreshChannels() { _channels.value = db.channels() }
+
     fun hasAccount() = secure.exists()
 
     suspend fun load(): Boolean = withContext(Dispatchers.IO) {
@@ -64,6 +77,8 @@ class Repo(context: Context) {
         val st = secure.read() ?: return@withContext false
         core = Core.load(st)
         refreshContacts()
+        refreshGroups()
+        refreshChannels()
         true
     }
 
@@ -152,8 +167,216 @@ class Repo(context: Context) {
         _changed.tryEmit(identity)
     }
 
-    fun nameOf(identity: String): String =
-        db.contacts().firstOrNull { it.identity == identity }?.name ?: "Контакт ${short(fingerprintOf(identity))}"
+    fun nameOf(identity: String): String {
+        if (identity.startsWith("g:")) return db.group(identity.removePrefix("g:"))?.name ?: "Група"
+        if (identity == core?.identity()) return myName.ifEmpty { "Я" }
+        return db.contacts().firstOrNull { it.identity == identity }?.name ?: "Контакт ${short(fingerprintOf(identity))}"
+    }
+
+    /** Як показувати учасника групи: ім'я з моїх контактів, інакше як його назвав адмін. */
+    fun memberName(id: String?, g: Group?): String {
+        if (id == null) return ""
+        if (id == core?.identity()) return myName.ifEmpty { "Я" }
+        return db.contacts().firstOrNull { it.identity == id }?.name ?: g?.members?.firstOrNull { it.id == id }?.name ?: "Контакт ${short(fingerprintOf(id))}"
+    }
+
+    fun avatarOf(id: String): String? = if (id == core?.identity()) myAvatar.ifEmpty { null } else db.contacts().firstOrNull { it.identity == id }?.avatar
+
+    // ---------- профіль ----------
+
+    /** Надіслати ім'я й фото контактам (усім або вказаним). */
+    suspend fun sendProfile(to: List<String>? = null) {
+        val body = Body.Profile(myName, myAvatar.ifEmpty { null })
+        for (id in to ?: db.contacts().map { it.identity }) runCatching { send(id, body) }
+    }
+
+    private suspend fun onProfile(from: String, b: Body.Profile) {
+        val c = db.contacts().firstOrNull { it.identity == from } ?: return
+        // Ім'я, яке дав сам користувач, не чіпаємо; автоматичне — замінюємо.
+        val auto = Regex("^(Новий|Контакт) \\d").containsMatchIn(c.name)
+        db.putContact(c.copy(avatar = b.avatar, name = if (auto && b.name.isNotBlank()) b.name else c.name))
+        refreshContacts()
+        _changed.emit(from)
+    }
+
+    // ---------- групи ----------
+
+    /** Надіслати в групу: кожному учаснику окремо (сервер не знає, що це група). Повертає к-сть невдач. */
+    suspend fun sendGroup(g: Group, body: Body, to: List<Member> = g.members): Int {
+        val me = core?.identity()
+        var failed = 0
+        for (m in to) {
+            if (m.id == me) continue
+            runCatching { send(m.id, body) }.onFailure { failed++ }
+        }
+        return failed
+    }
+
+    private fun stateOf(g: Group) = Body.GroupState(g.id, g.name, g.avatar, g.members, g.admins, g.v)
+
+    private suspend fun logGroup(g: Group, text: String) {
+        db.addMessage(Message(peer = "g:${g.id}", out = false, text = text, at = System.currentTimeMillis(), kind = "call"))
+        _changed.emit("g:${g.id}")
+    }
+
+    /** Адмін змінив групу: нова версія стану всім (і тим, кого видалили, — щоб знали). */
+    private suspend fun updateGroup(next: Group, notify: List<Member>): Int {
+        val g = next.copy(v = next.v + 1)
+        withContext(Dispatchers.IO) { db.putGroup(g) }
+        refreshGroups()
+        val failed = sendGroup(g, stateOf(g), notify)
+        _changed.emit("g:${g.id}")
+        return failed
+    }
+
+    suspend fun createGroup(name: String, memberIds: List<String>): Group {
+        val me = core?.identity() ?: error("Немає акаунта")
+        val g = Group(
+            id = Content.newMsgId(), name = name.trim().take(80), v = 0, admins = listOf(me),
+            members = listOf(Member(me, myName.ifEmpty { "Я" })) + memberIds.map { Member(it, nameOf(it)) },
+        )
+        logGroup(g, "Групу «${g.name}» створено")
+        updateGroup(g, g.members)
+        return db.group(g.id)!!
+    }
+
+    /** Зміна групи адміном: [f] повертає новий стан і кого сповістити (за замовчуванням — старий склад). */
+    suspend fun groupOp(id: String, f: suspend (Group) -> Pair<Group, List<Member>?>): Int {
+        val g = db.group(id) ?: error("Групу не знайдено")
+        val (next, notify) = f(g)
+        return updateGroup(next, notify ?: g.members)
+    }
+
+    suspend fun renameGroup(id: String, name: String) = groupOp(id) { it.copy(name = name.trim().take(80)) to null }
+    suspend fun setGroupAvatar(id: String, avatar: String) = groupOp(id) { it.copy(avatar = avatar) to null }
+
+    suspend fun addToGroup(id: String, ids: List<String>) = groupOp(id) { g ->
+        val added = ids.filter { a -> g.members.none { it.id == a } }.map { Member(it, nameOf(it)) }
+        if (added.isNotEmpty()) logGroup(g, "Додано: ${added.joinToString { it.name }}")
+        val next = g.copy(members = g.members + added)
+        next to next.members
+    }
+
+    suspend fun removeFromGroup(id: String, member: String) = groupOp(id) { g ->
+        logGroup(g, "${memberName(member, g)} видалено з групи")
+        g.copy(members = g.members.filter { it.id != member }, admins = g.admins.filter { it != member }) to g.members
+    }
+
+    suspend fun toggleAdmin(id: String, member: String) = groupOp(id) { g ->
+        val admins = if (member in g.admins) g.admins - member else g.admins + member
+        g.copy(admins = admins.ifEmpty { listOf(core!!.identity()) }) to null
+    }
+
+    suspend fun leaveGroup(id: String) {
+        val g = db.group(id) ?: return
+        val me = core?.identity()
+        sendGroup(g, Body.Leave(g.id))
+        db.putGroup(g.copy(left = true, members = g.members.filter { it.id != me }))
+        logGroup(g, "Ти вийшов(-ла) з групи")
+        refreshGroups()
+    }
+
+    suspend fun deleteGroupLocal(id: String) {
+        withContext(Dispatchers.IO) { db.deleteGroup(id) }
+        refreshGroups()
+        _changed.emit("g:$id")
+    }
+
+    /** Повідомлення, що стосується групи. */
+    private suspend fun onGroupMessage(from: String, body: Body) {
+        val me = core?.identity() ?: return
+        val gid = when (body) {
+            is Body.GroupState -> body.g
+            is Body.Leave -> body.g
+            is Body.Text -> body.g
+            is Body.Voice -> body.g
+            is Body.Delete -> body.g
+            else -> null
+        } ?: return
+        if (gid == Content.INVALID_GROUP) return
+        val key = "g:$gid"
+        val local = db.group(gid)
+        if (body is Body.GroupState) {
+            val amMember = body.members.any { it.id == me }
+            var next = Group(gid, body.name, body.avatar, body.members, body.admins, body.ver)
+            if (local == null) {
+                if (from !in body.admins || !amMember) return
+                db.putGroup(next)
+                logGroup(next, "${memberName(from, next)} додав(-ла) тебе до групи «${next.name}»")
+            } else {
+                if (from !in local.admins || body.ver <= local.v) return
+                val added = next.members.filter { m -> local.members.none { it.id == m.id } && m.id != me }
+                val removed = local.members.filter { m -> next.members.none { it.id == m.id } && m.id != me }
+                if (!amMember) next = next.copy(left = true)
+                db.putGroup(next)
+                when {
+                    !amMember && !local.left -> logGroup(next, "${memberName(from, local)} видалив(-ла) тебе з групи")
+                    amMember && local.left -> logGroup(next, "${memberName(from, local)} повернув(-ла) тебе до групи")
+                }
+                if (amMember && added.isNotEmpty()) logGroup(next, "Додано: ${added.joinToString { memberName(it.id, next) }}")
+                if (amMember && removed.isNotEmpty()) logGroup(next, "Видалено: ${removed.joinToString { memberName(it.id, local) }}")
+                if (next.name != local.name) logGroup(next, "Нова назва: «${next.name}»")
+            }
+            refreshGroups()
+            return
+        }
+        if (local == null || local.left || local.members.none { it.id == from }) return
+        val now = System.currentTimeMillis()
+        val m = when (body) {
+            is Body.Leave -> {
+                val name = memberName(from, local)
+                val members = local.members.filter { it.id != from }
+                var admins = local.admins - from
+                // Без адміністраторів група не лишається: адміном стає учасник з найменшим ключем (у всіх однаково).
+                if (admins.isEmpty() && members.isNotEmpty()) admins = listOf(members.map { it.id }.sorted().first())
+                db.putGroup(local.copy(members = members, admins = admins))
+                refreshGroups()
+                logGroup(local, "$name виходить з групи")
+                return
+            }
+            is Body.Delete -> {
+                if (db.deleteIncoming(key, body.ids, from) > 0) _changed.emit(key)
+                return
+            }
+            is Body.Text -> Message(peer = key, out = false, text = body.text, at = now, mid = body.id, sender = from)
+            is Body.Voice -> Message(
+                peer = key, out = false, text = "🎤 Голосове", at = now, kind = "voice",
+                voiceMime = body.mime, voiceDur = body.dur, voice = Base64.decode(body.data, Base64.DEFAULT), mid = body.id, sender = from,
+            )
+            else -> return
+        }
+        val id = db.addMessage(m)
+        _changed.emit(key)
+        _incoming.emit(m.copy(id = id))
+    }
+
+    // ---------- канали ----------
+
+    suspend fun saveChannel(c: ChannelRec) {
+        withContext(Dispatchers.IO) { db.putChannel(c) }
+        refreshChannels()
+    }
+
+    suspend fun createChannel(name: String, about: String, public: Boolean): ChannelRec = withContext(Dispatchers.IO) {
+        val c = core ?: error("Немає акаунта")
+        val k = Channels.newKeys(public)
+        val rec = ChannelRec(k.id, public, k.key, k.pub, k.priv, name.trim().take(80), about.trim().take(500))
+        api.channels.putMeta(rec, Channels.Meta(rec.name, rec.about)) { purpose, body -> c.authHeader(purpose, body) }
+        db.putChannel(rec)
+        refreshChannels()
+        rec
+    }
+
+    fun channelLink(c: ChannelRec) = Channels.link(api.url(""), c)
+
+    /** Нові дописи в каналах (для позначки «•»). */
+    suspend fun checkChannels() = withContext(Dispatchers.IO) {
+        for (c in db.channels()) {
+            val last = api.channels.lastSeq(c.id) ?: continue
+            if (last != c.lastSeq) db.putChannel(c.copy(lastSeq = last))
+        }
+        refreshChannels()
+    }
 
     fun inviteUrl(code: String? = null): String {
         val id = core?.identity() ?: return ""
@@ -198,16 +421,25 @@ class Repo(context: Context) {
         }
     }
 
-    suspend fun sendText(peer: String, text: String) {
+    /** До контакту або в групу (peer = "g:<id>"). Повертає, скільком учасникам не доставлено. */
+    private suspend fun sendTo(peer: String, body: (String?) -> Body): Int {
+        if (!peer.startsWith("g:")) { send(peer, body(null)); return 0 }
+        val g = db.group(peer.removePrefix("g:")) ?: error("Групу не знайдено")
+        if (g.left) error("Ти не в цій групі")
+        return sendGroup(g, body(g.id))
+    }
+
+    suspend fun sendText(peer: String, text: String): Int {
         val mid = Content.newMsgId()
-        send(peer, Body.Text(text, mid))
+        val failed = sendTo(peer) { g -> Body.Text(text, mid, g) }
         db.addMessage(Message(peer = peer, out = true, text = text, at = System.currentTimeMillis(), mid = mid))
         _changed.emit(peer)
+        return failed
     }
 
     suspend fun sendVoice(peer: String, mime: String, dur: Long, data: ByteArray) {
         val mid = Content.newMsgId()
-        send(peer, Body.Voice(mime, dur, Base64.encodeToString(data, Base64.NO_WRAP), mid))
+        sendTo(peer) { g -> Body.Voice(mime, dur, Base64.encodeToString(data, Base64.NO_WRAP), mid, g) }
         db.addMessage(Message(peer = peer, out = true, text = "🎤 Голосове", at = System.currentTimeMillis(), kind = "voice", voiceMime = mime, voiceDur = dur, voice = data, mid = mid))
         _changed.emit(peer)
     }
@@ -216,13 +448,13 @@ class Repo(context: Context) {
 
     /** Видалити повідомлення: лише в мене або в обох (лише свої, з id). */
     suspend fun deleteMessage(m: Message, everywhere: Boolean) {
-        if (everywhere && m.out && m.mid != null) send(m.peer, Body.Delete(listOf(m.mid)))
+        if (everywhere && m.out && m.mid != null) sendTo(m.peer) { g -> Body.Delete(listOf(m.mid), g) }
         withContext(Dispatchers.IO) { db.deleteMessage(m.id) }
         _changed.emit(m.peer)
     }
 
     suspend fun clearChat(peer: String, everywhere: Boolean) {
-        if (everywhere) send(peer, Body.Clear)
+        if (everywhere && !peer.startsWith("g:")) send(peer, Body.Clear)
         withContext(Dispatchers.IO) { db.clearChat(peer) }
         _changed.emit(peer)
     }
@@ -238,6 +470,7 @@ class Repo(context: Context) {
         send(peer, Body.Hello(myName))
         db.addMessage(Message(peer = peer, out = true, text = "👋 ${myName.ifEmpty { "Новий контакт" }} приєднується за запрошенням", at = System.currentTimeMillis()))
         _changed.emit(peer)
+        if (myAvatar.isNotEmpty()) runCatching { send(peer, Body.Profile(myName, myAvatar)) }
     }
 
     /**
@@ -267,6 +500,22 @@ class Repo(context: Context) {
 
     private suspend fun deliver(from: String, raw: String): Boolean {
         val body = Content.decode(raw)
+        // Групи: окремий шлях (і жодних нових контактів від учасників групи).
+        val groupish = when (body) {
+            is Body.GroupState, is Body.Leave -> true
+            is Body.Text -> body.g != null
+            is Body.Voice -> body.g != null
+            is Body.Delete -> body.g != null
+            else -> false
+        }
+        if (groupish) {
+            onGroupMessage(from, body)
+            return false
+        }
+        if (body is Body.Profile) {
+            onProfile(from, body)
+            return false
+        }
         // Службові: співрозмовник видалив свої повідомлення «у всіх» або очистив бесіду.
         when (body) {
             is Body.Delete -> {
@@ -289,6 +538,8 @@ class Repo(context: Context) {
             val name = (body as? Body.Hello)?.name?.trim()?.take(60)?.ifEmpty { null } ?: "Новий ${short(fp)}"
             db.putContact(Contact(from, name, fp))
             refreshContacts()
+            // Новий контакт привітався — надіслати йому моє фото (після receive: тут тримається м'ютекс).
+            if (body is Body.Hello && myAvatar.isNotEmpty()) scope.launch { sendProfile(listOf(from)) }
         }
         val now = System.currentTimeMillis()
         val m = when (body) {
@@ -369,8 +620,13 @@ class Repo(context: Context) {
             db.wipe()
             r.contacts.forEach { db.putContact(it) }
             r.messages.forEach { db.addMessage(it) }
+            r.groups.forEach { db.putGroup(it) }
+            r.channels.forEach { db.putChannel(it) }
             myName = r.myName
+            myAvatar = r.myAvatar
             refreshContacts()
+            refreshGroups()
+            refreshChannels()
         }
         ensureKeys()
     }
@@ -380,5 +636,7 @@ class Repo(context: Context) {
         secure.wipe()
         db.wipe()
         refreshContacts()
+        refreshGroups()
+        refreshChannels()
     }
 }

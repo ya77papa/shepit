@@ -46,17 +46,20 @@ import io.github.ya77papa.shepit.data.VoicePlayer
 import io.github.ya77papa.shepit.data.VoiceRecorder
 import io.github.ya77papa.shepit.service.Notifications
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import io.github.ya77papa.shepit.data.ChannelRec
+import androidx.compose.foundation.shape.CircleShape
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-private enum class Screen { CONTACTS, CHAT, SETTINGS }
+private enum class Screen { CONTACTS, CHAT, SETTINGS, GROUP_INFO, NEW_GROUP, CHANNEL, NEW_CHANNEL, FIND_CHANNEL }
 
 @Composable
 fun AppUi(
     app: ShepitApp, act: MainActivity, pendingInvite: MutableState<Pair<String, String?>?>, openRequest: MutableState<String?>,
-    inviteCode: MutableState<String?>, showUpdate: MutableState<Boolean>,
+    inviteCode: MutableState<String?>, showUpdate: MutableState<Boolean>, channelLink: MutableState<Pair<String, String?>?>,
 ) {
     val repo = app.repo
     var hasAccount by remember { mutableStateOf(repo.hasAccount()) }
@@ -75,7 +78,7 @@ fun AppUi(
             if (!hasAccount) {
                 Welcome(app, pendingInvite.value, inviteCode.value, onDone = { hasAccount = true }, onError = { scope.launch { snack.showSnackbar(it) } })
             } else if (loaded) {
-                Main(app, act, pendingInvite, openRequest, onUpdate = { showUpdate.value = true }, onLogout = { hasAccount = false; loaded = false }, toast = { scope.launch { snack.showSnackbar(it) } })
+                Main(app, act, pendingInvite, openRequest, channelLink, onUpdate = { showUpdate.value = true }, onLogout = { hasAccount = false; loaded = false }, toast = { scope.launch { snack.showSnackbar(it) } })
             }
         }
     }
@@ -180,27 +183,59 @@ private fun Welcome(app: ShepitApp, invite: Pair<String, String?>?, linkCode: St
 @Composable
 private fun Main(
     app: ShepitApp, act: MainActivity, pendingInvite: MutableState<Pair<String, String?>?>, openRequest: MutableState<String?>,
+    channelLink: MutableState<Pair<String, String?>?>,
     onUpdate: () -> Unit, onLogout: () -> Unit, toast: (String) -> Unit,
 ) {
     val repo = app.repo
     val contacts by repo.contacts.collectAsState()
     var screen by remember { mutableStateOf(Screen.CONTACTS) }
-    var current by remember { mutableStateOf<Contact?>(null) }
+    /** Відкрита бесіда: ідентичність контакту або "g:<id>" для групи. */
+    var peer by remember { mutableStateOf<String?>(null) }
+    var channel by remember { mutableStateOf<ChannelRec?>(null) }
+    var channelSub by remember { mutableStateOf(true) }
     var showInvite by remember { mutableStateOf(false) }
     var showAdd by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
+    fun openChat(p: String) { peer = p; screen = Screen.CHAT }
+    fun home() { screen = Screen.CONTACTS; peer = null; channel = null }
+
+    /** Канал за ідентифікатором (і ключем): підписаний — одразу, інакше попередній перегляд. */
+    fun openChannel(id: String, key: String?) {
+        repo.channels.value.firstOrNull { it.id == id }?.let { channel = it; channelSub = true; screen = Screen.CHANNEL; return }
+        scope.launch {
+            runCatching { withContext(kotlinx.coroutines.Dispatchers.IO) { repo.api.channels.fetch(id, key) } }
+                .onSuccess { r ->
+                    if (r == null) toast("Посилання на зашифрований канал без ключа або з неправильним ключем")
+                    else { channel = r.first; channelSub = false; screen = Screen.CHANNEL }
+                }
+                .onFailure { toast(it.message ?: "Помилка") }
+        }
+    }
+
     LaunchedEffect(openRequest.value, contacts) {
         val p = openRequest.value ?: return@LaunchedEffect
-        contacts.firstOrNull { it.identity == p }?.let { current = it; screen = Screen.CHAT; openRequest.value = null }
+        if (p.startsWith("g:") || contacts.any { it.identity == p }) { openChat(p); openRequest.value = null }
+    }
+    LaunchedEffect(channelLink.value) {
+        val l = channelLink.value ?: return@LaunchedEffect
+        channelLink.value = null
+        openChannel(l.first, l.second)
     }
     // Новий контакт з'явився (перше привітання), а нічого не відкрито — відкрити.
     LaunchedEffect(Unit) {
-        repo.incoming.collect { m -> if (screen == Screen.CONTACTS && current == null) repo.contacts.value.firstOrNull { it.identity == m.peer }?.let { current = it; screen = Screen.CHAT } }
+        repo.incoming.collect { m -> if (screen == Screen.CONTACTS && peer == null && !m.peer.startsWith("g:") && repo.contacts.value.any { it.identity == m.peer }) openChat(m.peer) }
     }
-    LaunchedEffect(screen, current) { MainActivity.openPeer = if (screen == Screen.CHAT) current?.identity else null }
+    // Нові дописи в каналах — раз на 2 хв, поки застосунок відкритий.
+    LaunchedEffect(Unit) { while (true) { runCatching { repo.checkChannels() }; delay(120_000) } }
+    LaunchedEffect(screen, peer) { MainActivity.openPeer = if (screen == Screen.CHAT) peer else null }
 
-    BackHandler(enabled = screen != Screen.CONTACTS) { screen = Screen.CONTACTS; current = null }
+    BackHandler(enabled = screen != Screen.CONTACTS) {
+        when (screen) {
+            Screen.GROUP_INFO -> screen = Screen.CHAT
+            else -> home()
+        }
+    }
 
     pendingInvite.value?.let { inv ->
         AlertDialog(
@@ -214,7 +249,7 @@ private fun Main(
                         val c = repo.addContact(inv.first, inv.second)
                         if (c == null) { toast("Це твоє власне запрошення або хибне посилання"); return@launch }
                         runCatching { repo.sendHello(c.identity) }.onFailure { toast(it.message ?: "Помилка") }
-                        current = c; screen = Screen.CHAT
+                        openChat(c.identity)
                     }
                 }) { Text("Додати") }
             },
@@ -222,30 +257,65 @@ private fun Main(
         )
     }
     if (showInvite) InviteDialog(app) { showInvite = false }
-    if (showAdd) AddDialog(app, onDone = { c -> showAdd = false; if (c != null) { current = c; screen = Screen.CHAT } }, toast)
+    if (showAdd) AddDialog(app, onDone = { c -> showAdd = false; if (c != null) openChat(c.identity) }, toast)
 
     when (screen) {
-        Screen.CONTACTS -> ContactsScreen(app, contacts, onUpdate, onOpen = { current = it; screen = Screen.CHAT }, onInvite = { showInvite = true }, onAdd = { showAdd = true }, onSettings = { screen = Screen.SETTINGS }, act)
-        Screen.CHAT -> current?.let { c -> ChatScreen(app, act, contacts.firstOrNull { it.identity == c.identity } ?: c, onBack = { screen = Screen.CONTACTS; current = null }, toast) }
-        Screen.SETTINGS -> SettingsScreen(app, act, onBack = { screen = Screen.CONTACTS }, onUpdate = onUpdate, onLogout = onLogout, toast)
+        Screen.CONTACTS -> ContactsScreen(
+            app, contacts, onUpdate, onOpen = { openChat(it) }, onChannel = { channel = it; channelSub = true; screen = Screen.CHANNEL },
+            onInvite = { showInvite = true }, onAdd = { showAdd = true }, onSettings = { screen = Screen.SETTINGS },
+            onNewGroup = { screen = Screen.NEW_GROUP }, onNewChannel = { screen = Screen.NEW_CHANNEL }, onFindChannel = { screen = Screen.FIND_CHANNEL }, act,
+        )
+        Screen.CHAT -> peer?.let { p -> ChatScreen(app, act, p, onBack = { home() }, onGroupInfo = { screen = Screen.GROUP_INFO }, toast) }
+        Screen.GROUP_INFO -> peer?.let { p -> GroupInfoScreen(app, p.removePrefix("g:"), onBack = { screen = Screen.CHAT }, onDeleted = { home() }, toast) }
+        Screen.SETTINGS -> SettingsScreen(app, act, onBack = { home() }, onUpdate = onUpdate, onLogout = onLogout, toast)
+        Screen.NEW_GROUP -> NewGroupScreen(app, onBack = { home() }, onCreated = { openChat("g:${it.id}") }, toast)
+        Screen.NEW_CHANNEL -> NewChannelScreen(app, onBack = { home() }, onCreated = { channel = it; channelSub = true; screen = Screen.CHANNEL }, toast)
+        Screen.FIND_CHANNEL -> FindChannelScreen(app, onBack = { home() }, onOpen = { openChannel(it, null) }, toast)
+        Screen.CHANNEL -> channel?.let { c ->
+            ChannelScreen(
+                app, c, channelSub, onBack = { home() },
+                onSubscribe = { rec -> scope.launch { repo.saveChannel(rec); channelSub = true; toast("Ти підписався(-лась) на «${rec.name}»") } },
+                onGone = { home() }, toast = toast,
+            )
+        }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ContactsScreen(app: ShepitApp, contacts: List<Contact>, onUpdate: () -> Unit, onOpen: (Contact) -> Unit, onInvite: () -> Unit, onAdd: () -> Unit, onSettings: () -> Unit, act: MainActivity) {
+private fun ContactsScreen(
+    app: ShepitApp, contacts: List<Contact>, onUpdate: () -> Unit, onOpen: (String) -> Unit, onChannel: (ChannelRec) -> Unit,
+    onInvite: () -> Unit, onAdd: () -> Unit, onSettings: () -> Unit,
+    onNewGroup: () -> Unit, onNewChannel: () -> Unit, onFindChannel: () -> Unit, act: MainActivity,
+) {
     val repo = app.repo
     val connected by repo.connected.collectAsState()
+    val groups by repo.groups.collectAsState()
+    val channels by repo.channels.collectAsState()
+    var menu by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize()) {
         TopAppBar(
             title = {
-                Column {
-                    Text(repo.myName.ifEmpty { "Шепіт" }, fontWeight = FontWeight.Bold)
-                    Text("Мій ID: ${repo.short(repo.core?.fingerprint() ?: "")}" + if (connected) " · на зв'язку" else " · з'єднання…", fontSize = 12.sp, color = Muted)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    AvatarView(repo.myName.ifEmpty { "?" }, repo.myAvatar.ifEmpty { null }, 36.dp)
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text(repo.myName.ifEmpty { "Шепіт" }, fontWeight = FontWeight.Bold)
+                        Text("Мій ID: ${repo.short(repo.core?.fingerprint() ?: "")}" + if (connected) " · на зв'язку" else " · з'єднання…", fontSize = 12.sp, color = Muted)
+                    }
                 }
             },
             actions = {
-                IconButton(onClick = onAdd) { Icon(Icons.Default.PersonAdd, "Додати за ключем") }
+                Box {
+                    IconButton(onClick = { menu = true }) { Icon(Icons.Default.Add, "Створити") }
+                    DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                        DropdownMenuItem(text = { Text("Запросити друга") }, leadingIcon = { Icon(Icons.Default.Share, null) }, onClick = { menu = false; onInvite() })
+                        DropdownMenuItem(text = { Text("Додати за ключем") }, leadingIcon = { Icon(Icons.Default.PersonAdd, null) }, onClick = { menu = false; onAdd() })
+                        DropdownMenuItem(text = { Text("Нова група") }, leadingIcon = { Icon(Icons.Default.Groups, null) }, enabled = contacts.isNotEmpty(), onClick = { menu = false; onNewGroup() })
+                        DropdownMenuItem(text = { Text("Новий канал") }, leadingIcon = { Icon(Icons.Default.Campaign, null) }, onClick = { menu = false; onNewChannel() })
+                        DropdownMenuItem(text = { Text("Знайти канал") }, leadingIcon = { Icon(Icons.Default.Search, null) }, onClick = { menu = false; onFindChannel() })
+                    }
+                }
                 IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, "Налаштування") }
             },
             colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -261,21 +331,45 @@ private fun ContactsScreen(app: ShepitApp, contacts: List<Contact>, onUpdate: ()
                 Text("⚠️ Дозволь Шепоту показувати вхідні дзвінки на весь екран — торкнись тут", Modifier.padding(12.dp))
             }
         }
-        if (contacts.isEmpty()) {
+        if (contacts.isEmpty() && groups.isEmpty() && channels.isEmpty()) {
             Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center) {
                 Text("Як почати спілкуватися", fontSize = 22.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(12.dp))
                 Text("1. Натисни «Запросити друга» і надішли посилання будь-яким способом або покажи QR-код.\n\n2. Друг відкриває посилання і створює акаунт — ви одразу в контактах одне в одного.\n\n3. Пишіть і дзвоніть. Для впевненості звірте «код безпеки» наживо.")
                 Spacer(Modifier.height(20.dp))
                 Button(onClick = onInvite, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text("Запросити друга") }
+                TextButton(onClick = onFindChannel, modifier = Modifier.fillMaxWidth()) { Text("або знайди публічний канал") }
             }
         } else {
             LazyColumn(Modifier.weight(1f)) {
+                if (contacts.isNotEmpty()) item { SectionLabel("Контакти") }
                 items(contacts, key = { it.identity }) { c ->
                     ListItem(
+                        leadingContent = { AvatarView(c.name, c.avatar, 44.dp) },
                         headlineContent = { Text(c.name, fontWeight = FontWeight.SemiBold) },
                         supportingContent = { Text(repo.short(c.fingerprint) + "…", fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Muted) },
-                        modifier = Modifier.clickable { onOpen(c) },
+                        modifier = Modifier.clickable { onOpen(c.identity) },
+                        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                    )
+                }
+                if (groups.isNotEmpty()) item { SectionLabel("Групи") }
+                items(groups, key = { "g:" + it.id }) { g ->
+                    ListItem(
+                        leadingContent = { AvatarView(g.name, g.avatar, 44.dp) },
+                        headlineContent = { Text(g.name, fontWeight = FontWeight.SemiBold) },
+                        supportingContent = { Text(if (g.left) "ти не в групі" else "${g.members.size} учасн.", fontSize = 12.sp, color = Muted) },
+                        modifier = Modifier.clickable { onOpen("g:${g.id}") },
+                        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                    )
+                }
+                if (channels.isNotEmpty()) item { SectionLabel("Канали") }
+                items(channels, key = { "c:" + it.id }) { c ->
+                    ListItem(
+                        leadingContent = { AvatarView(c.name, c.avatar, 44.dp) },
+                        headlineContent = { Text(c.name, fontWeight = FontWeight.SemiBold) },
+                        supportingContent = { Text(if (c.mine) "мій канал" else if (c.public) "📢 публічний" else "🔒 зашифрований", fontSize = 12.sp, color = Muted) },
+                        trailingContent = { if (c.lastSeq > c.readSeq) Box(Modifier.size(10.dp).clip(CircleShape).background(Accent)) },
+                        modifier = Modifier.clickable { onChannel(c) },
                         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                     )
                 }
@@ -283,6 +377,11 @@ private fun ContactsScreen(app: ShepitApp, contacts: List<Contact>, onUpdate: ()
             Button(onClick = onInvite, modifier = Modifier.fillMaxWidth().padding(16.dp).height(52.dp)) { Text("Запросити друга") }
         }
     }
+}
+
+@Composable
+private fun SectionLabel(text: String) {
+    Text(text.uppercase(), Modifier.padding(start = 16.dp, top = 12.dp, bottom = 2.dp), color = Muted, fontSize = 12.sp, letterSpacing = 1.sp)
 }
 
 @Composable
@@ -353,8 +452,14 @@ private fun AddDialog(app: ShepitApp, onDone: (Contact?) -> Unit, toast: (String
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ChatScreen(app: ShepitApp, act: MainActivity, contact: Contact, onBack: () -> Unit, toast: (String) -> Unit) {
+private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: () -> Unit, onGroupInfo: () -> Unit, toast: (String) -> Unit) {
     val repo = app.repo
+    val contacts by repo.contacts.collectAsState()
+    val groups by repo.groups.collectAsState()
+    val group = groups.firstOrNull { "g:${it.id}" == peer }
+    val isGroup = peer.startsWith("g:")
+    val contact = contacts.firstOrNull { it.identity == peer }
+    val title = group?.name ?: contact?.name ?: repo.nameOf(peer)
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var messages by remember { mutableStateOf(emptyList<Message>()) }
@@ -377,63 +482,83 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, contact: Contact, onBa
     }
 
     suspend fun reload() {
-        messages = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { repo.db.messages(contact.identity) }
+        messages = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { repo.db.messages(peer) }
         if (messages.isNotEmpty()) list.scrollToItem(messages.size - 1)
     }
-    LaunchedEffect(contact.identity) {
+    LaunchedEffect(peer) {
         reload()
-        repo.changed.collect { if (it == contact.identity) reload() }
+        repo.changed.collect { if (it == peer) reload() }
     }
-    LaunchedEffect(recording) { while (recording) { recMs = recorder.elapsed(); if (recMs >= VoiceRecorder.MAX_MS) { recording = false; recorder.stop()?.let { (d, dur) -> scope.launch { runCatching { repo.sendVoice(contact.identity, recorder.mime, dur, d) }.onFailure { toast(it.message ?: "Помилка") } } } }; delay(200) } }
+    LaunchedEffect(recording) { while (recording) { recMs = recorder.elapsed(); if (recMs >= VoiceRecorder.MAX_MS) { recording = false; recorder.stop()?.let { (d, dur) -> scope.launch { runCatching { repo.sendVoice(peer, recorder.mime, dur, d) }.onFailure { toast(it.message ?: "Помилка") } } } }; delay(200) } }
     DisposableEffect(Unit) { onDispose { VoicePlayer.stop(); recorder.stop(cancel = true) } }
 
     Column(Modifier.fillMaxSize().imePadding()) {
         TopAppBar(
             navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Назад") } },
-            title = { Text(contact.name, Modifier.clickable { rename = true }, fontWeight = FontWeight.Bold) },
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { if (isGroup) onGroupInfo() else rename = true }) {
+                    AvatarView(title, group?.avatar ?: contact?.avatar, 36.dp)
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text(title, fontWeight = FontWeight.Bold, maxLines = 1)
+                        if (group != null) Text("${group.members.size} учасн.", fontSize = 12.sp, color = Muted)
+                    }
+                }
+            },
             actions = {
+                if (isGroup) {
+                    IconButton(onClick = onGroupInfo) { Icon(Icons.Default.Groups, "Учасники") }
+                } else {
                 IconButton(onClick = { showSafety = !showSafety }) { Icon(Icons.Default.Lock, "Код безпеки") }
                 IconButton(enabled = callState == io.github.ya77papa.shepit.call.CallManager.State.IDLE, onClick = {
                     if (!act.hasMic()) { act.micPermission.launch(Manifest.permission.RECORD_AUDIO); return@IconButton }
-                    app.calls.start(contact.identity)
+                    app.calls.start(peer)
                     ctx.startActivity(Intent(ctx, CallActivity::class.java))
                 }) { Icon(Icons.Default.Call, "Голосовий дзвінок") }
+                }
                 Box {
                     IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "Ще") }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                        if (isGroup) {
+                            DropdownMenuItem(text = { Text("Учасники й налаштування") }, onClick = { menu = false; onGroupInfo() })
+                            DropdownMenuItem(text = { Text("Очистити історію в мене") }, onClick = { menu = false; confirm = "clear-me" })
+                        } else {
                         DropdownMenuItem(text = { Text("Очистити бесіду в мене") }, onClick = { menu = false; confirm = "clear-me" })
-                        DropdownMenuItem(text = { Text("Очистити в мене і в ${contact.name}") }, onClick = { menu = false; confirm = "clear-all" })
+                        DropdownMenuItem(text = { Text("Очистити в мене і в ${title}") }, onClick = { menu = false; confirm = "clear-all" })
                         DropdownMenuItem(text = { Text("Видалити контакт", color = Danger) }, onClick = { menu = false; confirm = "contact" })
+                        }
                     }
                 }
             },
             colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
         )
-        if (showSafety) {
+        if (showSafety && !isGroup) {
             Surface(color = MaterialTheme.colorScheme.surface, modifier = Modifier.fillMaxWidth().padding(12.dp), shape = RoundedCornerShape(10.dp)) {
                 Column(Modifier.padding(12.dp)) {
                     Text("Цей код однаковий у вас обох. Порівняйте його наживо або по телефону: якщо збігається — ніхто не підмінив ключі.", color = Muted, fontSize = 13.sp)
                     Spacer(Modifier.height(6.dp))
-                    Text(remember(contact.identity) { repo.safetyNumber(contact.identity) }, fontFamily = FontFamily.Monospace)
+                    Text(remember(peer) { repo.safetyNumber(peer) }, fontFamily = FontFamily.Monospace)
                 }
             }
         }
         LazyColumn(Modifier.weight(1f).padding(horizontal = 12.dp), state = list) {
             items(messages, key = { it.id }) { m ->
-                Bubble(m, playing == m.id, onLongPress = { actionsFor = m }) {
+                Bubble(m, playing == m.id, sender = if (group != null && !m.out && m.kind != "call") displayName(app, contacts, group, m.sender) else null, onLongPress = { actionsFor = m }) {
                     VoicePlayer.toggle(ctx, m.id, m.voice ?: return@Bubble, m.voiceMime) { playing = VoicePlayer.playingId }
                     playing = VoicePlayer.playingId
                 }
             }
         }
-        Surface(color = MaterialTheme.colorScheme.surface) {
+        if (group?.left == true) Surface(color = MaterialTheme.colorScheme.surface) {
+            Text("Ти не в цій групі — писати сюди не можна.", Modifier.fillMaxWidth().padding(16.dp).navigationBarsPadding(), color = Muted)
+        } else Surface(color = MaterialTheme.colorScheme.surface) {
             Row(Modifier.fillMaxWidth().padding(8.dp).navigationBarsPadding(), verticalAlignment = Alignment.CenterVertically) {
                 if (recording) {
                     Text("🔴 Запис ${Content.fmtDuration(recMs)} / ${Content.fmtDuration(VoiceRecorder.MAX_MS)}", Modifier.weight(1f).padding(8.dp))
                     TextButton(onClick = { recording = false; recorder.stop(cancel = true) }) { Text("Скасувати") }
                     Button(onClick = {
                         recording = false
-                        recorder.stop()?.let { (d, dur) -> scope.launch { runCatching { repo.sendVoice(contact.identity, recorder.mime, dur, d) }.onFailure { toast(it.message ?: "Помилка") } } }
+                        recorder.stop()?.let { (d, dur) -> scope.launch { runCatching { repo.sendVoice(peer, recorder.mime, dur, d) }.onFailure { toast(it.message ?: "Помилка") } } }
                     }) { Text("Надіслати") }
                 } else {
                     OutlinedTextField(draft, { draft = it }, placeholder = { Text("Повідомлення") }, modifier = Modifier.weight(1f), maxLines = 5)
@@ -441,7 +566,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, contact: Contact, onBa
                         IconButton(enabled = !busy, onClick = {
                             val t = draft.trim(); busy = true
                             scope.launch {
-                                runCatching { repo.sendText(contact.identity, t) }.onSuccess { draft = "" }.onFailure { toast(it.message ?: "Помилка") }
+                                runCatching { repo.sendText(peer, t) }.onSuccess { failed -> draft = ""; if (failed > 0) toast("Не вдалося доставити $failed учасникам — спробуй пізніше") }.onFailure { toast(it.message ?: "Помилка") }
                                 busy = false
                             }
                         }) { Icon(Icons.AutoMirrored.Filled.Send, "Надіслати", tint = Accent) }
@@ -484,9 +609,9 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, contact: Contact, onBa
             title = { Text(when (what) { "contact" -> "Видалити контакт?"; else -> "Очистити бесіду?" }) },
             text = {
                 Text(when (what) {
-                    "clear-me" -> "Уся бесіда з ${contact.name} зникне лише в тебе. У співрозмовника все залишиться."
-                    "clear-all" -> "Уся бесіда зникне і в тебе, і в ${contact.name}. Цього не скасувати."
-                    else -> "Контакт ${contact.name} і вся бесіда з ним зникнуть у тебе. Якщо ця людина напише знову, вона з'явиться як новий контакт."
+                    "clear-me" -> if (isGroup) "Історія групи «$title» зникне з цього телефона." else "Уся бесіда з ${title} зникне лише в тебе. У співрозмовника все залишиться."
+                    "clear-all" -> "Уся бесіда зникне і в тебе, і в ${title}. Цього не скасувати."
+                    else -> "Контакт ${title} і вся бесіда з ним зникнуть у тебе. Якщо ця людина напише знову, вона з'явиться як новий контакт."
                 })
             },
             confirmButton = {
@@ -494,9 +619,9 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, contact: Contact, onBa
                     confirm = null
                     runOp {
                         when (what) {
-                            "clear-me" -> repo.clearChat(contact.identity, everywhere = false)
-                            "clear-all" -> repo.clearChat(contact.identity, everywhere = true)
-                            else -> { repo.deleteContact(contact.identity); onBack() }
+                            "clear-me" -> repo.clearChat(peer, everywhere = false)
+                            "clear-all" -> repo.clearChat(peer, everywhere = true)
+                            else -> { repo.deleteContact(peer); onBack() }
                         }
                     }
                 }) { Text(if (what == "contact") "Видалити" else "Очистити", color = Danger) }
@@ -505,12 +630,12 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, contact: Contact, onBa
         )
     }
     if (rename) {
-        var n by remember { mutableStateOf(contact.name) }
+        var n by remember { mutableStateOf(title) }
         AlertDialog(
             onDismissRequest = { rename = false },
             title = { Text("Ім'я контакту") },
             text = { OutlinedTextField(n, { n = it }, singleLine = true) },
-            confirmButton = { TextButton(onClick = { if (n.isNotBlank()) repo.rename(contact.identity, n); rename = false }) { Text("Зберегти") } },
+            confirmButton = { TextButton(onClick = { if (n.isNotBlank()) repo.rename(peer, n); rename = false }) { Text("Зберегти") } },
             dismissButton = { TextButton(onClick = { rename = false }) { Text("Скасувати") } },
         )
     }
@@ -520,7 +645,7 @@ private val timeFmt = SimpleDateFormat("HH:mm", Locale("uk"))
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun Bubble(m: Message, playing: Boolean, onLongPress: () -> Unit, onPlay: () -> Unit) {
+private fun Bubble(m: Message, playing: Boolean, sender: String? = null, onLongPress: () -> Unit, onPlay: () -> Unit) {
     val system = m.kind == "call"
     Column(
         Modifier.fillMaxWidth().padding(vertical = 3.dp),
@@ -530,6 +655,7 @@ private fun Bubble(m: Message, playing: Boolean, onLongPress: () -> Unit, onPlay
             Text(m.text, color = Muted, fontSize = 13.sp, modifier = Modifier.combinedClickable(onClick = {}, onLongClick = onLongPress))
             return@Column
         }
+        if (sender != null) Text(sender, color = Accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp))
         Surface(
             color = if (m.out) OutBubble else InBubble, shape = RoundedCornerShape(14.dp),
             modifier = Modifier.widthIn(max = 300.dp).clip(RoundedCornerShape(14.dp))
@@ -576,13 +702,34 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
 
     Column(Modifier.fillMaxSize()) {
         TopAppBar(
-            navigationIcon = { IconButton(onClick = { repo.myName = name; onBack() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Назад") } },
+            navigationIcon = {
+                IconButton(onClick = {
+                    val changed = repo.myName != name.trim()
+                    repo.myName = name
+                    if (changed) repo.scope.launch { repo.sendProfile() } // нове ім'я — контактам
+                    onBack()
+                }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Назад") }
+            },
             title = { Text("Налаштування") },
             colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
         )
         Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Section("Моє фото") {
+                var avatar by remember { mutableStateOf(repo.myAvatar) }
+                val pick = rememberAvatarPicker(toast) { a ->
+                    repo.myAvatar = a; avatar = a
+                    repo.sendProfile()
+                    toast("Фото оновлено і надіслано контактам")
+                }
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    AvatarView(name.ifEmpty { "?" }, avatar.ifEmpty { null }, 64.dp)
+                    OutlinedButton(onClick = pick) { Text("🖼 Обрати") }
+                    if (avatar.isNotEmpty()) TextButton(onClick = { repo.myAvatar = ""; avatar = ""; scope.launch { repo.sendProfile() } }) { Text("Прибрати") }
+                }
+                Text("Бачать лише твої контакти: фото йде їм зашифрованим, сервер його не бачить.", color = Muted, fontSize = 12.sp)
+            }
             Section("Моє ім'я") {
-                OutlinedTextField(name, { name = it.take(60); repo.myName = name }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(name, { name = it.take(60) }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 Text("Бачать лише ті, кого ти запрошуєш. Сервер його не знає.", color = Muted, fontSize = 12.sp)
             }
             Section("Мій ID") { Text(repo.core?.fingerprint() ?: "", fontFamily = FontFamily.Monospace) }

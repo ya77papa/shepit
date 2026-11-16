@@ -110,7 +110,7 @@ class CallActivity : ComponentActivity() {
                 Text("Шепіт · наскрізне шифрування", color = Muted, fontSize = 13.sp)
             }
             Spacer(Modifier.height(48.dp))
-            Avatar(name, ringing = state == State.INCOMING || state == State.OUTGOING)
+            Avatar(name, remember(peer) { app.repo.avatarOf(peer) }, ringing = state == State.INCOMING || state == State.OUTGOING)
             Spacer(Modifier.height(24.dp))
             Text(name, color = Color.White, fontSize = 30.sp, fontWeight = FontWeight.Medium, textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis)
             Spacer(Modifier.height(8.dp))
@@ -155,7 +155,7 @@ class CallActivity : ComponentActivity() {
 private val avatarColors = listOf(0xFF5B8DEF, 0xFFE0884B, 0xFF4BB38A, 0xFFB46BD6, 0xFFD6577A, 0xFF4BA3C7).map { Color(it) }
 
 @Composable
-private fun Avatar(name: String, ringing: Boolean) {
+private fun Avatar(name: String, photo: String?, ringing: Boolean) {
     val initials = name.split(" ", "-").filter { it.isNotBlank() }.take(2).joinToString("") { it.take(1).uppercase() }.ifEmpty { "?" }
     val color = avatarColors[(name.hashCode() and 0x7fffffff) % avatarColors.size]
     val t = rememberInfiniteTransition(label = "ring")
@@ -163,7 +163,8 @@ private fun Avatar(name: String, ringing: Boolean) {
     val waveAlpha by t.animateFloat(0.35f, 0f, infiniteRepeatable(tween(1400), RepeatMode.Restart), label = "alpha")
     Box(contentAlignment = Alignment.Center, modifier = Modifier.size(180.dp)) {
         if (ringing) Box(Modifier.size(128.dp).scale(wave).clip(CircleShape).background(color.copy(alpha = waveAlpha)))
-        Box(Modifier.size(128.dp).clip(CircleShape).background(color), contentAlignment = Alignment.Center) {
+        if (photo != null) AvatarView(name, photo, 128.dp)
+        else Box(Modifier.size(128.dp).clip(CircleShape).background(color), contentAlignment = Alignment.Center) {
             Text(initials, color = Color.White, fontSize = 48.sp, fontWeight = FontWeight.Medium)
         }
     }

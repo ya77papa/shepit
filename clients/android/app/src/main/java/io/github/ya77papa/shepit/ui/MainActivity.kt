@@ -29,6 +29,8 @@ class MainActivity : ComponentActivity() {
     private val inviteCode = mutableStateOf<String?>(null)
     /** Показати вікно оновлення (з сповіщення «Доступна нова версія»). */
     private val showUpdate = mutableStateOf(false)
+    /** Посилання на канал (#c=…&k=…). */
+    private val channelLink = mutableStateOf<Pair<String, String?>?>(null)
 
     private val notifPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
     val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
@@ -39,7 +41,7 @@ class MainActivity : ComponentActivity() {
         handleIntent(intent)
         setContent {
             ShepitTheme {
-                AppUi(app, this, pendingInvite, openRequest, inviteCode, showUpdate)
+                AppUi(app, this, pendingInvite, openRequest, inviteCode, showUpdate, channelLink)
             }
         }
     }
@@ -51,6 +53,7 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIntent(i: Intent?) {
         i?.data?.toString()?.let { url ->
+            io.github.ya77papa.shepit.data.Channels.parseLink(url)?.let { channelLink.value = it }
             app.repo.inviteCodeFrom(url)?.let { inviteCode.value = it }
             app.repo.parseInvite(url)?.let { pendingInvite.value = it }
         }

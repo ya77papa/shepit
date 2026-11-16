@@ -23,6 +23,9 @@ class Api(private val base: String = BuildConfig.SERVER) {
 
     private val json = "application/json".toMediaType()
 
+    /** Канали: окремий клієнт з підписом ключем каналу. */
+    val channels by lazy { Channels.Client(base, client) }
+
     /**
      * Різниця між годинником сервера і телефона (мс). Позначки часу дзвінків рахуємо за
      * годинником сервера, щоб розбіжність годинників телефона й комп'ютера не ламала дзвінки.
