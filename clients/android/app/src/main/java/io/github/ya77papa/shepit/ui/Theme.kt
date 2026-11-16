@@ -1,5 +1,6 @@
 package io.github.ya77papa.shepit.ui
 
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
@@ -28,3 +29,15 @@ private val colors = darkColorScheme(
 
 @Composable
 fun ShepitTheme(content: @Composable () -> Unit) = MaterialTheme(colorScheme = colors, content = content)
+
+/**
+ * Інтерфейс завжди темний, тож значки системних смуг (час, батарея) — завжди світлі.
+ * Типовий enableEdgeToEdge() бере тему телефона: на світлій темі значки темні й зливаються з тлом.
+ */
+fun androidx.activity.ComponentActivity.darkSystemBars() {
+    val transparent = android.graphics.Color.TRANSPARENT
+    enableEdgeToEdge(
+        statusBarStyle = androidx.activity.SystemBarStyle.dark(transparent),
+        navigationBarStyle = androidx.activity.SystemBarStyle.dark(transparent),
+    )
+}
