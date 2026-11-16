@@ -7,7 +7,7 @@
   import type { Channel } from './lib/db';
 
   let {
-    channel, subscribed, canSubscribe = true, onSubscribe, onUnsubscribe, onChange, onDeleted, onError,
+    channel, subscribed, canSubscribe = true, onSubscribe, onUnsubscribe, onChange, onDeleted, onError, editAvatar,
   }: {
     channel: Channel;
     subscribed: boolean;
@@ -18,6 +18,8 @@
     onChange?: (c: Channel) => void;
     onDeleted?: () => void;
     onError: (msg: string) => void;
+    /** Редактор фото (масштаб, поворот); null — скасовано. */
+    editAvatar?: (f: File) => Promise<string | null>;
   } = $props();
 
   const mine = $derived(!!channel.priv);
@@ -143,12 +145,16 @@
   }
 
   async function pickAvatar(e: Event) {
-    const f = (e.currentTarget as HTMLInputElement).files?.[0];
+    const input = e.currentTarget as HTMLInputElement;
+    const f = input.files?.[0];
+    input.value = '';
     if (!f) return;
     try {
+      const a = editAvatar ? await editAvatar(f) : await makeAvatar(f);
+      if (!a) return;
       editName ||= channel.name;
       editAbout ||= channel.about;
-      await saveMeta(await makeAvatar(f));
+      await saveMeta(a);
     } catch (err) {
       fail(err);
     }
@@ -176,7 +182,7 @@
 <header>
   <Avatar name={channel.name} src={channel.avatar} size={36} />
   <button class="title" onclick={() => (info = !info)} title="Про канал">{channel.name}</button>
-  <span class="small muted">{channel.public ? '📢 публічний' : '🔒 зашифрований'}</span>
+  <span class="small muted">{channel.public ? 'публічний' : 'зашифрований'}</span>
   <span class="spacer"></span>
   {#if !subscribed && canSubscribe}
     <button class="primary" onclick={() => onSubscribe?.()}>Підписатися</button>
@@ -205,10 +211,10 @@
       <div class="qr">{@html qr}</div>
       <div class="linkbox mono small">{link}</div>
       <div class="row wrap">
-        <button onclick={copyLink}>{copied ? 'Скопійовано ✓' : 'Копіювати посилання'}</button>
+        <button onclick={copyLink}>{copied ? 'Скопійовано ' : 'Копіювати посилання'}</button>
         {#if mine}
-          <button onclick={startEdit}>✎ Назва й опис</button>
-          <label class="button-like">🖼 Фото<input type="file" accept="image/*" hidden onchange={pickAvatar} /></label>
+          <button onclick={startEdit}>Назва й опис</button>
+          <label class="button-like">Фото<input type="file" accept="image/*" hidden onchange={pickAvatar} /></label>
           <button class="danger" onclick={removeChannel}>Видалити канал</button>
         {:else if subscribed}
           <button class="ghost" onclick={() => onUnsubscribe?.()}>Відписатися</button>
@@ -225,7 +231,7 @@
     <div class="msg post" class:selected={selected === p.seq}>
       <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
       <div class="bubble" onclick={() => mine && (selected = selected === p.seq ? null : p.seq)}>
-        {#if p.body}{p.body.text}{:else}<span class="muted">🔒 не вдалося розшифрувати</span>{/if}
+        {#if p.body}{p.body.text}{:else}<span class="muted">не вдалося розшифрувати</span>{/if}
       </div>
       <div class="time">{time(p.at)}</div>
     </div>

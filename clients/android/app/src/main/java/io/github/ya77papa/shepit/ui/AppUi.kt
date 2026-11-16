@@ -104,7 +104,7 @@ private fun Welcome(app: ShepitApp, invite: Pair<String, String?>?, linkCode: St
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(32.dp))
-        Text("🤫", fontSize = 56.sp)
+        Image(androidx.compose.ui.res.painterResource(io.github.ya77papa.shepit.R.drawable.ic_launcher_fg), null, Modifier.size(96.dp))
         Text("Шепіт", fontSize = 32.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(12.dp))
         if (invite != null) {
@@ -126,7 +126,7 @@ private fun Welcome(app: ShepitApp, invite: Pair<String, String?>?, linkCode: St
             if (mode == "invite") {
                 Spacer(Modifier.height(12.dp))
                 if (linkCode != null) {
-                    Text("🎟 Код запрошення: $linkCode", fontFamily = FontFamily.Monospace)
+                    Text("Код запрошення: $linkCode", fontFamily = FontFamily.Monospace)
                 } else {
                     OutlinedTextField(code, { code = it.take(20) }, label = { Text("Код запрошення: XXXX-XXXX-XXXX") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     Text("Реєстрація на цьому сервері — лише за запрошенням. Код є в посиланні, яке тобі надіслали.", color = Muted, fontSize = 12.sp)
@@ -309,11 +309,11 @@ private fun ContactsScreen(
                 Box {
                     IconButton(onClick = { menu = true }) { Icon(Icons.Default.Add, "Створити") }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                        DropdownMenuItem(text = { Text("Запросити друга") }, leadingIcon = { Icon(Icons.Default.Share, null) }, onClick = { menu = false; onInvite() })
-                        DropdownMenuItem(text = { Text("Додати за ключем") }, leadingIcon = { Icon(Icons.Default.PersonAdd, null) }, onClick = { menu = false; onAdd() })
-                        DropdownMenuItem(text = { Text("Нова група") }, leadingIcon = { Icon(Icons.Default.Groups, null) }, enabled = contacts.isNotEmpty(), onClick = { menu = false; onNewGroup() })
-                        DropdownMenuItem(text = { Text("Новий канал") }, leadingIcon = { Icon(Icons.Default.Campaign, null) }, onClick = { menu = false; onNewChannel() })
-                        DropdownMenuItem(text = { Text("Знайти канал") }, leadingIcon = { Icon(Icons.Default.Search, null) }, onClick = { menu = false; onFindChannel() })
+                        DropdownMenuItem(text = { Text("Запросити друга") }, onClick = { menu = false; onInvite() })
+                        DropdownMenuItem(text = { Text("Додати за ключем") }, onClick = { menu = false; onAdd() })
+                        DropdownMenuItem(text = { Text("Нова група") }, enabled = contacts.isNotEmpty(), onClick = { menu = false; onNewGroup() })
+                        DropdownMenuItem(text = { Text("Новий канал") }, onClick = { menu = false; onNewChannel() })
+                        DropdownMenuItem(text = { Text("Знайти канал") }, onClick = { menu = false; onFindChannel() })
                     }
                 }
                 IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, "Налаштування") }
@@ -323,12 +323,12 @@ private fun ContactsScreen(
         val update by app.updater.available.collectAsState()
         update?.let { u ->
             Surface(color = Color(0xFF1F2B18), modifier = Modifier.fillMaxWidth().clickable(onClick = onUpdate)) {
-                Text("⬆️ Доступна нова версія ${u.versionName} — торкнись, щоб оновити", Modifier.padding(12.dp))
+                Text("Доступна нова версія ${u.versionName} — торкнись, щоб оновити", Modifier.padding(12.dp))
             }
         }
         if (!Notifications.canFullScreen(act)) {
             Surface(color = Color(0xFF2B2A14), modifier = Modifier.fillMaxWidth().clickable { act.askFullScreen() }) {
-                Text("⚠️ Дозволь Шепоту показувати вхідні дзвінки на весь екран — торкнись тут", Modifier.padding(12.dp))
+                Text("Дозволь Шепоту показувати вхідні дзвінки на весь екран — торкнись тут", Modifier.padding(12.dp))
             }
         }
         if (contacts.isEmpty() && groups.isEmpty() && channels.isEmpty()) {
@@ -337,7 +337,7 @@ private fun ContactsScreen(
                 Spacer(Modifier.height(12.dp))
                 Text("1. Натисни «Запросити друга» і надішли посилання будь-яким способом або покажи QR-код.\n\n2. Друг відкриває посилання і створює акаунт — ви одразу в контактах одне в одного.\n\n3. Пишіть і дзвоніть. Для впевненості звірте «код безпеки» наживо.")
                 Spacer(Modifier.height(20.dp))
-                Button(onClick = onInvite, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text("Запросити друга") }
+                Button(onClick = onInvite, colors = ButtonDefaults.buttonColors(containerColor = CalmButton, contentColor = Color(0xFFE6EDF5)), modifier = Modifier.fillMaxWidth().height(52.dp)) { Text("Запросити друга") }
                 TextButton(onClick = onFindChannel, modifier = Modifier.fillMaxWidth()) { Text("або знайди публічний канал") }
             }
         } else {
@@ -367,14 +367,14 @@ private fun ContactsScreen(
                     ListItem(
                         leadingContent = { AvatarView(c.name, c.avatar, 44.dp) },
                         headlineContent = { Text(c.name, fontWeight = FontWeight.SemiBold) },
-                        supportingContent = { Text(if (c.mine) "мій канал" else if (c.public) "📢 публічний" else "🔒 зашифрований", fontSize = 12.sp, color = Muted) },
+                        supportingContent = { Text(if (c.mine) "мій канал" else if (c.public) "публічний" else "зашифрований", fontSize = 12.sp, color = Muted) },
                         trailingContent = { if (c.lastSeq > c.readSeq) Box(Modifier.size(10.dp).clip(CircleShape).background(Accent)) },
                         modifier = Modifier.clickable { onChannel(c) },
                         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                     )
                 }
             }
-            Button(onClick = onInvite, modifier = Modifier.fillMaxWidth().padding(16.dp).height(52.dp)) { Text("Запросити друга") }
+            Button(onClick = onInvite, colors = ButtonDefaults.buttonColors(containerColor = CalmButton, contentColor = Color(0xFFE6EDF5)), modifier = Modifier.fillMaxWidth().padding(16.dp).height(52.dp)) { Text("Запросити друга") }
         }
     }
 }
@@ -401,7 +401,7 @@ private fun InviteDialog(app: ShepitApp, onClose: () -> Unit) {
                 Text("Друг сканує QR камерою або відкриває посилання. Воно містить лише твій публічний ключ.", color = Muted, fontSize = 13.sp)
                 mine?.let { m ->
                     val note = when {
-                        m.mode == "invite" && m.code != null -> "🎟 Реєстрація на сервері — за запрошенням. Посилання містить твій одноразовий код (діє 30 днів)" + if (m.left > 0) "; ще можна створити ${m.left}." else "."
+                        m.mode == "invite" && m.code != null -> "Реєстрація на сервері — за запрошенням. Посилання містить твій одноразовий код (діє 30 днів)" + if (m.left > 0) "; ще можна створити ${m.left}." else "."
                         m.mode == "invite" -> "Твої запрошення закінчились. Друг, який уже має Шепіт, може додати тебе за цим посиланням; новому користувачеві потрібен код від адміністратора."
                         m.mode == "closed" -> "Реєстрацію нових користувачів закрито — посилання спрацює лише для тих, хто вже має Шепіт."
                         else -> null
@@ -554,7 +554,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
         } else Surface(color = MaterialTheme.colorScheme.surface) {
             Row(Modifier.fillMaxWidth().padding(8.dp).navigationBarsPadding(), verticalAlignment = Alignment.CenterVertically) {
                 if (recording) {
-                    Text("🔴 Запис ${Content.fmtDuration(recMs)} / ${Content.fmtDuration(VoiceRecorder.MAX_MS)}", Modifier.weight(1f).padding(8.dp))
+                    Text("Запис ${Content.fmtDuration(recMs)} / ${Content.fmtDuration(VoiceRecorder.MAX_MS)}", Modifier.weight(1f).padding(8.dp))
                     TextButton(onClick = { recording = false; recorder.stop(cancel = true) }) { Text("Скасувати") }
                     Button(onClick = {
                         recording = false
@@ -665,7 +665,7 @@ private fun Bubble(m: Message, playing: Boolean, sender: String? = null, onLongP
                 Row(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(if (playing) Icons.Default.Stop else Icons.Default.PlayArrow, null)
                     Spacer(Modifier.width(8.dp))
-                    Text("🎤 ${Content.fmtDuration(m.voiceDur)}")
+                    Text("${Content.fmtDuration(m.voiceDur)}")
                 }
             } else {
                 Text(m.text, Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
@@ -723,7 +723,7 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
                 }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     AvatarView(name.ifEmpty { "?" }, avatar.ifEmpty { null }, 64.dp)
-                    OutlinedButton(onClick = pick) { Text("🖼 Обрати") }
+                    OutlinedButton(onClick = pick) { Text("Обрати") }
                     if (avatar.isNotEmpty()) TextButton(onClick = { repo.myAvatar = ""; avatar = ""; scope.launch { repo.sendProfile() } }) { Text("Прибрати") }
                 }
                 Text("Бачать лише твої контакти: фото йде їм зашифрованим, сервер його не бачить.", color = Muted, fontSize = 12.sp)
@@ -735,8 +735,8 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
             Section("Мій ID") { Text(repo.core?.fingerprint() ?: "", fontFamily = FontFamily.Monospace) }
             Section("Дзвінки, коли застосунок закритий") {
                 Text("Шепіт тримає з'єднання з сервером без сервісів Google (тихе сповіщення «на зв'язку»).", color = Muted, fontSize = 13.sp)
-                if (!battery) OutlinedButton(onClick = { act.askBattery() }) { Text("🔋 Дозволити працювати у фоні") } else Text("✅ Фонова робота дозволена")
-                if (!Notifications.canFullScreen(ctx)) OutlinedButton(onClick = { act.askFullScreen() }) { Text("📞 Дозволити дзвінки на весь екран") } else Text("✅ Дзвінки на весь екран дозволені")
+                if (!battery) OutlinedButton(onClick = { act.askBattery() }) { Text("Дозволити працювати у фоні") } else Text("Фонова робота дозволена")
+                if (!Notifications.canFullScreen(ctx)) OutlinedButton(onClick = { act.askFullScreen() }) { Text("Дозволити дзвінки на весь екран") } else Text("Дзвінки на весь екран дозволені")
             }
             Section("Дзвінки: діагностика") {
                 var check by remember { mutableStateOf("") }
@@ -769,7 +769,7 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
                             .onFailure { toast(it.message ?: "Помилка") }
                         busy = false
                     }
-                }) { Text(if (busy) "Шифрую…" else "💾 Зберегти у файл") }
+                }) { Text(if (busy) "Шифрую…" else "Зберегти у файл") }
             }
             Section("Версія й оновлення") {
                 val upd = app.updater
@@ -784,12 +784,12 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
                 }
                 Text("Раз на 12 год застосунок питає GitHub про нову версію (GitHub бачить лише IP-адресу). Оновлення ставиться тільки після твого підтвердження і тільки якщо підписане тим самим ключем.", color = Muted, fontSize = 12.sp)
                 if (available != null) {
-                    Button(onClick = onUpdate) { Text("⬆️ Оновити до ${available!!.versionName}") }
+                    Button(onClick = onUpdate) { Text("Оновити до ${available!!.versionName}") }
                 } else {
                     OutlinedButton(enabled = !checking, onClick = {
                         checking = true; status = ""
                         scope.launch {
-                            status = runCatching { upd.check() }.fold({ if (it == null) "✅ У тебе найновіша версія" else "" }, { "Не вдалося перевірити: ${it.message}" })
+                            status = runCatching { upd.check() }.fold({ if (it == null) "У тебе найновіша версія" else "" }, { "Не вдалося перевірити: ${it.message}" })
                             checking = false
                         }
                     }) { Text(if (checking) "Перевіряю…" else "Перевірити оновлення") }

@@ -3,10 +3,10 @@
   import { renderSVG } from 'uqr';
   import { Shepit, announceAccountChange, fingerprintOf, isValidIdentity, loadWasm, normalizeInviteCode, onAccountChangedElsewhere, registrationMode, type RegistrationMode } from './lib/shepit';
   import { channels as channelsDb, contacts as contactsDb, groups as groupsDb, kv, messages as messagesDb, wipe, type Channel, type Contact, type Group, type Member, type Message } from './lib/db';
-  import { makeAvatar } from './lib/avatar';
   import { channelFromServer, fetchChannel, newChannelKeys, parseChannelLink, putMeta, searchPublic, type ChannelMeta } from './lib/channels';
   import Avatar from './Avatar.svelte';
   import ChannelView from './ChannelView.svelte';
+  import AvatarEditor from './AvatarEditor.svelte';
   import { exportBackup, importBackup, MIN_PASSWORD } from './lib/backup';
   import { COMMIT, REPO, SHORT, commitUrl, compareUrl, registerServiceWorker } from './lib/pwa';
   import { decode, encode, fromBase64, toBase64, fmtDuration, newMsgId, validAvatar, validGroupId, validMsgId, type Body } from './lib/content';
@@ -52,6 +52,19 @@
   let showSafety = $state(false);
   let selected: Message | null = $state(null); // повідомлення, для якого відкрито дії
   let myAvatar = $state('');
+  // Відкритий редактор фото: обрати фрагмент, масштаб, поворот.
+  let avatarEdit: { file: File; resolve: (b64: string | null) => void } | null = $state(null);
+  function editAvatar(file: File): Promise<string | null> {
+    if (!file.type.startsWith('image/')) return Promise.reject(new Error('Це не зображення'));
+    return new Promise((resolve) => (avatarEdit = { file, resolve }));
+  }
+  /** Файл з <input type=file> → редактор → base64 (або null, якщо скасовано). */
+  async function pickFrom(e: Event): Promise<string | null> {
+    const input = e.currentTarget as HTMLInputElement;
+    const f = input.files?.[0];
+    input.value = ''; // щоб той самий файл можна було обрати знову
+    return f ? editAvatar(f) : null;
+  }
   let groups: Group[] = $state([]);
   let group: Group | null = $state(null); // відкрита група
   let channels: Channel[] = $state([]);
@@ -96,11 +109,16 @@
   }
 
   async function setMyAvatar(e: Event) {
-    const f = (e.currentTarget as HTMLInputElement).files?.[0];
-    if (!f) return;
+    let a: string | null;
+    try {
+      a = await pickFrom(e);
+    } catch (err) {
+      return fail(err);
+    }
+    if (!a) return;
     busy = true;
     try {
-      myAvatar = await makeAvatar(f);
+      myAvatar = a;
       await kv.set('myAvatar', myAvatar);
       await sendProfile();
       notice = 'Фото оновлено і надіслано контактам';
@@ -232,10 +250,9 @@
   };
 
   async function setGroupAvatar(e: Event) {
-    const f = (e.currentTarget as HTMLInputElement).files?.[0];
-    if (!f) return;
     try {
-      const a = await makeAvatar(f);
+      const a = await pickFrom(e);
+      if (!a) return;
       await groupOp((g) => { g.avatar = a; return g.members; });
     } catch (err) {
       fail(err);
@@ -1055,7 +1072,7 @@
         <p class="muted small left">Ім'я бачать лише ті, кому ти надішлеш запрошення. Сервер його не знає.</p>
         {#if regMode === 'invite'}
           {#if invite?.code || (inviteCode && normalizeInviteCode(inviteCode))}
-            <p class="muted small left">🎟 Код запрошення: <span class="mono">{normalizeInviteCode(inviteCode)}</span></p>
+            <p class="muted small left">Код запрошення: <span class="mono">{normalizeInviteCode(inviteCode)}</span></p>
           {:else}
             <input placeholder="Код запрошення: XXXX-XXXX-XXXX" bind:value={inviteCode} maxlength="20" autocomplete="off" class="mono" />
             <p class="muted small left">Реєстрація на цьому сервері — лише за запрошенням. Код є в посиланні, яке тобі надіслали.</p>
@@ -1088,15 +1105,15 @@
             <div class="who-name">{myName || 'Без імені'}</div>
             <div class="small muted">Мій ID: <span class="mono">{short(me.fingerprint)}</span></div>
           </div>
-          <button class="ghost gear" title="Налаштування" aria-label="Налаштування" onclick={() => (panel = 'settings')}>⚙️</button>
+          <button class="ghost gear" title="Налаштування" aria-label="Налаштування" onclick={() => (panel = 'settings')}>Налаштування</button>
         </div>
-        <button class="primary wide" onclick={() => (panel = 'invite')}>Запросити друга</button>
+        <button class="calm wide" onclick={() => (panel = 'invite')}>Запросити друга</button>
       </section>
 
       {#if pushState === 'off'}
-        <button class="notify-cta" onclick={enablePush}>🔔 Увімкнути сповіщення — щоб дзвінки доходили, коли Шепіт закритий</button>
+        <button class="notify-cta" onclick={enablePush}>Увімкнути сповіщення — щоб дзвінки доходили, коли Шепіт закритий</button>
       {:else if pushState === 'denied'}
-        <p class="small warn">🔕 Сповіщення заборонені для цього сайту в налаштуваннях браузера — дзвінки не дійдуть, коли Шепіт закритий.</p>
+        <p class="small warn">Сповіщення заборонені для цього сайту в налаштуваннях браузера — дзвінки не дійдуть, коли Шепіт закритий.</p>
       {/if}
 
       <section class="contacts">
@@ -1147,7 +1164,7 @@
         <div class="row between">
           <div class="label">Канали</div>
           <span class="row">
-            <button class="ghost" onclick={() => { searchResults = null; searchQ = ''; panel = 'findchannel'; doSearch(); }}>🔍</button>
+            <button class="ghost" onclick={() => { searchResults = null; searchQ = ''; panel = 'findchannel'; doSearch(); }}>Знайти</button>
             <button class="ghost" onclick={() => (panel = 'newchannel')}>+ Новий</button>
           </span>
         </div>
@@ -1189,6 +1206,7 @@
           onChange={(c) => (channelSubscribed ? saveChannel(c) : (channel = c))}
           onDeleted={onChannelDeleted}
           onError={fail}
+          {editAvatar}
         />
       {:else if current || group}
         {#if group}
@@ -1202,10 +1220,10 @@
         {:else if current}
         <header>
           <Avatar name={current.name} src={current.avatar} size={36} />
-          <button class="title" onclick={rename} title="Перейменувати">{current.name} ✎</button>
-          <button class="ghost small" onclick={() => (showSafety = !showSafety)}>🔒 код безпеки</button>
+          <button class="title" onclick={rename} title="Перейменувати">{current.name} </button>
+          <button class="ghost small" onclick={() => (showSafety = !showSafety)}>код безпеки</button>
           <span class="spacer"></span>
-          <button class="ghost" title="Голосовий дзвінок" disabled={calls.state !== 'idle'} onclick={() => calls.start(current!.identity)}>📞</button>
+          <button class="ghost" title="Голосовий дзвінок" disabled={calls.state !== 'idle'} onclick={() => calls.start(current!.identity)}>Дзвінок</button>
           <button class="ghost" title="Бесіда: очистити, видалити контакт" onclick={() => (panel = 'chat')}>⋯</button>
         </header>
         {/if}
@@ -1241,7 +1259,7 @@
           <div class="composer msg-actions">
             <span class="muted small">Повідомлення:</span>
             <span class="spacer"></span>
-            <button onclick={() => deleteMessage(selected!, false)} disabled={busy}>🗑 Видалити в мене</button>
+            <button onclick={() => deleteMessage(selected!, false)} disabled={busy}>Видалити в мене</button>
             {#if selected.out && selected.mid}
               <button class="danger" onclick={() => deleteMessage(selected!, true)} disabled={busy}>Видалити у всіх</button>
             {/if}
@@ -1261,7 +1279,7 @@
             {#if draft.trim()}
               <button class="primary" type="submit" disabled={busy}>Надіслати</button>
             {:else}
-              <button type="button" title="Голосове повідомлення" disabled={busy} onclick={startRecording}>🎤</button>
+              <button type="button" title="Голосове повідомлення" disabled={busy} onclick={startRecording}>Голосове</button>
             {/if}
           </form>
         {/if}
@@ -1273,7 +1291,7 @@
             <li><b>Друг відкриває посилання</b> і створює акаунт — ти одразу з'являєшся в його контактах, а він надсилає тобі привітання.</li>
             <li><b>Ви в контактах одне в одного</b> — пишіть. Для впевненості звірте «код безпеки» наживо.</li>
           </ol>
-          <button class="primary" onclick={() => (panel = 'invite')}>Запросити друга</button>
+          <button class="calm" onclick={() => (panel = 'invite')}>Запросити друга</button>
           <p class="muted small">Номер телефону, email чи пароль не потрібні. Посилання містить лише твій публічний ключ.</p>
         </div>
       {:else}
@@ -1283,6 +1301,14 @@
       {#if error}<div class="toast" role="alert">{error} <button class="ghost" onclick={() => (error = '')}>✕</button></div>{/if}
     </main>
   </div>
+
+  {#if avatarEdit}
+    <AvatarEditor
+      file={avatarEdit.file}
+      onDone={(b) => { avatarEdit?.resolve(b); avatarEdit = null; }}
+      onCancel={() => { avatarEdit?.resolve(null); avatarEdit = null; }}
+    />
+  {/if}
 
   {#if calls.state !== 'idle'}
     <CallOverlay {calls} name={nameOf(calls.peer)} avatar={contacts.find((c) => c.identity === calls.peer)?.avatar} />
@@ -1311,8 +1337,8 @@
           </div>
           {#if isAdmin}
             <div class="row wrap">
-              <button onclick={renameGroup} disabled={busy}>✎ Назва</button>
-              <label class="button-like">🖼 Фото<input type="file" accept="image/*" hidden onchange={setGroupAvatar} /></label>
+              <button onclick={renameGroup} disabled={busy}>Назва</button>
+              <label class="button-like">Фото<input type="file" accept="image/*" hidden onchange={setGroupAvatar} /></label>
             </div>
           {/if}
           <div class="label">Учасники</div>
@@ -1340,7 +1366,7 @@
               <button onclick={addToGroup} disabled={busy || !addMembers.length || group.members.length + addMembers.length > 100}>Додати обраних</button>
             {/if}
           {/if}
-          <button onclick={() => clearChat(false)}>🧹 Очистити історію в мене</button>
+          <button onclick={() => clearChat(false)}>Очистити історію в мене</button>
           {#if group.left}
             <button class="danger" onclick={deleteGroupLocal}>Видалити групу з цього пристрою</button>
           {:else}
@@ -1350,8 +1376,8 @@
           <h2>Новий канал</h2>
           <input placeholder="Назва каналу" bind:value={newChannelName} maxlength="80" />
           <textarea placeholder="Опис (необов'язково)" bind:value={newChannelAbout} maxlength="500" rows="3"></textarea>
-          <label class="choice"><input type="radio" class="cb" name="ctype" value={false} bind:group={newChannelPublic} /> <span><b>🔒 Зашифрований</b><br /><span class="small muted">Читає лише той, хто має посилання: ключ у посиланні, сервер дописів не бачить.</span></span></label>
-          <label class="choice"><input type="radio" class="cb" name="ctype" value={true} bind:group={newChannelPublic} /> <span><b>📢 Публічний</b><br /><span class="small muted">Дописи відкриті, канал знаходиться пошуком, читати можна без акаунта.</span></span></label>
+          <label class="choice"><input type="radio" class="cb" name="ctype" value={false} bind:group={newChannelPublic} /> <span><b>Зашифрований</b><br /><span class="small muted">Читає лише той, хто має посилання: ключ у посиланні, сервер дописів не бачить.</span></span></label>
+          <label class="choice"><input type="radio" class="cb" name="ctype" value={true} bind:group={newChannelPublic} /> <span><b>Публічний</b><br /><span class="small muted">Дописи відкриті, канал знаходиться пошуком, читати можна без акаунта.</span></span></label>
           <button class="primary" onclick={createChannel} disabled={busy || !newChannelName.trim()}>{busy ? 'Створюю…' : 'Створити канал'}</button>
           <p class="small warn">Ключ автора зберігається лише на цьому пристрої — зроби резервну копію, інакше втратиш можливість писати в канал.</p>
         {:else if panel === 'findchannel'}
@@ -1375,8 +1401,8 @@
           <p class="small muted">Зашифровані канали в пошуку не з'являються — до них потрапляють лише за посиланням.</p>
         {:else if panel === 'chat' && current}
           <h2>{current.name}</h2>
-          <button onclick={() => clearChat(false)} disabled={busy}>🧹 Очистити бесіду в мене</button>
-          <button onclick={() => clearChat(true)} disabled={busy}>🧹 Очистити в мене і в {current.name}</button>
+          <button onclick={() => clearChat(false)} disabled={busy}>Очистити бесіду в мене</button>
+          <button onclick={() => clearChat(true)} disabled={busy}>Очистити в мене і в {current.name}</button>
           <button class="danger" onclick={deleteContact} disabled={busy}>Видалити контакт</button>
           <p class="muted small">Щоб видалити окреме повідомлення — натисни на нього (на телефоні можна довго втримати). «Видалити у всіх» доступне для твоїх повідомлень, надісланих у цій версії Шепоту.</p>
         {:else if panel === 'invite'}
@@ -1384,7 +1410,7 @@
           {#if !myName}<p class="warn small">Підказка: вкажи своє ім'я зліва — тоді друг побачить, від кого запрошення.</p>{/if}
           {#if myInvite?.mode === 'invite'}
             {#if myInvite.code}
-              <p class="muted small">🎟 Реєстрація на сервері — за запрошенням. Посилання містить твій одноразовий код (діє 30 днів){myInvite.left ? `; ще можна створити ${myInvite.left}` : ''}.</p>
+              <p class="muted small">Реєстрація на сервері — за запрошенням. Посилання містить твій одноразовий код (діє 30 днів){myInvite.left ? `; ще можна створити ${myInvite.left}` : ''}.</p>
             {:else}
               <p class="warn small">Реєстрація на сервері — за запрошенням, а твої запрошення закінчились. Друг, який уже має Шепіт, може додати тебе за цим посиланням; новому користувачеві потрібен код від адміністратора.</p>
             {/if}
@@ -1395,9 +1421,9 @@
           <p class="muted small">Друг сканує QR камерою телефона або відкриває посилання:</p>
           <div class="linkbox mono">{inviteUrl}</div>
           <div class="row wrap">
-            <button class="primary" onclick={share}>{copied === 'link' ? 'Скопійовано ✓' : 'Поділитися посиланням'}</button>
+            <button class="primary" onclick={share}>{copied === 'link' ? 'Скопійовано ' : 'Поділитися посиланням'}</button>
             <button onclick={() => copy(inviteUrl, 'link')}>Копіювати</button>
-            <button onclick={() => copy(me!.identity, 'key')}>{copied === 'key' ? 'Скопійовано ✓' : 'Лише ключ'}</button>
+            <button onclick={() => copy(me!.identity, 'key')}>{copied === 'key' ? 'Скопійовано ' : 'Лише ключ'}</button>
           </div>
         {:else if panel === 'settings'}
           <h2>Налаштування</h2>
@@ -1405,7 +1431,7 @@
             <span class="label">Моє фото</span>
             <div class="row">
               <Avatar name={myName || '?'} src={myAvatar} size={56} />
-              <label class="button-like">🖼 Обрати<input type="file" accept="image/*" hidden onchange={setMyAvatar} /></label>
+              <label class="button-like">Обрати<input type="file" accept="image/*" hidden onchange={setMyAvatar} /></label>
               {#if myAvatar}<button class="ghost" onclick={removeMyAvatar}>Прибрати</button>{/if}
             </div>
             <span class="small muted">Бачать лише твої контакти: фото йде їм зашифрованим, сервер його не бачить.</span>
@@ -1422,9 +1448,9 @@
           <div class="field">
             <span class="label">Сповіщення</span>
             {#if pushState === 'on'}
-              <span class="row wrap">✅ Увімкнено <button class="ghost small" onclick={disablePush}>Вимкнути</button></span>
+              <span class="row wrap">Увімкнено <button class="ghost small" onclick={disablePush}>Вимкнути</button></span>
             {:else if pushState === 'off'}
-              <button onclick={enablePush}>🔔 Увімкнути</button>
+              <button onclick={enablePush}>Увімкнути</button>
             {:else if pushState === 'busy'}
               <span class="muted">Вмикаю…</span>
             {:else if pushState === 'denied'}
@@ -1435,11 +1461,11 @@
           </div>
           <div class="field">
             <span class="label">Дзвінки</span>
-            <button onclick={runCallTest}>📞 Перевірити дзвінки</button>
+            <button onclick={runCallTest}>Перевірити дзвінки</button>
           </div>
           <div class="field">
             <span class="label">Резервна копія</span>
-            <button onclick={() => (panel = 'backup')}>💾 Зберегти ключі у файл</button>
+            <button onclick={() => (panel = 'backup')}>Зберегти ключі у файл</button>
             <span class="small warn">Ключі зберігаються лише в цьому браузері. Без копії очищення даних сайту = втрата акаунта.</span>
           </div>
           <div class="field">
@@ -1455,7 +1481,7 @@
           {:else}
             <ul class="small">
               {#each relayResults as r}
-                <li>{r.ok ? '✅' : '❌'} <span class="mono">{r.url}</span> — {r.detail}</li>
+                <li>{r.ok ? 'OK' : 'Помилка'}: <span class="mono">{r.url}</span> — {r.detail}</li>
               {/each}
             </ul>
           {/if}

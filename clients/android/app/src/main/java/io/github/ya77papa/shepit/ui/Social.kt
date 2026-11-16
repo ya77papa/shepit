@@ -33,6 +33,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.drawscope.withTransform
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -76,32 +79,129 @@ fun AvatarView(name: String, b64: String?, size: Dp = 40.dp) {
     }
 }
 
-/** Квадрат 192×192 з центру, JPEG ≤ ~48 КБ, base64 — як у веб-версії. */
-suspend fun makeAvatar(ctx: Context, uri: Uri): String = withContext(Dispatchers.IO) {
+/** Відкрити фото для редагування: зменшене до ~2048 px, з урахуванням повороту з EXIF. */
+suspend fun loadForEdit(ctx: Context, uri: Uri): Bitmap = withContext(Dispatchers.IO) {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
     var sample = 1
-    while (minOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= 192) sample *= 2
+    while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= 2048) sample *= 2
     val src = ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample }) }
         ?: error("Не вдалося відкрити зображення")
-    val side = minOf(src.width, src.height)
-    val square = Bitmap.createBitmap(src, (src.width - side) / 2, (src.height - side) / 2, side, side)
-    val small = Bitmap.createScaledBitmap(square, 192, 192, true)
-    for (q in listOf(82, 70, 55)) {
-        val out = ByteArrayOutputStream()
-        small.compress(Bitmap.CompressFormat.JPEG, q, out)
-        if (out.size() <= 48_000) return@withContext Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+    val degrees = runCatching {
+        ctx.contentResolver.openInputStream(uri)?.use { android.media.ExifInterface(it) }?.let { e ->
+            when (e.getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION, 1)) {
+                android.media.ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                android.media.ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                android.media.ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                else -> 0f
+            }
+        } ?: 0f
+    }.getOrDefault(0f)
+    if (degrees == 0f) src
+    else Bitmap.createBitmap(src, 0, 0, src.width, src.height, android.graphics.Matrix().apply { postRotate(degrees) }, true)
+}
+
+/** Стан редактора: масштаб (1 = фото повністю закриває коло), поворот (°), зсув (px екрана). */
+private data class Framing(val scale: Float = 1f, val rotation: Float = 0f, val dx: Float = 0f, val dy: Float = 0f)
+
+/** Відрендерити те, що в колі, у квадрат 192×192 JPEG ≤ ~48 КБ (base64) — як у веб-версії. */
+private fun renderAvatar(bmp: Bitmap, side: Float, f: Framing): String {
+    val out = 192
+    val k = out / side
+    val base = side / minOf(bmp.width, bmp.height)
+    val result = Bitmap.createBitmap(out, out, Bitmap.Config.ARGB_8888)
+    android.graphics.Canvas(result).apply {
+        drawColor(android.graphics.Color.rgb(15, 23, 34))
+        translate(out / 2f + f.dx * k, out / 2f + f.dy * k)
+        rotate(f.rotation)
+        val s = base * f.scale * k
+        scale(s, s)
+        drawBitmap(bmp, -bmp.width / 2f, -bmp.height / 2f, android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG or android.graphics.Paint.ANTI_ALIAS_FLAG))
+    }
+    for (q in listOf(85, 72, 58)) {
+        val o = ByteArrayOutputStream()
+        result.compress(Bitmap.CompressFormat.JPEG, q, o)
+        if (o.size() <= 48_000) return Base64.encodeToString(o.toByteArray(), Base64.NO_WRAP)
     }
     error("Не вдалося стиснути фото")
 }
 
-/** Вибір фото системним засобом (без дозволу на всі файли). */
+/** Редактор фото: посунути пальцем, збільшити/зменшити й повернути двома пальцями або повзунками. */
+@Composable
+private fun AvatarEditor(bmp: Bitmap, onCancel: () -> Unit, onDone: (String) -> Unit) {
+    val img = remember(bmp) { bmp.asImageBitmap() }
+    var f by remember(bmp) { mutableStateOf(Framing()) }
+    var sidePx by remember { mutableFloatStateOf(1f) }
+    androidx.compose.ui.window.Dialog(onDismissRequest = onCancel, properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(color = Color(0xFF0B111A), modifier = Modifier.fillMaxSize()) {
+            Column(Modifier.fillMaxSize().systemBarsPadding().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("Фото", fontSize = 20.sp, fontWeight = FontWeight.Bold, modifier = Modifier.align(Alignment.Start))
+                Text("Посунь пальцем, збільш або поверни двома пальцями.", color = Muted, fontSize = 13.sp, modifier = Modifier.align(Alignment.Start))
+                Spacer(Modifier.height(16.dp))
+                BoxWithConstraints(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    val side = minOf(maxWidth, 380.dp)
+                    androidx.compose.foundation.Canvas(
+                        Modifier.size(side).clip(RoundedCornerShape(8.dp)).background(Color(0xFF16202E))
+                            .pointerInput(bmp) {
+                                detectTransformGestures { _, pan, zoom, rot ->
+                                    f = f.copy(scale = (f.scale * zoom).coerceIn(1f, 6f), rotation = f.rotation + rot, dx = f.dx + pan.x, dy = f.dy + pan.y)
+                                }
+                            },
+                    ) {
+                        sidePx = size.width
+                        val base = size.width / minOf(img.width, img.height)
+                        withTransform({
+                            translate(size.width / 2 + f.dx, size.height / 2 + f.dy)
+                            rotate(f.rotation, androidx.compose.ui.geometry.Offset.Zero)
+                            scale(base * f.scale, base * f.scale, androidx.compose.ui.geometry.Offset.Zero)
+                        }) {
+                            drawImage(img, topLeft = androidx.compose.ui.geometry.Offset(-img.width / 2f, -img.height / 2f))
+                        }
+                        // Затемнення поза колом: видно, що потрапить в аватар.
+                        val r = size.width / 2
+                        val mask = androidx.compose.ui.graphics.Path().apply {
+                            fillType = androidx.compose.ui.graphics.PathFillType.EvenOdd
+                            addRect(androidx.compose.ui.geometry.Rect(0f, 0f, size.width, size.height))
+                            addOval(androidx.compose.ui.geometry.Rect(center = center, radius = r))
+                        }
+                        drawPath(mask, Color.Black.copy(alpha = 0.6f))
+                        drawCircle(Color.White.copy(alpha = 0.7f), radius = r, style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2f))
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+                Text("Масштаб", color = Muted, fontSize = 12.sp, modifier = Modifier.align(Alignment.Start))
+                Slider(value = f.scale, onValueChange = { f = f.copy(scale = it) }, valueRange = 1f..6f)
+                Text("Поворот: ${((f.rotation % 360 + 540) % 360 - 180).toInt()}°", color = Muted, fontSize = 12.sp, modifier = Modifier.align(Alignment.Start))
+                Slider(value = ((f.rotation % 360 + 540) % 360 - 180), onValueChange = { f = f.copy(rotation = it) }, valueRange = -180f..180f)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { f = f.copy(rotation = f.rotation - 90f) }) { Text("Вліво 90°") }
+                    OutlinedButton(onClick = { f = f.copy(rotation = f.rotation + 90f) }) { Text("Вправо 90°") }
+                    TextButton(onClick = { f = Framing() }) { Text("Скинути") }
+                }
+                Spacer(Modifier.weight(1f))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedButton(onClick = onCancel, modifier = Modifier.weight(1f).height(52.dp)) { Text("Скасувати") }
+                    Button(onClick = { onDone(renderAvatar(bmp, sidePx, f)) }, modifier = Modifier.weight(1f).height(52.dp)) { Text("Готово") }
+                }
+            }
+        }
+    }
+}
+
+/** Вибір фото системним засобом (без дозволу на всі файли) і редактор. */
 @Composable
 fun rememberAvatarPicker(onError: (String) -> Unit, onPicked: suspend (String) -> Unit): () -> Unit {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
+    var editing by remember { mutableStateOf<Bitmap?>(null) }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        if (uri != null) scope.launch { runCatching { onPicked(makeAvatar(ctx, uri)) }.onFailure { onError(it.message ?: "Помилка") } }
+        if (uri != null) scope.launch { runCatching { loadForEdit(ctx, uri) }.onSuccess { editing = it }.onFailure { onError(it.message ?: "Помилка") } }
+    }
+    editing?.let { bmp ->
+        AvatarEditor(bmp, onCancel = { editing = null }) { b64 ->
+            editing = null
+            scope.launch { runCatching { onPicked(b64) }.onFailure { onError(it.message ?: "Помилка") } }
+        }
     }
     return { launcher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
 }
@@ -212,8 +312,8 @@ fun GroupInfoScreen(app: ShepitApp, groupId: String, onBack: () -> Unit, onDelet
                     }
                 }
                 if (admin) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(enabled = !busy, onClick = { rename = true }) { Text("✎ Назва") }
-                    OutlinedButton(enabled = !busy, onClick = pickAvatar) { Text("🖼 Фото") }
+                    OutlinedButton(enabled = !busy, onClick = { rename = true }) { Text("Назва") }
+                    OutlinedButton(enabled = !busy, onClick = pickAvatar) { Text("Фото") }
                 }
                 Spacer(Modifier.height(12.dp))
                 Text("УЧАСНИКИ", color = Muted, fontSize = 12.sp)
@@ -308,8 +408,8 @@ fun NewChannelScreen(app: ShepitApp, onBack: () -> Unit, onCreated: (ChannelRec)
         Column(Modifier.padding(16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             OutlinedTextField(name, { name = it.take(80) }, label = { Text("Назва каналу") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             OutlinedTextField(about, { about = it.take(500) }, label = { Text("Опис (необов'язково)") }, minLines = 2, modifier = Modifier.fillMaxWidth())
-            ChoiceRow(!public, "🔒 Зашифрований", "Читає лише той, хто має посилання: ключ у посиланні, сервер дописів не бачить.") { public = false }
-            ChoiceRow(public, "📢 Публічний", "Дописи відкриті, канал знаходиться пошуком, читати можна без акаунта.") { public = true }
+            ChoiceRow(!public, "Зашифрований", "Читає лише той, хто має посилання: ключ у посиланні, сервер дописів не бачить.") { public = false }
+            ChoiceRow(public, "Публічний", "Дописи відкриті, канал знаходиться пошуком, читати можна без акаунта.") { public = true }
             Button(enabled = !busy && name.isNotBlank(), modifier = Modifier.fillMaxWidth().height(52.dp), onClick = {
                 busy = true
                 scope.launch {
@@ -440,7 +540,7 @@ fun ChannelScreen(
                     Surface(
                         color = InBubble, shape = RoundedCornerShape(14.dp),
                         modifier = Modifier.clip(RoundedCornerShape(14.dp)).combinedClickable(onClick = {}, onLongClick = { if (ch.mine || p.text != null) actions = p }),
-                    ) { Text(p.text ?: "🔒 не вдалося розшифрувати", Modifier.padding(12.dp), color = if (p.text == null) Muted else Color.Unspecified) }
+                    ) { Text(p.text ?: "не вдалося розшифрувати", Modifier.padding(12.dp), color = if (p.text == null) Muted else Color.Unspecified) }
                     Text(postTime.format(Date(p.at)), color = Muted, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 6.dp))
                 }
             }
@@ -500,8 +600,8 @@ fun ChannelScreen(
                     AvatarView(ch.name, ch.avatar, 64.dp)
                     if (ch.about.isNotEmpty()) Text(ch.about)
                     Text(
-                        if (ch.public) "📢 Публічний канал: дописи відкриті, сервер їх бачить, канал знаходиться пошуком."
-                        else "🔒 Зашифрований канал: читати може лише той, хто має посилання — ключ у ньому, сервер дописів не бачить.",
+                        if (ch.public) "Публічний канал: дописи відкриті, сервер їх бачить, канал знаходиться пошуком."
+                        else "Зашифрований канал: читати може лише той, хто має посилання — ключ у ньому, сервер дописів не бачить.",
                         color = Muted, fontSize = 13.sp,
                     )
                     Image(qr, "QR-код каналу", Modifier.size(200.dp).clip(RoundedCornerShape(12.dp)).background(Color.White))
@@ -513,8 +613,8 @@ fun ChannelScreen(
                     }
                     if (ch.mine) {
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(onClick = { edit = true }) { Text("✎ Опис") }
-                            OutlinedButton(onClick = pickAvatar) { Text("🖼 Фото") }
+                            OutlinedButton(onClick = { edit = true }) { Text("Опис") }
+                            OutlinedButton(onClick = pickAvatar) { Text("Фото") }
                         }
                         TextButton(onClick = { confirm = "delete" }) { Text("Видалити канал", color = Danger) }
                         Text("Ти автор: ключ каналу зберігається лише на цьому телефоні і в резервній копії.", color = Color(0xFFE0B45A), fontSize = 12.sp)

@@ -5,6 +5,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
 
 val Accent = Color(0xFFF5C542)
 val Muted = Color(0xFF8A9BB0)
@@ -27,8 +28,17 @@ private val colors = darkColorScheme(
     error = Color(0xFFFF7A7A),
 )
 
+/** Поля введення й меню — помітно заокруглені. */
+private val shapes = androidx.compose.material3.Shapes(
+    extraSmall = androidx.compose.foundation.shape.RoundedCornerShape(16.dp),
+    small = androidx.compose.foundation.shape.RoundedCornerShape(16.dp),
+)
+
+/** Спокійна (не яскрава) кнопка для частих дій, напр. «Запросити друга». */
+val CalmButton = Color(0xFF2A3A52)
+
 @Composable
-fun ShepitTheme(content: @Composable () -> Unit) = MaterialTheme(colorScheme = colors, content = content)
+fun ShepitTheme(content: @Composable () -> Unit) = MaterialTheme(colorScheme = colors, shapes = shapes, content = content)
 
 /**
  * Інтерфейс завжди темний, тож значки системних смуг (час, батарея) — завжди світлі.
