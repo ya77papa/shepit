@@ -3,7 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+    # Зміни лише в документації не запускають збірку (економія сховища й часу).
+    paths-ignore: ['docs/**', '**/*.md', 'LICENSE']
   pull_request:
+    paths-ignore: ['docs/**', '**/*.md', 'LICENSE']
 
 permissions:
   contents: read
@@ -26,6 +29,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      # Не зберігати артефакт-звіт збірки (.dockerbuild) — він займає сховище Actions.
+      DOCKER_BUILD_RECORD_UPLOAD: false
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -40,6 +46,9 @@ jobs:
           file: server/Dockerfile
           platforms: linux/amd64
           build-args: SHEPIT_COMMIT=${{ github.sha }}
+          # Без attestation-маніфестів: кожен з них — окрема версія пакета в ghcr.io.
+          provenance: false
+          sbom: false
           push: true
           tags: |
             ghcr.io/${{ github.repository_owner }}/shepit-server:latest
@@ -58,3 +67,10 @@ jobs:
             echo "- Хеш збірки: \`$BUILD\`"
             echo "- Перевірити сервер: \`curl -s https://shepit.razom.isroot.in/version.json | jq -r .build\`"
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Прибрати старі версії образу (лишити 5 останніх)
+        continue-on-error: true
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: shepit-server
+          package-type: container
+          min-versions-to-keep: 5
