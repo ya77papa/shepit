@@ -47,7 +47,16 @@ SHEPIT_TURN_IP=<публічна IP VPS>
 У `SHEPIT_TURN_URLS` краще вказувати IP, а не домен: деякі браузери не можуть розв'язати
 ім'я TURN-сервера (помилка 701 «host lookup»).
 
-Порти: 3478/udp+tcp, 49160–49400/udp. Без TURN дзвінки йдуть напряму (IP видно співрозмовнику).
+Порти: 3478/udp+tcp, 49160–49400/udp. На VPS увімкнений UFW (політика DROP), тож їх треба відкрити:
+
+```bash
+sudo ufw allow 3478/tcp comment 'shepit turn'
+sudo ufw allow 3478/udp comment 'shepit turn'
+sudo ufw allow 49160:49400/udp comment 'shepit turn relay'
+```
+
+Перевірка ззовні: `Test-NetConnection <IP> -Port 3478` (Windows) або «📞 Перевірити дзвінки» в застосунку.
+Без TURN дзвінки йдуть напряму (IP видно співрозмовнику).
 
 ## Перевірка веб-клієнта
 
