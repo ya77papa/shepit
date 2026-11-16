@@ -32,13 +32,14 @@ services:
   # Ретранслятор голосових дзвінків (TURN). Вмикається, якщо в .env є:
   #   COMPOSE_PROFILES=calls
   #   SHEPIT_TURN_SECRET=<openssl rand -hex 32>
-  #   SHEPIT_TURN_URLS=turn:<домен>:3478?transport=udp,turn:<домен>:3478?transport=tcp
+  #   SHEPIT_TURN_URLS=turn:<IP>:3478?transport=udp,turn:<IP>:3478?transport=tcp  (IP, не домен)
   #   SHEPIT_TURN_IP=<публічна IP сервера>   (обов'язково: інакше coturn може віддати
   #                                          адресу docker- чи VPN-інтерфейсу, і дзвінок не з'єднається)
   # Потрібні відкриті порти: 3478/udp+tcp і 49160-49400/udp.
   # Ретранслятор пересилає лише зашифрований звук і не знає, хто дзвонить
   # (логіни тимчасові й не містять ідентичності).
   turn:
+    # Перевірено з 4.19: --no-dtls/--no-cli там прибрані (CLI вимкнений за замовчуванням).
     image: coturn/coturn:4.19
     container_name: shepit-turn
     profiles: [calls]
@@ -57,9 +58,7 @@ services:
       - --static-auth-secret=${SHEPIT_TURN_SECRET:-}
       - --realm=shepit
       - --fingerprint
-      - --no-cli
       - --no-tls
-      - --no-dtls
       - --no-multicast-peers
       - --no-tcp-relay
       # Лише голос: обмеження швидкості на сесію (байт/с) — проти зловживань ретранслятором.
