@@ -62,6 +62,50 @@ pub struct Stats {
     pub mailboxes_waiting: u64,
     pub push_subs: u64,
     pub invites_active: u64,
+    pub channels: u64,
+    pub channels_public: u64,
+    pub channel_posts: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Channel {
+    pub id: String,
+    #[serde(rename = "pub")]
+    pub pub_key: String,
+    pub public: bool,
+    pub meta: String,
+    pub created: u64,
+    pub updated: u64,
+    pub posts: u64,
+    pub last_seq: i64,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Post {
+    pub seq: i64,
+    pub at: u64,
+    pub data: String,
+}
+
+const CHANNEL_SELECT: &str = "SELECT c.id, c.pub, c.public, c.meta, c.created, c.updated,
+        (SELECT COUNT(*) FROM channel_posts p WHERE p.channel = c.id),
+        (SELECT COALESCE(MAX(seq), 0) FROM channel_posts p WHERE p.channel = c.id),
+        (SELECT COALESCE(SUM(LENGTH(data)), 0) FROM channel_posts p WHERE p.channel = c.id)
+     FROM channels c";
+
+fn channel_row(r: &rusqlite::Row) -> rusqlite::Result<Channel> {
+    Ok(Channel {
+        id: r.get(0)?,
+        pub_key: r.get(1)?,
+        public: r.get::<_, i64>(2)? != 0,
+        meta: r.get(3)?,
+        created: r.get::<_, i64>(4)? as u64,
+        updated: r.get::<_, i64>(5)? as u64,
+        posts: r.get::<_, i64>(6)? as u64,
+        last_seq: r.get(7)?,
+        bytes: r.get::<_, i64>(8)? as u64 + r.get::<_, String>(3)?.len() as u64,
+    })
 }
 
 /// Скільки зберігати недоставлені конверти.
@@ -117,6 +161,22 @@ impl Db {
                  identity TEXT PRIMARY KEY,
                  at       INTEGER NOT NULL
              );
+             -- Канали: опис і дописи — шифротекст (зашифровані) або JSON (публічні).
+             CREATE TABLE IF NOT EXISTS channels (
+                 id      TEXT PRIMARY KEY,
+                 pub     TEXT NOT NULL,
+                 public  INTEGER NOT NULL,
+                 meta    TEXT NOT NULL,
+                 created INTEGER NOT NULL,
+                 updated INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS channel_posts (
+                 seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+                 channel TEXT NOT NULL,
+                 at      INTEGER NOT NULL,
+                 data    TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS channel_posts_channel ON channel_posts(channel, seq);
              CREATE TABLE IF NOT EXISTS settings (
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL
@@ -236,6 +296,97 @@ impl Db {
         self.0.lock().unwrap().execute("DELETE FROM blocked WHERE identity = ?1", [identity])
     }
 
+    // ---------- канали ----------
+
+    pub fn create_channel(&self, id: &str, pub_key: &str, public: bool, meta: &str, now_ms: u64) -> rusqlite::Result<()> {
+        self.0.lock().unwrap().execute(
+            "INSERT INTO channels(id, pub, public, meta, created, updated) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![id, pub_key, public as i64, meta, now_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_channel_meta(&self, id: &str, meta: &str, now_ms: u64) -> rusqlite::Result<()> {
+        self.0.lock().unwrap().execute(
+            "UPDATE channels SET meta = ?2, updated = ?3 WHERE id = ?1",
+            params![id, meta, now_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn channel(&self, id: &str) -> rusqlite::Result<Option<Channel>> {
+        self.0.lock().unwrap().query_row(&format!("{CHANNEL_SELECT} WHERE c.id = ?1"), [id], channel_row).optional()
+    }
+
+    pub fn channels(&self) -> rusqlite::Result<Vec<Channel>> {
+        let c = self.0.lock().unwrap();
+        let mut st = c.prepare(&format!("{CHANNEL_SELECT} ORDER BY c.updated DESC"))?;
+        let rows = st.query_map([], channel_row)?;
+        rows.collect()
+    }
+
+    /// Пошук публічних каналів за назвою й описом (без урахування регістру, і для кирилиці).
+    pub fn search_public_channels(&self, q: &str, limit: usize) -> rusqlite::Result<Vec<Channel>> {
+        let all = {
+            let c = self.0.lock().unwrap();
+            let mut st = c.prepare(&format!("{CHANNEL_SELECT} WHERE c.public = 1 ORDER BY c.updated DESC"))?;
+            let rows = st.query_map([], channel_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let q = q.to_lowercase();
+        Ok(all
+            .into_iter()
+            .filter(|c| {
+                let m: serde_json::Value = serde_json::from_str(&c.meta).unwrap_or_default();
+                let text = format!("{} {}", m["name"].as_str().unwrap_or(""), m["about"].as_str().unwrap_or("")).to_lowercase();
+                text.contains(&q)
+            })
+            .take(limit)
+            .collect())
+    }
+
+    pub fn delete_channel(&self, id: &str) -> rusqlite::Result<usize> {
+        let mut c = self.0.lock().unwrap();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM channel_posts WHERE channel = ?1", [id])?;
+        let n = tx.execute("DELETE FROM channels WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    pub fn add_post(&self, channel: &str, data: &str, now_ms: u64) -> rusqlite::Result<i64> {
+        let c = self.0.lock().unwrap();
+        c.execute(
+            "INSERT INTO channel_posts(channel, at, data) VALUES (?1, ?2, ?3)",
+            params![channel, now_ms as i64, data],
+        )?;
+        c.execute("UPDATE channels SET updated = ?2 WHERE id = ?1", params![channel, now_ms as i64])?;
+        Ok(c.last_insert_rowid())
+    }
+
+    pub fn delete_post(&self, channel: &str, seq: i64) -> rusqlite::Result<usize> {
+        self.0.lock().unwrap().execute("DELETE FROM channel_posts WHERE channel = ?1 AND seq = ?2", params![channel, seq])
+    }
+
+    /// Дописи за зростанням номера: після `after`, або останні `limit` до `before`.
+    pub fn posts(&self, channel: &str, after: Option<i64>, before: Option<i64>, limit: usize) -> rusqlite::Result<Vec<Post>> {
+        let c = self.0.lock().unwrap();
+        let row = |r: &rusqlite::Row| Ok(Post { seq: r.get(0)?, at: r.get::<_, i64>(1)? as u64, data: r.get(2)? });
+        let mut out: Vec<Post> = if let Some(a) = after {
+            let mut st = c.prepare("SELECT seq, at, data FROM channel_posts WHERE channel = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3")?;
+            let rows = st.query_map(params![channel, a, limit as i64], row)?;
+            rows.collect::<rusqlite::Result<_>>()?
+        } else {
+            let mut st = c.prepare("SELECT seq, at, data FROM channel_posts WHERE channel = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3")?;
+            let rows = st.query_map(params![channel, before.unwrap_or(i64::MAX), limit as i64], row)?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        if after.is_none() {
+            out.reverse();
+        }
+        Ok(out)
+    }
+
     // ---------- запрошення ----------
 
     pub fn create_invite(&self, inv: &Invite) -> rusqlite::Result<()> {
@@ -304,6 +455,9 @@ impl Db {
             queued_bytes: queued_bytes as u64,
             mailboxes_waiting: one("SELECT COUNT(DISTINCT mailbox) FROM envelopes WHERE ?1 = ?1", 0)? as u64,
             push_subs: one("SELECT COUNT(*) FROM push_subs WHERE ?1 = ?1", 0)? as u64,
+            channels: one("SELECT COUNT(*) FROM channels WHERE ?1 = ?1", 0)? as u64,
+            channels_public: one("SELECT COUNT(*) FROM channels WHERE public = ?1", 1)? as u64,
+            channel_posts: one("SELECT COUNT(*) FROM channel_posts WHERE ?1 = ?1", 0)? as u64,
             invites_active: c.query_row(
                 "SELECT COUNT(*) FROM invites WHERE revoked = 0 AND uses < max_uses AND (expires IS NULL OR expires > ?1)",
                 [now_ms as i64], |r| r.get::<_, i64>(0),
@@ -452,6 +606,36 @@ mod tests {
         // Ключі, що були до появи таблиці акаунтів, стають акаунтами.
         let db = Db::open(&path).unwrap();
         assert!(db.is_account("05ab").unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn channels() {
+        let dir = std::env::temp_dir().join(format!("shepit-ch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("t.db")).unwrap();
+        db.create_channel("a1", "PUB", true, r#"{"name":"Новини 100%"}"#, 1).unwrap();
+        db.create_channel("b2", "PUB2", false, "ciphertext", 1).unwrap();
+        for i in 0..5 {
+            db.add_post("a1", &format!("p{i}"), 10 + i).unwrap();
+        }
+        let c = db.channel("a1").unwrap().unwrap();
+        assert_eq!((c.posts, c.public), (5, true));
+        let last3 = db.posts("a1", None, None, 3).unwrap();
+        assert_eq!(last3.iter().map(|p| p.data.as_str()).collect::<Vec<_>>(), ["p2", "p3", "p4"]);
+        let older = db.posts("a1", None, Some(last3[0].seq), 10).unwrap();
+        assert_eq!(older.len(), 2);
+        assert_eq!(db.posts("a1", Some(last3[1].seq), None, 10).unwrap().len(), 1);
+        assert_eq!(db.delete_post("a1", last3[2].seq).unwrap(), 1);
+        assert_eq!(db.delete_post("b2", last3[1].seq).unwrap(), 0, "чужий канал");
+        assert_eq!(db.search_public_channels("новини", 10).unwrap().len(), 1, "без урахування регістру");
+        assert_eq!(db.search_public_channels("", 10).unwrap().len(), 1, "порожній запит — усі публічні");
+        assert_eq!(db.search_public_channels("100%", 10).unwrap().len(), 1);
+        assert_eq!(db.search_public_channels("cipher", 10).unwrap().len(), 0, "зашифровані не шукаються");
+        assert_eq!(db.stats(100).unwrap().channels, 2);
+        db.delete_channel("a1").unwrap();
+        assert!(db.channel("a1").unwrap().is_none());
+        assert!(db.posts("a1", None, None, 10).unwrap().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

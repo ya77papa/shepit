@@ -1,7 +1,26 @@
 // Локальне сховище в браузері (IndexedDB). Нічого з цього не йде на сервер.
 // УВАГА: стан акаунта містить секретні ключі; IndexedDB не зашифрована (етап 0).
 
-export type Contact = { identity: string; name: string; fingerprint: string };
+/** avatar — JPEG у base64 (з профілю, який надіслав сам контакт). */
+export type Contact = { identity: string; name: string; fingerprint: string; avatar?: string };
+
+/** Учасник групи: ім'я — як його знає той, хто додав. */
+export type Member = { id: string; name: string };
+/**
+ * Група: існує лише на пристроях учасників, сервер про неї не знає.
+ * Змінюють склад і назву адміністратори; v — версія стану (більша перемагає).
+ */
+export type Group = { id: string; name: string; avatar?: string; members: Member[]; admins: string[]; v: number; left?: boolean };
+
+/**
+ * Канал, на який я підписаний (або власний). key — ключ шифрування (зашифрований канал),
+ * priv — приватний ключ підпису (лише в автора).
+ */
+export type Channel = {
+  id: string; public: boolean; key?: string; pub: string; priv?: string;
+  name: string; about: string; avatar?: string;
+  lastSeq: number; readSeq: number; joined: number;
+};
 export type Voice = { blob: Blob; mime: string; dur: number; ptt?: boolean };
 export type Message = {
   id?: number;
@@ -13,6 +32,8 @@ export type Message = {
   voice?: Voice;
   /** Спільний з співрозмовником id (для «видалити у всіх»); у старих повідомлень немає. */
   mid?: string;
+  /** У групі (peer = "g:<id>"): хто надіслав. */
+  from?: string;
 };
 
 const DB = 'shepit';
@@ -20,13 +41,21 @@ let dbp: Promise<IDBDatabase> | null = null;
 
 function open(): Promise<IDBDatabase> {
   dbp ??= new Promise((resolve, reject) => {
-    const r = indexedDB.open(DB, 1);
-    r.onupgradeneeded = () => {
+    const r = indexedDB.open(DB, 2);
+    r.onupgradeneeded = (e) => {
       const db = r.result;
-      db.createObjectStore('kv');
-      db.createObjectStore('contacts', { keyPath: 'identity' });
-      db.createObjectStore('messages', { keyPath: 'id', autoIncrement: true }).createIndex('peer', 'peer');
+      if (e.oldVersion < 1) {
+        db.createObjectStore('kv');
+        db.createObjectStore('contacts', { keyPath: 'identity' });
+        db.createObjectStore('messages', { keyPath: 'id', autoIncrement: true }).createIndex('peer', 'peer');
+      }
+      if (e.oldVersion < 2) {
+        db.createObjectStore('groups', { keyPath: 'id' });
+        db.createObjectStore('channels', { keyPath: 'id' });
+      }
     };
+    // Інша вкладка оновлює базу — звільнити її.
+    r.onblocked = () => console.warn('IndexedDB: оновлення чекає, поки закриються інші вкладки');
     r.onsuccess = () => resolve(r.result);
     r.onerror = () => reject(r.error);
   });
@@ -44,6 +73,9 @@ async function store(name: string, mode: IDBTransactionMode = 'readonly') {
   return (await open()).transaction(name, mode).objectStore(name);
 }
 
+/** Реактивні об'єкти Svelte (Proxy) не можна покласти в IndexedDB — зберігаємо звичайну копію. */
+const plain = <T>(o: T): T => JSON.parse(JSON.stringify(o));
+
 export const kv = {
   get: async <T>(k: string) => req<T | undefined>((await store('kv')).get(k)),
   set: async (k: string, v: unknown) => req((await store('kv', 'readwrite')).put(v, k)),
@@ -51,8 +83,22 @@ export const kv = {
 
 export const contacts = {
   all: async () => req<Contact[]>((await store('contacts')).getAll()),
-  put: async (c: Contact) => req((await store('contacts', 'readwrite')).put(c)),
+  put: async (c: Contact) => req((await store('contacts', 'readwrite')).put(plain(c))),
   delete: async (identity: string) => req((await store('contacts', 'readwrite')).delete(identity)),
+};
+
+export const groups = {
+  all: async () => req<Group[]>((await store('groups')).getAll()),
+  get: async (id: string) => req<Group | undefined>((await store('groups')).get(id)),
+  put: async (g: Group) => req((await store('groups', 'readwrite')).put(plain(g))),
+  delete: async (id: string) => req((await store('groups', 'readwrite')).delete(id)),
+};
+
+export const channels = {
+  all: async () => req<Channel[]>((await store('channels')).getAll()),
+  get: async (id: string) => req<Channel | undefined>((await store('channels')).get(id)),
+  put: async (c: Channel) => req((await store('channels', 'readwrite')).put(plain(c))),
+  delete: async (id: string) => req((await store('channels', 'readwrite')).delete(id)),
 };
 
 /** Видалити повідомлення бесіди, що підходять під умову. Повертає кількість. */
@@ -72,9 +118,10 @@ export const messages = {
   /** Усю бесіду з peer. */
   clear: (peer: string) => deleteWhere(peer, () => true),
   /** Повідомлення, які peer надіслав мені, з цими id (він попросив видалити «у всіх»). */
-  deleteIncoming: (peer: string, mids: string[]) => {
+  deleteIncoming: (peer: string, mids: string[], from?: string) => {
     const set = new Set(mids);
-    return deleteWhere(peer, (m) => !m.out && !!m.mid && set.has(m.mid));
+    // У групі видалити можна лише власні повідомлення відправника.
+    return deleteWhere(peer, (m) => !m.out && !!m.mid && set.has(m.mid) && (from === undefined || m.from === from));
   },
 };
 

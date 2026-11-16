@@ -17,6 +17,7 @@
 //! | DELETE| /v0/push                | так    | відписати |
 //! | GET   | /v0/registration        | —      | режим реєстрації: open / invite / closed |
 //! | POST  | /v0/invites/mine        | так    | моє запрошення (код) для нових користувачів |
+//! | …     | /v0/channels/…          | ключ каналу | канали (див. `channels.rs`) |
 //! | …     | /v0/admin/…             | сесія  | адмін-панель (див. `admin.rs`) |
 //!
 //! Нова ідентичність реєструється першою публікацією ключів (PUT /v0/keys). У режимі
@@ -28,6 +29,7 @@
 //! Дані — у $SHEPIT_DATA: issuer.json (ключі сертифікатів) і shepit.db (SQLite: ключі, черги).
 
 mod admin;
+mod channels;
 mod db;
 #[cfg(feature = "push")]
 mod push;
@@ -560,6 +562,12 @@ fn app(issuer: Issuer, db: db::Db, shutdown: tokio::sync::watch::Receiver<bool>)
         .route("/v0/push", put(put_push).delete(delete_push))
         .route("/v0/registration", get(registration))
         .route("/v0/invites/mine", post(my_invite))
+        .route("/v0/channels", get(channels::search))
+        .route("/v0/channels/{id}", get(channels::get_channel).put(channels::put_channel).delete(channels::delete_channel))
+        .route("/v0/channels/{id}/posts", get(channels::posts).post(channels::post))
+        .route("/v0/channels/{id}/posts/{seq}", axum::routing::delete(channels::delete_post))
+        .route("/v0/admin/channels", get(admin_channels))
+        .route("/v0/admin/channels/{id}", axum::routing::delete(admin_delete_channel))
         .route("/v0/admin/login", post(admin_login))
         .route("/v0/admin/logout", post(admin_logout))
         .route("/v0/admin/overview", get(admin_overview))
@@ -848,6 +856,32 @@ async fn admin_unblock(State(app): State<Shared>, headers: HeaderMap, Path(ident
     }
     match app.db.unblock(&identity) {
         Ok(1..) => StatusCode::NO_CONTENT,
+        Ok(_) => StatusCode::NOT_FOUND,
+        Err(e) => internal(e),
+    }
+}
+
+/// Канали для адмінки: публічні — з описом, зашифровані — лише розмір і кількість.
+async fn admin_channels(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<Vec<db::Channel>>, StatusCode> {
+    admin_guard(&app, &headers)?;
+    let mut list = app.db.channels().map_err(internal)?;
+    for c in &mut list {
+        if !c.public {
+            c.meta.clear(); // шифротекст адміну ні до чого
+        }
+    }
+    Ok(Json(list))
+}
+
+async fn admin_delete_channel(State(app): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> StatusCode {
+    if let Err(s) = admin_guard(&app, &headers) {
+        return s;
+    }
+    match app.db.delete_channel(&id) {
+        Ok(1..) => {
+            println!("Адмін: видалено канал {id}");
+            StatusCode::NO_CONTENT
+        }
         Ok(_) => StatusCode::NOT_FOUND,
         Err(e) => internal(e),
     }

@@ -4,15 +4,29 @@
 export type CallOp = 'offer' | 'answer' | 'end' | 'reject' | 'busy';
 
 // id — випадковий ідентифікатор повідомлення: за ним відправник може видалити його «у всіх».
+// g — ідентифікатор групи: повідомлення адресоване групі (кожному учаснику окремо).
+export type GroupMember = { id: string; name: string };
 export type Body =
-  | { t: 'text'; text: string; id?: string }
+  | { t: 'text'; text: string; id?: string; g?: string }
   | { t: 'hello'; name: string }
-  | { t: 'voice'; mime: string; dur: number; data: string; ptt?: boolean; id?: string }
+  | { t: 'voice'; mime: string; dur: number; data: string; ptt?: boolean; id?: string; g?: string }
   | { t: 'call'; op: CallOp; id: string; at: number; sdp?: string }
-  // Видалити мої повідомлення з цими id у співрозмовника.
-  | { t: 'delete'; ids: string[] }
+  // Видалити мої повідомлення з цими id у співрозмовника (або в групі g).
+  | { t: 'delete'; ids: string[]; g?: string }
   // Очистити всю нашу бесіду у співрозмовника.
-  | { t: 'clear' };
+  | { t: 'clear' }
+  // Мій профіль: ім'я і фото (JPEG base64) — для контактів.
+  | { t: 'profile'; name: string; avatar?: string }
+  // Стан групи від адміністратора: назва, фото, склад, адміни, версія стану (ver; «v» —
+  // версія формату повідомлення, вона завжди 1).
+  | { t: 'group'; g: string; name: string; avatar?: string; members: GroupMember[]; admins: string[]; ver: number }
+  // Я виходжу з групи.
+  | { t: 'leave'; g: string };
+
+const HEX32 = /^[0-9a-f]{32}$/;
+export const validGroupId = (id: unknown): id is string => typeof id === 'string' && HEX32.test(id);
+/** Фото профілю чи групи: base64 JPEG до ~64 КБ. */
+export const validAvatar = (a: unknown): a is string => typeof a === 'string' && a.length < 90_000 && /^[A-Za-z0-9+/=]+$/.test(a);
 
 /** Новий ідентифікатор повідомлення (128 біт). */
 export function newMsgId(): string {
@@ -24,7 +38,7 @@ export const validMsgId = (id: unknown): id is string => typeof id === 'string' 
 
 const LEGACY_HELLO = '\u0001hello ';
 
-export const encode = (b: Body): string => JSON.stringify({ v: 1, ...b });
+export const encode = (b: Body): string => JSON.stringify({ ...b, v: 1 });
 
 export function decode(raw: string): Body {
   if (raw.startsWith('{')) {

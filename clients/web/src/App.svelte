@@ -2,10 +2,14 @@
   import { onMount, tick } from 'svelte';
   import { renderSVG } from 'uqr';
   import { Shepit, announceAccountChange, fingerprintOf, isValidIdentity, loadWasm, normalizeInviteCode, onAccountChangedElsewhere, registrationMode, type RegistrationMode } from './lib/shepit';
-  import { contacts as contactsDb, kv, messages as messagesDb, wipe, type Contact, type Message } from './lib/db';
+  import { channels as channelsDb, contacts as contactsDb, groups as groupsDb, kv, messages as messagesDb, wipe, type Channel, type Contact, type Group, type Member, type Message } from './lib/db';
+  import { makeAvatar } from './lib/avatar';
+  import { channelFromServer, fetchChannel, newChannelKeys, parseChannelLink, putMeta, searchPublic, type ChannelMeta } from './lib/channels';
+  import Avatar from './Avatar.svelte';
+  import ChannelView from './ChannelView.svelte';
   import { exportBackup, importBackup, MIN_PASSWORD } from './lib/backup';
   import { COMMIT, REPO, SHORT, commitUrl, compareUrl, registerServiceWorker } from './lib/pwa';
-  import { decode, encode, fromBase64, toBase64, fmtDuration, newMsgId, validMsgId } from './lib/content';
+  import { decode, encode, fromBase64, toBase64, fmtDuration, newMsgId, validAvatar, validGroupId, validMsgId, type Body } from './lib/content';
   import { VoiceRecorder, MAX_VOICE_MS } from './lib/recorder';
   import { CallManager, checkRelay, type RelayCheck } from './lib/call.svelte';
   import VoiceMsg from './VoiceMsg.svelte';
@@ -36,7 +40,7 @@
   let regMode: RegistrationMode = $state('open');
   let inviteCode = $state(''); // код запрошення для реєстрації (з посилання #i=… або введений)
   let myInvite: { code: string | null; mode: RegistrationMode; left: number } | null = $state(null);
-  let panel: '' | 'invite' | 'backup' | 'add' | 'restore' | 'calltest' | 'settings' | 'chat' = $state('');
+  let panel: '' | 'invite' | 'backup' | 'add' | 'restore' | 'calltest' | 'settings' | 'chat' | 'newgroup' | 'group' | 'newchannel' | 'findchannel' = $state('');
   let relayResults: RelayCheck[] | null = $state(null);
   let pushState: 'unsupported' | 'off' | 'on' | 'denied' | 'busy' = $state('unsupported');
   let newName = $state('');
@@ -47,18 +51,425 @@
   let copied = $state('');
   let showSafety = $state(false);
   let selected: Message | null = $state(null); // повідомлення, для якого відкрито дії
+  let myAvatar = $state('');
+  let groups: Group[] = $state([]);
+  let group: Group | null = $state(null); // відкрита група
+  let channels: Channel[] = $state([]);
+  let channel: Channel | null = $state(null); // відкритий канал
+  let channelSubscribed = $state(false);
+  let channelLinkPending: { id: string; key?: string } | null = $state(null);
+  // нова група / канал / пошук
+  let newGroupName = $state('');
+  let newGroupMembers: string[] = $state([]);
+  let newChannelName = $state('');
+  let newChannelAbout = $state('');
+  let newChannelPublic = $state(false);
+  let searchQ = $state('');
+  let searchResults: { id: string; name: string; about: string; avatar?: string; posts: number }[] | null = $state(null);
+  let addMembers: string[] = $state([]);
+
+  /** Ключ бесіди: контакт — його ідентичність, група — "g:<id>". */
+  const chatKey = $derived(group ? `g:${group.id}` : current?.identity ?? '');
+  const isAdmin = $derived(!!(group && me && group.admins.includes(me.identity) && !group.left));
+
+  function closeChats() {
+    current = null;
+    group = null;
+    channel = null;
+    selected = null;
+  }
+
+  /** Як показувати учасника групи: ім'я з моїх контактів, інакше як його назвав адмін. */
+  function senderName(id: string | undefined, g: Group | null = group): string {
+    if (!id) return '';
+    if (me && id === me.identity) return myName || 'Я';
+    return contacts.find((c) => c.identity === id)?.name ?? g?.members.find((m) => m.id === id)?.name ?? `Контакт ${short(fingerprintOf(id))}`;
+  }
+
+  // ---------- профіль ----------
+
+  /** Надіслати ім'я й фото контактам (усім або одному). */
+  async function sendProfile(to?: string[]) {
+    if (!me) return;
+    const body = encode({ t: 'profile', name: myName.trim(), avatar: myAvatar || undefined });
+    for (const id of to ?? contacts.map((c) => c.identity)) await me.send(id, body).catch(() => {});
+  }
+
+  async function setMyAvatar(e: Event) {
+    const f = (e.currentTarget as HTMLInputElement).files?.[0];
+    if (!f) return;
+    busy = true;
+    try {
+      myAvatar = await makeAvatar(f);
+      await kv.set('myAvatar', myAvatar);
+      await sendProfile();
+      notice = 'Фото оновлено і надіслано контактам';
+    } catch (err) {
+      fail(err);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function removeMyAvatar() {
+    myAvatar = '';
+    await kv.set('myAvatar', '');
+    await sendProfile();
+  }
+
+  async function onProfile(from: string, b: Extract<Body, { t: 'profile' }>) {
+    const c = contacts.find((x) => x.identity === from);
+    if (!c) return;
+    const upd: Contact = { ...$state.snapshot(c), avatar: validAvatar(b.avatar) ? b.avatar : undefined };
+    const name = typeof b.name === 'string' ? b.name.trim().slice(0, 60) : '';
+    // Ім'я, яке дав сам користувач, не чіпаємо; автоматичне — замінюємо.
+    if (name && /^(Новий|Контакт) \d/.test(c.name)) upd.name = name;
+    await contactsDb.put(upd);
+  }
+
+  // ---------- групи ----------
+
+  async function refreshGroups() {
+    groups = (await groupsDb.all()).sort((a, b) => a.name.localeCompare(b.name, 'uk'));
+  }
+
+  async function openGroup(g: Group) {
+    closeChats();
+    group = g;
+    unread[`g:${g.id}`] = 0;
+    thread = await messagesDb.forPeer(`g:${g.id}`);
+    await tick();
+    threadEl?.scrollTo({ top: threadEl.scrollHeight });
+  }
+
+  async function reloadThread() {
+    if (group) {
+      const g = groups.find((x) => x.id === group!.id);
+      if (g) group = g;
+      thread = await messagesDb.forPeer(`g:${group.id}`);
+    } else if (current) {
+      thread = await messagesDb.forPeer(current.identity);
+    } else return;
+    if (selected && !thread.some((t) => t.id === selected!.id)) selected = null;
+    await tick();
+    threadEl?.scrollTo({ top: threadEl.scrollHeight });
+  }
+
+  /** Надіслати в групу: кожному учаснику окремо (сервер не знає, що це група). */
+  async function sendGroup(g: Group, body: Body, to: Member[] = g.members) {
+    if (!me) return;
+    const raw = encode({ ...body, g: g.id } as Body);
+    let failed = 0;
+    for (const m of to) {
+      if (m.id === me.identity) continue;
+      try {
+        await me.send(m.id, raw);
+      } catch {
+        failed++;
+      }
+    }
+    if (failed) error = `Не вдалося доставити ${failed} з ${to.length - 1} учасникам (спробуй пізніше).`;
+  }
+
+  const stateBody = (g: Group): Body => ({ t: 'group', g: g.id, name: g.name, avatar: g.avatar, members: g.members, admins: g.admins, ver: g.v });
+
+  async function logGroup(g: Group, text: string) {
+    await messagesDb.add({ peer: `g:${g.id}`, out: false, text, at: Date.now(), kind: 'call' });
+  }
+
+  /** Адмін змінив групу: нова версія стану всім (і тим, кого видалили, — щоб знали). */
+  async function updateGroup(next: Group, notify: Member[] = next.members) {
+    next.v += 1;
+    await groupsDb.put(next);
+    await refreshGroups();
+    group = groups.find((x) => x.id === next.id) ?? null;
+    await sendGroup(next, stateBody(next), notify);
+    await reloadThread();
+  }
+
+  async function createGroup() {
+    if (!me) return;
+    const name = newGroupName.trim().slice(0, 80);
+    if (!name) return fail('Вкажи назву групи');
+    if (!newGroupMembers.length) return fail('Обери хоча б одного учасника');
+    busy = true;
+    try {
+      const g: Group = {
+        id: newMsgId(), name, v: 0, admins: [me.identity],
+        members: [{ id: me.identity, name: myName || 'Я' }, ...newGroupMembers.map((id) => ({ id, name: nameOf(id) }))],
+      };
+      await logGroup(g, `Групу «${name}» створено`);
+      await updateGroup(g);
+      newGroupName = '';
+      newGroupMembers = [];
+      panel = '';
+      await openGroup(groups.find((x) => x.id === g.id)!);
+    } catch (e) {
+      fail(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function groupOp(f: (g: Group) => Member[] | void | Promise<Member[] | void>) {
+    if (!group) return;
+    busy = true;
+    try {
+      const g: Group = $state.snapshot(group);
+      const old = g.members.slice();
+      const notify = await f(g);
+      await updateGroup(g, notify ?? old);
+    } catch (e) {
+      fail(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  const renameGroup = () => {
+    const name = prompt('Назва групи', group?.name)?.trim().slice(0, 80);
+    if (name) groupOp((g) => { g.name = name; return g.members; });
+  };
+
+  async function setGroupAvatar(e: Event) {
+    const f = (e.currentTarget as HTMLInputElement).files?.[0];
+    if (!f) return;
+    try {
+      const a = await makeAvatar(f);
+      await groupOp((g) => { g.avatar = a; return g.members; });
+    } catch (err) {
+      fail(err);
+    }
+  }
+
+  const addToGroup = () =>
+    groupOp(async (g) => {
+      const added = addMembers.filter((id) => !g.members.some((m) => m.id === id)).map((id) => ({ id, name: nameOf(id) }));
+      g.members.push(...added);
+      addMembers = [];
+      if (added.length) await logGroup(g, `Додано: ${added.map((m) => m.name).join(', ')}`);
+      return g.members;
+    });
+
+  const removeFromGroup = (id: string) => {
+    if (!confirm(`Видалити ${senderName(id)} з групи?`)) return;
+    groupOp(async (g) => {
+      const all = g.members.slice();
+      g.members = g.members.filter((m) => m.id !== id);
+      g.admins = g.admins.filter((a) => a !== id);
+      await logGroup(g, `${senderName(id)} видалено з групи`);
+      return all;
+    });
+  };
+
+  const toggleAdmin = (id: string) =>
+    groupOp((g) => {
+      g.admins = g.admins.includes(id) ? g.admins.filter((a) => a !== id) : [...g.admins, id];
+      if (!g.admins.length) g.admins = [me!.identity];
+      return g.members;
+    });
+
+  async function leaveGroup() {
+    if (!group || !me) return;
+    if (!confirm(`Вийти з групи «${group.name}»? Ти більше не отримуватимеш повідомлень з неї.`)) return;
+    const g: Group = $state.snapshot(group);
+    await sendGroup(g, { t: 'leave', g: g.id });
+    g.left = true;
+    g.members = g.members.filter((m) => m.id !== me!.identity);
+    await groupsDb.put(g);
+    await logGroup(g, 'Ти вийшов(-ла) з групи');
+    await refreshGroups();
+    group = groups.find((x) => x.id === g.id) ?? null;
+    panel = '';
+    await reloadThread();
+  }
+
+  async function deleteGroupLocal() {
+    if (!group) return;
+    if (!confirm(`Видалити групу «${group.name}» і її історію з цього пристрою?`)) return;
+    await messagesDb.clear(`g:${group.id}`);
+    await groupsDb.delete(group.id);
+    closeChats();
+    panel = '';
+    await refreshGroups();
+  }
+
+  function validState(b: Extract<Body, { t: 'group' }>): boolean {
+    return (
+      validGroupId(b.g) && typeof b.name === 'string' && b.name.length <= 80 && Number.isInteger(b.ver) && b.ver > 0 &&
+      Array.isArray(b.members) && b.members.length <= 101 &&
+      b.members.every((m) => m && isValidIdentity(m.id) && typeof m.name === 'string') &&
+      Array.isArray(b.admins) && b.admins.every((a) => b.members.some((m) => m.id === a)) &&
+      (b.avatar === undefined || validAvatar(b.avatar))
+    );
+  }
+
+  /** Повідомлення, що стосується групи. Повертає ключ бесіди, якщо там щось змінилось. */
+  async function onGroupMessage(from: string, b: Body): Promise<string | null> {
+    if (!me) return null;
+    const gid = (b as { g?: string }).g;
+    if (!validGroupId(gid)) return null;
+    const key = `g:${gid}`;
+    const local = await groupsDb.get(gid);
+    if (b.t === 'group') {
+      if (!validState(b)) return null;
+      const amMember = b.members.some((m) => m.id === me!.identity);
+      const next: Group = { id: gid, name: b.name, avatar: b.avatar, members: b.members.map((m) => ({ id: m.id, name: m.name.slice(0, 60) })), admins: b.admins, v: b.ver };
+      if (!local) {
+        if (!b.admins.includes(from) || !amMember) return null;
+        await groupsDb.put(next);
+        await logGroup(next, `${senderName(from, next)} додав(-ла) тебе до групи «${next.name}»`);
+        return key;
+      }
+      if (!local.admins.includes(from) || b.ver <= local.v) return null;
+      const added = next.members.filter((m) => !local.members.some((x) => x.id === m.id) && m.id !== me!.identity);
+      const removed = local.members.filter((m) => !next.members.some((x) => x.id === m.id) && m.id !== me!.identity);
+      if (!amMember) next.left = true;
+      await groupsDb.put(next);
+      if (!amMember && !local.left) await logGroup(next, `${senderName(from, local)} видалив(-ла) тебе з групи`);
+      else if (amMember && local.left) await logGroup(next, `${senderName(from, local)} повернув(-ла) тебе до групи`);
+      if (amMember && added.length) await logGroup(next, `Додано: ${added.map((m) => senderName(m.id, next)).join(', ')}`);
+      if (amMember && removed.length) await logGroup(next, `Видалено: ${removed.map((m) => senderName(m.id, local)).join(', ')}`);
+      if (next.name !== local.name) await logGroup(next, `Нова назва: «${next.name}»`);
+      return key;
+    }
+    if (!local || local.left || !local.members.some((m) => m.id === from)) return null;
+    if (b.t === 'leave') {
+      const name = senderName(from, local);
+      local.members = local.members.filter((m) => m.id !== from);
+      local.admins = local.admins.filter((a) => a !== from);
+      // Без адміністраторів група не лишається: адміном стає учасник з найменшим ключем (у всіх однаково).
+      if (!local.admins.length && local.members.length) local.admins = [local.members.map((m) => m.id).sort()[0]!];
+      await groupsDb.put(local);
+      await logGroup(local, `${name} виходить з групи`);
+      return key;
+    }
+    if (b.t === 'delete') {
+      const ids = Array.isArray(b.ids) ? b.ids.filter(validMsgId).slice(0, 500) : [];
+      return ids.length && (await messagesDb.deleteIncoming(key, ids, from)) ? key : null;
+    }
+    const mid = validMsgId((b as { id?: string }).id) ? (b as { id: string }).id : undefined;
+    if (b.t === 'text') {
+      await messagesDb.add({ peer: key, out: false, text: b.text, at: Date.now(), mid, from });
+    } else if (b.t === 'voice') {
+      const blob = new Blob([fromBase64(b.data)], { type: b.mime });
+      await messagesDb.add({ peer: key, out: false, text: '🎤 Голосове', at: Date.now(), kind: 'voice', voice: { blob, mime: b.mime, dur: b.dur }, mid, from });
+    } else return null;
+    if (!group || group.id !== gid) unread[key] = (unread[key] ?? 0) + 1;
+    return key;
+  }
+
+  // ---------- канали ----------
+
+  async function refreshChannels() {
+    channels = (await channelsDb.all()).sort((a, b) => a.name.localeCompare(b.name, 'uk'));
+  }
+
+  async function openChannel(c: Channel, subscribed = true) {
+    closeChats();
+    channel = c;
+    channelSubscribed = subscribed;
+  }
+
+  async function saveChannel(c: Channel) {
+    await channelsDb.put(c);
+    await refreshChannels();
+    if (channel?.id === c.id) channel = channels.find((x) => x.id === c.id) ?? c;
+  }
+
+  async function createChannel() {
+    if (!me) return;
+    const name = newChannelName.trim().slice(0, 80);
+    if (!name) return fail('Вкажи назву каналу');
+    busy = true;
+    try {
+      const k = await newChannelKeys(newChannelPublic);
+      const rec: Channel = { id: k.id, public: newChannelPublic, key: k.key, pub: k.pub, priv: k.priv, name, about: newChannelAbout.trim().slice(0, 500), lastSeq: 0, readSeq: 0, joined: Date.now() };
+      const meta: ChannelMeta = { name: rec.name, about: rec.about };
+      await putMeta(rec, meta, (purpose, body) => me!.signRequest(purpose, body));
+      await saveChannel(rec);
+      newChannelName = newChannelAbout = '';
+      panel = '';
+      await openChannel(rec);
+    } catch (e) {
+      fail(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** Відкрити канал за посиланням (#c=…&k=…): свій/підписаний — одразу, інакше попередній перегляд. */
+  async function openChannelLink(l: { id: string; key?: string }) {
+    const have = channels.find((c) => c.id === l.id);
+    if (have) return openChannel(have);
+    try {
+      const sc = await fetchChannel(l.id);
+      if (!sc) return fail('Канал не знайдено — можливо, його видалено');
+      const r = await channelFromServer(sc, l.key);
+      if (!r) return fail(sc.public ? 'Канал пошкоджено' : 'Посилання на зашифрований канал без ключа або з неправильним ключем');
+      await openChannel(r.rec, false);
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  async function subscribe() {
+    if (!channel) return;
+    await saveChannel($state.snapshot(channel));
+    channelSubscribed = true;
+    notice = `Ти підписався(-лась) на «${channel.name}»`;
+  }
+
+  async function unsubscribe() {
+    if (!channel) return;
+    if (!confirm(`Відписатися від «${channel.name}»?`)) return;
+    await channelsDb.delete(channel.id);
+    closeChats();
+    await refreshChannels();
+  }
+
+  async function onChannelDeleted() {
+    if (!channel) return;
+    await channelsDb.delete(channel.id);
+    closeChats();
+    await refreshChannels();
+    notice = 'Канал видалено';
+  }
+
+  async function doSearch() {
+    try {
+      const list = await searchPublic(searchQ.trim());
+      searchResults = list.map((c) => ({ id: c.id, name: c.parsed.name, about: c.parsed.about, avatar: c.parsed.avatar, posts: c.posts }));
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  /** Чи є нові дописи в каналах (раз на 2 хв). */
+  async function checkChannels() {
+    for (const c of channels) {
+      try {
+        const sc = await fetchChannel(c.id);
+        if (!sc) continue;
+        if (sc.last_seq !== c.lastSeq) await channelsDb.put({ ...$state.snapshot(c), lastSeq: sc.last_seq });
+      } catch { /* мережа */ }
+    }
+    await refreshChannels();
+  }
 
   /** Видалити повідомлення: лише в мене або в обох (лише свої, нові повідомлення). */
   async function deleteMessage(m: Message, everywhere: boolean) {
-    if (!me || !current) return;
-    const peer = current;
+    if (!me || (!current && !group)) return;
     busy = true;
     error = '';
     try {
-      if (everywhere && m.mid) await me.send(peer.identity, encode({ t: 'delete', ids: [m.mid] }));
+      if (everywhere && m.mid) {
+        if (group) await sendGroup(group, { t: 'delete', ids: [m.mid] });
+        else await me.send(current!.identity, encode({ t: 'delete', ids: [m.mid] }));
+      }
       await messagesDb.delete(m.id!);
       selected = null;
-      await openThread(peer);
+      await reloadThread();
     } catch (e) {
       fail(e);
     } finally {
@@ -67,6 +478,12 @@
   }
 
   async function clearChat(everywhere: boolean) {
+    if (group && !everywhere) {
+      if (!confirm(`Очистити історію групи «${group.name}» на цьому пристрої?`)) return;
+      await messagesDb.clear(`g:${group.id}`);
+      panel = '';
+      return reloadThread();
+    }
     if (!me || !current) return;
     const peer = current;
     if (!confirm(everywhere
@@ -92,7 +509,7 @@
     await messagesDb.clear(peer.identity);
     await contactsDb.delete(peer.identity);
     panel = '';
-    current = null;
+    closeChats();
     thread = [];
     await refreshContacts();
   }
@@ -108,7 +525,7 @@
 
   async function logCall(peer: string, text: string) {
     await messagesDb.add({ peer, out: false, text, at: Date.now(), kind: 'call' });
-    if (current?.identity === peer) await openThread(current);
+    if (current?.identity === peer) await reloadThread();
   }
   const calls = new CallManager(() => me, logCall);
   const nameOf = (identity: string) => contacts.find((c) => c.identity === identity)?.name ?? `Контакт ${short(fingerprintOf(identity))}`;
@@ -139,6 +556,12 @@
 
   function readInviteFromUrl(): Invite | null {
     const p = new URLSearchParams(location.hash.slice(1));
+    const ch = parseChannelLink(location.hash);
+    if (ch) {
+      channelLinkPending = ch;
+      history.replaceState(null, '', location.pathname);
+      return null;
+    }
     const key = (p.get('add') ?? '').toLowerCase();
     const code = normalizeInviteCode(p.get('i') ?? '') ?? undefined;
     if (code) inviteCode = code;
@@ -160,6 +583,7 @@
   }
 
   async function openThread(c: Contact) {
+    closeChats();
     current = c;
     showSafety = false;
     unread[c.identity] = 0;
@@ -189,6 +613,7 @@
     busy = true;
     try {
       await me.send(inv.key, encode({ t: 'hello', name: myName.trim() }));
+      if (myAvatar) await sendProfile([inv.key]);
       await messagesDb.add({ peer: inv.key, out: true, text: helloText(myName.trim()), at: Date.now() });
       if (current?.identity === inv.key) await openThread(current);
     } catch (e) {
@@ -229,16 +654,17 @@
 
   async function send() {
     const text = draft.trim();
-    if (!text || !me || !current) return;
-    const peer = current;
+    if (!text || !me || (!current && !group)) return;
+    const key = chatKey;
     busy = true;
     error = '';
     try {
       const mid = newMsgId();
-      await me.send(peer.identity, encode({ t: 'text', text, id: mid }));
-      await messagesDb.add({ peer: peer.identity, out: true, text, at: Date.now(), mid });
+      if (group) await sendGroup(group, { t: 'text', text, id: mid });
+      else await me.send(current!.identity, encode({ t: 'text', text, id: mid }));
+      await messagesDb.add({ peer: key, out: true, text, at: Date.now(), mid });
       draft = '';
-      if (current?.identity === peer.identity) await openThread(peer);
+      if (chatKey === key) await reloadThread();
     } catch (e) {
       fail(e);
     } finally {
@@ -247,14 +673,16 @@
   }
 
   async function sendVoice(blob: Blob, mime: string, dur: number) {
-    if (!me || !current) return;
-    const peer = current;
+    if (!me || (!current && !group)) return;
+    const key = chatKey;
     busy = true;
     try {
       const mid = newMsgId();
-      await me.send(peer.identity, encode({ t: 'voice', mime, dur, data: toBase64(await blob.arrayBuffer()), id: mid }));
-      await messagesDb.add({ peer: peer.identity, out: true, text: '🎤 Голосове', at: Date.now(), kind: 'voice', voice: { blob, mime, dur }, mid });
-      if (current?.identity === peer.identity) await openThread(peer);
+      const body: Body = { t: 'voice', mime, dur, data: toBase64(await blob.arrayBuffer()), id: mid };
+      if (group) await sendGroup(group, body);
+      else await me.send(current!.identity, encode(body));
+      await messagesDb.add({ peer: key, out: true, text: '🎤 Голосове', at: Date.now(), kind: 'voice', voice: { blob, mime, dur }, mid });
+      if (chatKey === key) await reloadThread();
     } catch (e) {
       fail(e);
     } finally {
@@ -348,12 +776,27 @@
     if (!me) return;
     const known = new Set(contacts.map((c) => c.identity));
     const changedPeers = new Set<string>();
+    const newcomers: string[] = [];
     let firstFrom = '';
     let delivered = 0;
     try {
       await me.receive(async (m) => {
         const body = decode(m.text);
+        // Групи: окремий шлях (і жодних нових контактів від учасників групи).
+        if ((body as { g?: unknown }).g !== undefined || body.t === 'group' || body.t === 'leave') {
+          const key = await onGroupMessage(m.from, body);
+          if (key) changedPeers.add(key);
+          return;
+        }
+        if (body.t === 'profile') {
+          if (known.has(m.from)) {
+            await onProfile(m.from, body);
+            changedPeers.add('contacts');
+          }
+          return;
+        }
         const hello = body.t === 'hello' ? body.name.trim().slice(0, 60) : null;
+        if (hello !== null && !known.has(m.from) && myAvatar) newcomers.push(m.from);
         if (!known.has(m.from)) {
           const fp = fingerprintOf(m.from);
           await contactsDb.put({ identity: m.from, name: hello || `Новий ${short(fp)}`, fingerprint: fp });
@@ -396,15 +839,19 @@
     } catch (e) {
       fail(e); // повідомлення вже збережені локально — показуємо їх нижче
     }
-    if (current && changedPeers.has(current.identity) && !delivered) {
-      await openThread(current);
-      if (selected && !thread.some((t) => t.id === selected!.id)) selected = null;
-    }
+    if ([...changedPeers].some((k) => k.startsWith('g:'))) await refreshGroups();
+    if (changedPeers.has('contacts')) await refreshContacts();
+    if (chatKey && changedPeers.has(chatKey)) await reloadThread();
+    // Новий контакт привітався — надіслати йому моє фото.
+    if (newcomers.length) sendProfile(newcomers);
     if (!delivered) return;
     await refreshContacts();
     // Нікого не відкрито (напр. перше привітання після запрошення) — відкрити розмову.
-    const target = current ?? contacts.find((c) => c.identity === firstFrom) ?? null;
-    if (target) await openThread(target);
+    if (current) await reloadThread();
+    else if (!group && !channel) {
+      const target = contacts.find((c) => c.identity === firstFrom);
+      if (target) await openThread(target);
+    }
   }
 
   async function copy(text: string, what: string) {
@@ -426,6 +873,7 @@
   async function saveName() {
     myName = myName.trim().slice(0, 60);
     await kv.set('myName', myName);
+    sendProfile();
   }
 
   async function rename() {
@@ -468,7 +916,10 @@
       password = '';
       me = await Shepit.restore();
       myName = (await kv.get<string>('myName')) ?? '';
+      myAvatar = (await kv.get<string>('myAvatar')) ?? '';
       await refreshContacts();
+      await refreshGroups();
+      await refreshChannels();
       await me?.ensureKeys();
       panel = '';
       notice = 'Акаунт відновлено. Не користуйся ним одночасно в іншому браузері.';
@@ -491,9 +942,14 @@
     let pollTimer: ReturnType<typeof setInterval>;
     let stopEvents: (() => void) | null = null;
     let keysTimer: ReturnType<typeof setInterval>;
+    let channelsTimer: ReturnType<typeof setInterval>;
     const onHash = async () => {
       const inv = readInviteFromUrl();
       if (inv) invite = inv;
+      if (channelLinkPending) {
+        await openChannelLink(channelLinkPending);
+        channelLinkPending = null;
+      }
     };
     window.addEventListener('hashchange', onHash);
     onAccountChangedElsewhere(() => location.reload());
@@ -516,7 +972,11 @@
         me = await Shepit.restore();
         if (!me) regMode = await registrationMode();
         myName = (await kv.get<string>('myName')) ?? '';
+        myAvatar = (await kv.get<string>('myAvatar')) ?? '';
         await refreshContacts();
+        await refreshGroups();
+        await refreshChannels();
+        if (channelLinkPending) await openChannelLink(channelLinkPending);
         if (me) await me.ensureKeys();
         refreshPush().catch(() => {});
       } catch (e) {
@@ -531,12 +991,15 @@
         if (!streamOk || tickN % 10 === 0) poll();
       }, POLL_MS);
       keysTimer = setInterval(() => me?.ensureKeys().catch(fail), KEYS_CHECK_MS);
+      channelsTimer = setInterval(() => me && checkChannels(), 2 * 60 * 1000);
+      if (me) checkChannels();
       if (me) stopEvents = me.listen(poll, (ok) => (streamOk = ok));
       poll();
     })();
     return () => {
       clearInterval(pollTimer);
       clearInterval(keysTimer);
+      clearInterval(channelsTimer);
       stopEvents?.();
       window.removeEventListener('hashchange', onHash);
     };
@@ -564,6 +1027,17 @@
 {/if}
 {#if loading}
   <main class="center"><p class="muted">Завантаження…</p></main>
+{:else if !me && channel}
+  <div class="app solo">
+    <main class="chat">
+      <ChannelView {channel} subscribed={false} canSubscribe={false} onError={fail} onChange={(c) => (channel = c)} />
+      <div class="composer solo-cta">
+        <span class="small muted">Щоб підписатися на канал, створи акаунт у Шепоті — це хвилина, без номера телефону.</span>
+        <span class="spacer"></span>
+        <button class="primary" onclick={() => (channel = null)}>Створити акаунт</button>
+      </div>
+    </main>
+  </div>
 {:else if !me}
   <main class="center">
     <div class="card welcome">
@@ -609,6 +1083,7 @@
     <aside>
       <section class="me">
         <div class="row between">
+          <Avatar name={myName || '?'} src={myAvatar} size={44} />
           <div class="who">
             <div class="who-name">{myName || 'Без імені'}</div>
             <div class="small muted">Мій ID: <span class="mono">{short(me.fingerprint)}</span></div>
@@ -632,12 +1107,64 @@
         <ul>
           {#each contacts as c (c.identity)}
             <li>
-              <button class:active={current?.identity === c.identity} onclick={() => openThread(c)}>
-                <span class="name">{c.name}</span>
-                <span class="sub">{short(c.fingerprint)}…</span>
+              <button class="chat-item" class:active={current?.identity === c.identity} onclick={() => openThread(c)}>
+                <Avatar name={c.name} src={c.avatar} size={36} />
+                <span class="item-text">
+                  <span class="name">{c.name}</span>
+                  <span class="sub">{short(c.fingerprint)}…</span>
+                </span>
                 {#if unread[c.identity]}<span class="badge">{unread[c.identity]}</span>{/if}
               </button>
             </li>
+          {/each}
+        </ul>
+      </section>
+
+      <section class="contacts">
+        <div class="row between">
+          <div class="label">Групи</div>
+          <button class="ghost" onclick={() => { newGroupMembers = []; panel = 'newgroup'; }} disabled={!contacts.length} title={contacts.length ? '' : 'Спершу додай контакти'}>+ Нова</button>
+        </div>
+        <ul>
+          {#each groups as g (g.id)}
+            <li>
+              <button class="chat-item" class:active={group?.id === g.id} onclick={() => openGroup(g)}>
+                <Avatar name={g.name} src={g.avatar} size={36} />
+                <span class="item-text">
+                  <span class="name">{g.name}</span>
+                  <span class="sub">{g.left ? 'ти не в групі' : `${g.members.length} учасн.`}</span>
+                </span>
+                {#if unread[`g:${g.id}`]}<span class="badge">{unread[`g:${g.id}`]}</span>{/if}
+              </button>
+            </li>
+          {:else}
+            <li class="small muted empty">Груп ще немає</li>
+          {/each}
+        </ul>
+      </section>
+
+      <section class="contacts">
+        <div class="row between">
+          <div class="label">Канали</div>
+          <span class="row">
+            <button class="ghost" onclick={() => { searchResults = null; searchQ = ''; panel = 'findchannel'; doSearch(); }}>🔍</button>
+            <button class="ghost" onclick={() => (panel = 'newchannel')}>+ Новий</button>
+          </span>
+        </div>
+        <ul>
+          {#each channels as c (c.id)}
+            <li>
+              <button class="chat-item" class:active={channel?.id === c.id} onclick={() => openChannel(c)}>
+                <Avatar name={c.name} src={c.avatar} size={36} />
+                <span class="item-text">
+                  <span class="name">{c.name}</span>
+                  <span class="sub">{c.priv ? 'мій канал' : c.public ? 'публічний' : 'зашифрований'}</span>
+                </span>
+                {#if c.lastSeq > c.readSeq && channel?.id !== c.id}<span class="badge">•</span>{/if}
+              </button>
+            </li>
+          {:else}
+            <li class="small muted empty">Каналів ще немає</li>
           {/each}
         </ul>
       </section>
@@ -653,18 +1180,39 @@
           </div>
         </div>
       {/if}
-      {#if current}
+      {#if channel}
+        <ChannelView
+          {channel}
+          subscribed={channelSubscribed}
+          onSubscribe={subscribe}
+          onUnsubscribe={unsubscribe}
+          onChange={(c) => (channelSubscribed ? saveChannel(c) : (channel = c))}
+          onDeleted={onChannelDeleted}
+          onError={fail}
+        />
+      {:else if current || group}
+        {#if group}
         <header>
+          <Avatar name={group.name} src={group.avatar} size={36} />
+          <button class="title" onclick={() => (panel = 'group')} title="Учасники й налаштування">{group.name}</button>
+          <span class="small muted">{group.members.length} учасн.</span>
+          <span class="spacer"></span>
+          <button class="ghost" title="Група" onclick={() => (panel = 'group')}>⋯</button>
+        </header>
+        {:else if current}
+        <header>
+          <Avatar name={current.name} src={current.avatar} size={36} />
           <button class="title" onclick={rename} title="Перейменувати">{current.name} ✎</button>
           <button class="ghost small" onclick={() => (showSafety = !showSafety)}>🔒 код безпеки</button>
           <span class="spacer"></span>
           <button class="ghost" title="Голосовий дзвінок" disabled={calls.state !== 'idle'} onclick={() => calls.start(current!.identity)}>📞</button>
           <button class="ghost" title="Бесіда: очистити, видалити контакт" onclick={() => (panel = 'chat')}>⋯</button>
         </header>
-        {#if showSafety}
+        {/if}
+        {#if showSafety && current}
           <div class="safety">
             Цей код <b>однаковий у вас обох</b>. Порівняйте його з {current.name} наживо або по телефону: якщо збігається — ніхто не підмінив ключі.
-            <div class="fp">{me.safetyNumber(current.identity)}</div>
+            <div class="fp">{me!.safetyNumber(current.identity)}</div>
           </div>
         {/if}
         <div class="thread" bind:this={threadEl}>
@@ -674,6 +1222,7 @@
               role="listitem"
               oncontextmenu={(e) => { e.preventDefault(); selected = selected?.id === m.id ? null : m; }}
             >
+              {#if group && !m.out && m.from && m.kind !== 'call'}<div class="from small">{senderName(m.from)}</div>{/if}
               {#if m.kind === 'voice' && m.voice}
                 <div class="bubble"><VoiceMsg voice={m.voice} /></div>
               {:else}
@@ -686,7 +1235,9 @@
             <p class="muted center-text">Повідомлень ще немає. Усе, що ви напишете, шифрується на пристрої — сервер бачить лише шифротекст.</p>
           {/each}
         </div>
-        {#if selected}
+        {#if group?.left}
+          <div class="composer"><span class="muted small">Ти не в цій групі — писати сюди не можна.</span></div>
+        {:else if selected}
           <div class="composer msg-actions">
             <span class="muted small">Повідомлення:</span>
             <span class="spacer"></span>
@@ -726,7 +1277,7 @@
           <p class="muted small">Номер телефону, email чи пароль не потрібні. Посилання містить лише твій публічний ключ.</p>
         </div>
       {:else}
-        <div class="center"><p class="muted">Обери контакт.</p></div>
+        <div class="center"><p class="muted">Обери контакт, групу чи канал.</p></div>
       {/if}
       {#if notice}<div class="toast ok" role="status">{notice} <button class="ghost" onclick={() => (notice = '')}>✕</button></div>{/if}
       {#if error}<div class="toast" role="alert">{error} <button class="ghost" onclick={() => (error = '')}>✕</button></div>{/if}
@@ -734,13 +1285,95 @@
   </div>
 
   {#if calls.state !== 'idle'}
-    <CallOverlay {calls} name={nameOf(calls.peer)} />
+    <CallOverlay {calls} name={nameOf(calls.peer)} avatar={contacts.find((c) => c.identity === calls.peer)?.avatar} />
   {/if}
 
   {#if panel}
     <div class="overlay" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) panel = ''; }}>
       <div class="card modal">
-        {#if panel === 'chat' && current}
+        {#if panel === 'newgroup'}
+          <h2>Нова група</h2>
+          <input placeholder="Назва групи" bind:value={newGroupName} maxlength="80" />
+          <p class="small muted">Учасники (до 100). Сервер не знає ні про групу, ні про її склад: повідомлення шифрується кожному окремо.</p>
+          <div class="pick">
+            {#each contacts as c (c.identity)}
+              <label class="row"><input type="checkbox" class="cb" value={c.identity} bind:group={newGroupMembers} /> <Avatar name={c.name} src={c.avatar} size={28} /> {c.name}</label>
+            {/each}
+          </div>
+          <button class="primary" onclick={createGroup} disabled={busy || !newGroupName.trim() || !newGroupMembers.length || newGroupMembers.length > 99}>Створити групу</button>
+        {:else if panel === 'group' && group}
+          <div class="row">
+            <Avatar name={group.name} src={group.avatar} size={56} />
+            <div>
+              <h2>{group.name}</h2>
+              <span class="small muted">{group.members.length} учасн. · {group.left ? 'ти не в групі' : isAdmin ? 'ти адміністратор' : 'учасник'}</span>
+            </div>
+          </div>
+          {#if isAdmin}
+            <div class="row wrap">
+              <button onclick={renameGroup} disabled={busy}>✎ Назва</button>
+              <label class="button-like">🖼 Фото<input type="file" accept="image/*" hidden onchange={setGroupAvatar} /></label>
+            </div>
+          {/if}
+          <div class="label">Учасники</div>
+          <ul class="members">
+            {#each group.members as m (m.id)}
+              <li class="row">
+                <Avatar name={senderName(m.id)} src={contacts.find((c) => c.identity === m.id)?.avatar ?? (m.id === me?.identity ? myAvatar : undefined)} size={28} />
+                <span class="grow">{senderName(m.id)}{#if group.admins.includes(m.id)} <span class="small muted">· адмін</span>{/if}</span>
+                {#if isAdmin && m.id !== me?.identity}
+                  <button class="ghost small" onclick={() => toggleAdmin(m.id)} disabled={busy}>{group.admins.includes(m.id) ? 'зняти адміна' : 'зробити адміном'}</button>
+                  <button class="ghost small danger-text" onclick={() => removeFromGroup(m.id)} disabled={busy}>✕</button>
+                {/if}
+              </li>
+            {/each}
+          </ul>
+          {#if isAdmin}
+            {@const candidates = contacts.filter((c) => !group!.members.some((m) => m.id === c.identity))}
+            {#if candidates.length}
+              <div class="label">Додати</div>
+              <div class="pick">
+                {#each candidates as c (c.identity)}
+                  <label class="row"><input type="checkbox" class="cb" value={c.identity} bind:group={addMembers} /> {c.name}</label>
+                {/each}
+              </div>
+              <button onclick={addToGroup} disabled={busy || !addMembers.length || group.members.length + addMembers.length > 100}>Додати обраних</button>
+            {/if}
+          {/if}
+          <button onclick={() => clearChat(false)}>🧹 Очистити історію в мене</button>
+          {#if group.left}
+            <button class="danger" onclick={deleteGroupLocal}>Видалити групу з цього пристрою</button>
+          {:else}
+            <button class="danger" onclick={leaveGroup}>Вийти з групи</button>
+          {/if}
+        {:else if panel === 'newchannel'}
+          <h2>Новий канал</h2>
+          <input placeholder="Назва каналу" bind:value={newChannelName} maxlength="80" />
+          <textarea placeholder="Опис (необов'язково)" bind:value={newChannelAbout} maxlength="500" rows="3"></textarea>
+          <label class="choice"><input type="radio" class="cb" name="ctype" value={false} bind:group={newChannelPublic} /> <span><b>🔒 Зашифрований</b><br /><span class="small muted">Читає лише той, хто має посилання: ключ у посиланні, сервер дописів не бачить.</span></span></label>
+          <label class="choice"><input type="radio" class="cb" name="ctype" value={true} bind:group={newChannelPublic} /> <span><b>📢 Публічний</b><br /><span class="small muted">Дописи відкриті, канал знаходиться пошуком, читати можна без акаунта.</span></span></label>
+          <button class="primary" onclick={createChannel} disabled={busy || !newChannelName.trim()}>{busy ? 'Створюю…' : 'Створити канал'}</button>
+          <p class="small warn">Ключ автора зберігається лише на цьому пристрої — зроби резервну копію, інакше втратиш можливість писати в канал.</p>
+        {:else if panel === 'findchannel'}
+          <h2>Публічні канали</h2>
+          <form class="row" onsubmit={(e) => { e.preventDefault(); doSearch(); }}>
+            <input placeholder="Назва або опис" bind:value={searchQ} />
+            <button type="submit">Шукати</button>
+          </form>
+          {#if searchResults}
+            <ul class="members">
+              {#each searchResults as r (r.id)}
+                <li><button class="chat-item" onclick={() => { panel = ''; openChannelLink({ id: r.id }); }}>
+                  <Avatar name={r.name} src={r.avatar} size={36} />
+                  <span class="item-text"><span class="name">{r.name}</span><span class="sub">{r.about || `${r.posts} дописів`}</span></span>
+                </button></li>
+              {:else}
+                <li class="small muted">Нічого не знайдено.</li>
+              {/each}
+            </ul>
+          {/if}
+          <p class="small muted">Зашифровані канали в пошуку не з'являються — до них потрапляють лише за посиланням.</p>
+        {:else if panel === 'chat' && current}
           <h2>{current.name}</h2>
           <button onclick={() => clearChat(false)} disabled={busy}>🧹 Очистити бесіду в мене</button>
           <button onclick={() => clearChat(true)} disabled={busy}>🧹 Очистити в мене і в {current.name}</button>
@@ -768,6 +1401,15 @@
           </div>
         {:else if panel === 'settings'}
           <h2>Налаштування</h2>
+          <div class="field">
+            <span class="label">Моє фото</span>
+            <div class="row">
+              <Avatar name={myName || '?'} src={myAvatar} size={56} />
+              <label class="button-like">🖼 Обрати<input type="file" accept="image/*" hidden onchange={setMyAvatar} /></label>
+              {#if myAvatar}<button class="ghost" onclick={removeMyAvatar}>Прибрати</button>{/if}
+            </div>
+            <span class="small muted">Бачать лише твої контакти: фото йде їм зашифрованим, сервер його не бачить.</span>
+          </div>
           <label class="field">
             <span class="label">Моє ім'я</span>
             <input placeholder="Як тебе називати" bind:value={myName} onchange={saveName} maxlength="60" />

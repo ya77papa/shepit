@@ -20,6 +20,9 @@ hmac = "0.12"
 sha1 = "0.10"
 base64 = "0.22"
 rand = "0.9"
+# Канали: підпис дописів ключем каналу (ECDSA P-256 — є у WebCrypto й Android без бібліотек).
+p256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
 # Пароль адміністратора: Argon2id; введення без відлуння в терміналі.
 argon2 = "0.5"
 rpassword = "7"
@@ -27,7 +30,6 @@ rpassword = "7"
 # Docker-образ збирається з `--features push`; локально на Windows можна без неї.
 web-push = { version = "0.11", default-features = false, optional = true }
 ureq = { version = "3", optional = true }
-p256 = { version = "0.13", optional = true }
 http = { version = "0.2", optional = true }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
@@ -38,7 +40,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 libc = "0.2"
 
 [features]
-push = ["dep:web-push", "dep:ureq", "dep:p256", "dep:http"]
+push = ["dep:web-push", "dep:ureq", "dep:http"]
 
 [dev-dependencies]
 ece = "2.4"

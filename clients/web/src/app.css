@@ -112,3 +112,23 @@ button.big { padding: 12px 18px; }
 .msg .bubble { cursor: default; }
 .msg-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .modal > button { text-align: left; }
+/* аватари, групи, канали */
+.chat-item { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; }
+.item-text { display: grid; min-width: 0; flex: 1; }
+.item-text .name, .item-text .sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat header { gap: 10px; }
+.from { color: var(--accent); padding: 0 4px 2px; font-weight: 600; }
+.pick { display: grid; gap: 6px; max-height: 240px; overflow: auto; }
+.pick label, .choice { gap: 8px; cursor: pointer; }
+.choice { display: flex; align-items: flex-start; border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
+.cb { width: auto; flex: none; }
+.members { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; }
+.members .grow { flex: 1; }
+.danger-text { color: var(--danger); }
+.button-like { background: var(--line); border-radius: 8px; padding: 8px 12px; cursor: pointer; }
+.modal textarea { width: 100%; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; color: inherit; font: inherit; }
+.empty { padding: 4px 8px; list-style: none; }
+.app.solo { grid-template-columns: 1fr; }
+.solo-cta { flex-wrap: wrap; }
+.who { flex: 1; min-width: 0; }
+.me .row.between { gap: 10px; }

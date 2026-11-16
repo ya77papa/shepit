@@ -11,6 +11,7 @@
     stats: {
       users: number; new_7d: number; active_1d: number; active_7d: number; active_30d: number;
       queued: number; queued_bytes: number; mailboxes_waiting: number; push_subs: number; invites_active: number;
+      channels: number; channels_public: number; channel_posts: number;
     };
     server: {
       version: string; commit: string; started: number; now: number; turn: string[]; web_push: boolean;
@@ -36,6 +37,8 @@
   let created: Invite | null = $state(null);
   type User = { identity: string; fingerprint: string; created: number; last_seen: number; invite: string | null; invited_by: string | null };
   type Blocked = { identity: string; fingerprint: string; at: number };
+  type Chan = { id: string; public: boolean; meta: string; created: number; updated: number; posts: number; bytes: number };
+  let chans: Chan[] = $state([]);
   let users: User[] = $state([]);
   let blocked: Blocked[] = $state([]);
   let query = $state('');
@@ -61,7 +64,8 @@
   }
 
   async function load() {
-    const [o, i, u] = await Promise.all([api('GET', 'overview'), api('GET', 'invites'), api('GET', 'users')]);
+    const [o, i, u, c] = await Promise.all([api('GET', 'overview'), api('GET', 'invites'), api('GET', 'users'), api('GET', 'channels')]);
+    chans = await c.json();
     ov = await o.json();
     invites = await i.json();
     ({ users, blocked } = await u.json());
@@ -129,6 +133,19 @@
   const revoke = (code: string) => {
     if (!confirm(`Відкликати запрошення ${code}? Ним більше не можна буде зареєструватись.`)) return;
     act(() => api('DELETE', `invites/${encodeURIComponent(code)}`), 'Запрошення відкликано');
+  };
+
+  const chanName = (c: Chan) => {
+    if (!c.public) return '🔒 зашифрований';
+    try {
+      return JSON.parse(c.meta).name as string;
+    } catch {
+      return '?';
+    }
+  };
+  const deleteChan = (c: Chan) => {
+    if (!confirm(`Видалити канал «${chanName(c)}» (${c.posts} дописів) з сервера? Його автор і читачі втратять доступ до всіх дописів.`)) return;
+    act(() => api('DELETE', `channels/${c.id}`), 'Канал видалено');
   };
 
   const deleteUser = (u: User) =>
@@ -250,6 +267,7 @@
         <div class="tile"><span class="n">{ov.stats.queued}</span><span class="small muted">недоставлених ({bytes(ov.stats.queued_bytes)}) у {ov.stats.mailboxes_waiting} скриньках</span></div>
         <div class="tile"><span class="n">{ov.stats.push_subs}</span><span class="small muted">підписок на сповіщення</span></div>
         <div class="tile"><span class="n">{ov.stats.invites_active}</span><span class="small muted">чинних запрошень</span></div>
+        <div class="tile"><span class="n">{ov.stats.channels}</span><span class="small muted">каналів ({ov.stats.channels_public} публічних), {ov.stats.channel_posts} дописів</span></div>
       </div>
       <p class="small muted">Активність рахується з точністю до дня. Вміст повідомлень і те, хто кому пише, сервер не знає.</p>
     </section>
@@ -299,6 +317,34 @@
             {/each}
           </tbody>
         </table>
+      {/if}
+    </section>
+
+    <section class="card">
+      <h2>Канали ({chans.length})</h2>
+      <p class="small muted">Зміст зашифрованих каналів сервер не бачить — лише розмір. Групи на сервері не зберігаються взагалі.</p>
+      {#if chans.length}
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Назва</th><th>Дописів</th><th>Розмір</th><th>Оновлено</th><th></th></tr></thead>
+            <tbody>
+              {#each chans as c (c.id)}
+                <tr>
+                  <td>{chanName(c)}<div class="small muted mono">{c.id.slice(0, 12)}…</div></td>
+                  <td>{c.posts}</td>
+                  <td>{bytes(c.bytes)}</td>
+                  <td>{date(c.updated)}</td>
+                  <td>
+                    {#if c.public}<a class="small" href={`/#c=${c.id}`} target="_blank" rel="noopener">відкрити</a>{/if}
+                    <button class="small danger" onclick={() => deleteChan(c)}>Видалити</button>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {:else}
+        <p class="muted small">Каналів ще немає.</p>
       {/if}
     </section>
 

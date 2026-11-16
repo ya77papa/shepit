@@ -2,13 +2,17 @@
 // Шифрування — стандартний WebCrypto браузера: PBKDF2-SHA256 (600 000 ітерацій) → AES-256-GCM.
 // Без пароля файл марний; пароль ніде не зберігається і нікуди не надсилається.
 
-import { contacts as contactsDb, kv, messages as messagesDb, type Contact, type Message } from './db';
+import { channels as channelsDb, contacts as contactsDb, groups as groupsDb, kv, messages as messagesDb, type Channel, type Contact, type Group, type Message } from './db';
 
 const ITERATIONS = 600_000;
 export const MIN_PASSWORD = 10;
 
 type StoredMessage = Omit<Message, 'voice'> & { voice?: { data: string; mime: string; dur: number; ptt?: boolean } };
-type Payload = { account: string; contacts: Contact[]; messages: StoredMessage[]; myName: string; exportedAt: number };
+// groups, channels, myAvatar — з'явились пізніше; старі копії їх не мають.
+type Payload = {
+  account: string; contacts: Contact[]; messages: StoredMessage[]; myName: string; exportedAt: number;
+  groups?: Group[]; channels?: Channel[]; myAvatar?: string;
+};
 type BackupFile = { shepit: 'backup'; v: 1; kdf: 'PBKDF2-SHA256'; iter: number; salt: string; iv: string; data: string };
 
 const b64 = (b: Uint8Array) => btoa(String.fromCharCode(...b));
@@ -46,6 +50,10 @@ export async function exportBackup(password: string): Promise<Blob> {
     ),
     myName: (await kv.get<string>('myName')) ?? '',
     exportedAt: Date.now(),
+    groups: await groupsDb.all(),
+    // Містить ключі моїх каналів — без них писати в канал неможливо.
+    channels: await channelsDb.all(),
+    myAvatar: (await kv.get<string>('myAvatar')) ?? '',
   };
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -76,6 +84,9 @@ export async function importBackup(file: File, password: string): Promise<void> 
   const p: Payload = JSON.parse(new TextDecoder().decode(plain));
   await kv.set('account', unb64(p.account));
   await kv.set('myName', p.myName);
+  await kv.set('myAvatar', p.myAvatar ?? '');
+  for (const g of p.groups ?? []) await groupsDb.put(g);
+  for (const c of p.channels ?? []) await channelsDb.put(c);
   for (const c of p.contacts) await contactsDb.put(c);
   for (const { id: _id, voice, ...m } of p.messages) {
     await messagesDb.add(

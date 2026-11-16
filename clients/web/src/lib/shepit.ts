@@ -213,6 +213,11 @@ export class Shepit {
     await http('PUT', '/v0/keys', { body, headers });
   }
 
+  /** Підпис запиту ключем акаунта (напр. для створення каналу). */
+  signRequest(purpose: string, body: Uint8Array): string {
+    return this.acc.authHeader(purpose, body);
+  }
+
   /**
    * Код запрошення для мого посилання (коли сервер працює «за запрошенням»).
    * Сервер видає той самий код, поки ним не скористались, і новий — у межах ліміту.

@@ -3,7 +3,8 @@
   import type { CallManager } from './lib/call.svelte';
   import { fmtDuration } from './lib/content';
 
-  let { calls, name }: { calls: CallManager; name: string } = $props();
+  import Avatar from './Avatar.svelte';
+  let { calls, name, avatar }: { calls: CallManager; name: string; avatar?: string } = $props();
   let audio: HTMLAudioElement | undefined = $state();
   let now = $state(Date.now());
   const tick = setInterval(() => (now = Date.now()), 500);
@@ -59,6 +60,7 @@
 <div class="overlay call">
   <div class="card modal call-card">
     <div class="call-avatar">📞</div>
+    <Avatar {name} src={avatar} size={96} />
     <h2>{name}</h2>
     <p class="muted">
       {#if calls.state === 'outgoing'}Дзвоню…
