@@ -15,3 +15,6 @@ build/
 # Приватні ключі сервера (корінь довіри) — НІКОЛИ не комітити
 data/
 issuer.json
+
+# Код Android-клієнта (пакет data) — не секрети сервера
+!clients/android/app/src/main/java/io/github/ya77papa/shepit/data/

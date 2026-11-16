@@ -1,0 +1,4 @@
+[bindings.kotlin]
+package_name = "io.github.ya77papa.shepit.core"
+cdylib_name = "shepit_ffi"
+android = true

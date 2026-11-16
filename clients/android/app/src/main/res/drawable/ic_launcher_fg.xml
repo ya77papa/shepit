@@ -1,0 +1,10 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- бульбашка повідомлення -->
+    <path android:fillColor="#F5C542"
+        android:pathData="M30,34h48a8,8 0,0 1,8 8v22a8,8 0,0 1,-8 8H50l-12,10v-10h-8a8,8 0,0 1,-8 -8V42a8,8 0,0 1,8 -8z" />
+    <!-- три крапки «шепоту» -->
+    <path android:fillColor="#0F1722" android:pathData="M42,53m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0" />
+    <path android:fillColor="#0F1722" android:pathData="M54,53m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0" />
+    <path android:fillColor="#0F1722" android:pathData="M66,53m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0" />
+</vector>

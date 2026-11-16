@@ -500,7 +500,7 @@
       {/if}
       {#if error}<p class="error">{error}</p>{/if}
       <p class="muted small">Версія <a href={commitUrl(COMMIT)} target="_blank" rel="noopener">{SHORT}</a> · відкритий код</p>
-      <p class="warn small">Веб-версія зручна, але менш захищена за нативний застосунок: код завантажується з сервера. Для максимального захисту — дочекайся застосунку для Android.</p>
+      <p class="warn small">Веб-версія зручна, але менш захищена за нативний застосунок: код завантажується з сервера. Для максимального захисту — <a href="https://github.com/ya77papa/shepit/releases/latest" target="_blank" rel="noopener">встанови застосунок для Android</a>.</p>
     </div>
   </main>
 {:else}

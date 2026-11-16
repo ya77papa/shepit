@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "server", "clients/cli", "clients/web-core"]
+members = ["core", "server", "clients/cli", "clients/web-core", "clients/android-core"]
 
 [workspace.package]
 version = "0.0.1"
