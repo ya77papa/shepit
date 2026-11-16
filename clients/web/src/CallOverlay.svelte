@@ -65,6 +65,13 @@
       {:else}
         {#if calls.state === 'active'}
           <button class="big" onclick={() => calls.toggleMute()}>{calls.muted ? '🔇 Увімкнути мікрофон' : '🎙 Вимкнути мікрофон'}</button>
+          {#if calls.earpieceId() && calls.speakerId()}
+            {#if calls.inputId === calls.earpieceId()}
+              <button class="big" onclick={() => calls.switchInput(calls.speakerId())}>🔊 Гучний зв'язок</button>
+            {:else}
+              <button class="big" onclick={() => calls.switchInput(calls.earpieceId())}>📱 До вуха</button>
+            {/if}
+          {/if}
         {/if}
         <button class="danger big" onclick={() => calls.hangup()}>{calls.state === 'outgoing' ? 'Скасувати' : 'Завершити'}</button>
       {/if}

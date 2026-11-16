@@ -35,6 +35,7 @@
   let invite: Invite | null = $state(null); // прийшли за посиланням-запрошенням
   let panel: '' | 'invite' | 'backup' | 'add' | 'restore' | 'calltest' = $state('');
   let relayResults: RelayCheck[] | null = $state(null);
+  let pushState: 'unsupported' | 'off' | 'on' | 'denied' | 'busy' = $state('unsupported');
   let newName = $state('');
   let newKey = $state('');
   let password = $state('');
@@ -139,6 +140,7 @@
       await kv.set('myName', myName.trim());
       me = await Shepit.register();
       me.listen(poll, (ok) => (streamOk = ok));
+      refreshPush().catch(() => {});
       if (invite) await acceptInvite();
     } catch (e) {
       fail(e);
@@ -210,6 +212,56 @@
     if (recTimer) clearInterval(recTimer);
     const rec = await recorder.stop(cancel);
     if (rec) await sendVoice(rec.blob, rec.mime, rec.dur);
+  }
+
+  const b64ToBytes = (s: string) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
+
+  async function refreshPush() {
+    if (!me || !import.meta.env.PROD || !('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
+      pushState = 'unsupported';
+      return;
+    }
+    if (Notification.permission === 'denied') {
+      pushState = 'denied';
+      return;
+    }
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    pushState = sub ? 'on' : 'off';
+    if (sub) await me.subscribePush(sub).catch(() => {}); // нагадати серверу (на випадок втрати бази)
+  }
+
+  async function enablePush() {
+    if (!me) return;
+    pushState = 'busy';
+    try {
+      const r = await fetch('/v0/push/key');
+      if (!r.ok) throw new Error('Сервер поки не підтримує сповіщення');
+      const key = (await r.text()).trim();
+      if ((await Notification.requestPermission()) !== 'granted') {
+        pushState = Notification.permission === 'denied' ? 'denied' : 'off';
+        return;
+      }
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(key) });
+      await me.subscribePush(sub);
+      pushState = 'on';
+      notice = 'Сповіщення увімкнено: дзвінки й повідомлення прийдуть, навіть коли Шепіт закритий.';
+    } catch (e) {
+      pushState = 'off';
+      fail(/permission denied|NotAllowed/i.test(String(e)) ? 'Браузер не дозволив сповіщення (у приватному режимі чи без Google-сервісів вони можуть бути недоступні)' : e);
+    }
+  }
+
+  async function disablePush() {
+    if (!me) return;
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (sub) {
+      await me.unsubscribePush(sub.endpoint).catch(() => {});
+      await sub.unsubscribe();
+    }
+    pushState = 'off';
   }
 
   async function runCallTest() {
@@ -356,6 +408,14 @@
     };
     window.addEventListener('hashchange', onHash);
     onAccountChangedElsewhere(() => location.reload());
+    // Застосунок на екрані — прибрати сповіщення (дзвінок покаже сам застосунок) і одразу перевірити пошту.
+    const onVisible = async () => {
+      if (document.visibilityState !== 'visible') return;
+      poll();
+      const reg = await navigator.serviceWorker?.getRegistration();
+      (await reg?.getNotifications())?.forEach((n) => n.close());
+    };
+    document.addEventListener('visibilitychange', onVisible);
     registerServiceWorker((apply) => (applyUpdate = apply)).catch((e) => console.warn('service worker:', e));
     (async () => {
       try {
@@ -368,6 +428,7 @@
         myName = (await kv.get<string>('myName')) ?? '';
         await refreshContacts();
         if (me) await me.ensureKeys();
+        refreshPush().catch(() => {});
       } catch (e) {
         fail(e);
       } finally {
@@ -473,7 +534,17 @@
         </ul>
       </section>
       <p class="warn small">Веб-версія: ключі зберігаються в цьому браузері. Зроби резервну копію, інакше очищення даних сайту = втрата акаунта.</p>
-      <p class="small"><button class="ghost small" onclick={runCallTest}>📞 Перевірити дзвінки</button></p>
+      {#if pushState === 'off'}
+        <button class="notify-cta" onclick={enablePush}>🔔 Увімкнути сповіщення — щоб дзвінки доходили, коли Шепіт закритий</button>
+      {:else if pushState === 'busy'}
+        <p class="small muted">🔔 Вмикаю сповіщення…</p>
+      {:else if pushState === 'denied'}
+        <p class="small warn">🔕 Сповіщення заборонені в налаштуваннях браузера для цього сайту — без них дзвінки не дійдуть, коли Шепіт закритий.</p>
+      {/if}
+      <p class="small row wrap">
+        <button class="ghost small" onclick={runCallTest}>📞 Перевірити дзвінки</button>
+        {#if pushState === 'on'}<button class="ghost small" onclick={disablePush}>🔔 Сповіщення увімкнено · вимкнути</button>{/if}
+      </p>
       <p class="muted small version">Версія <a href={commitUrl(COMMIT)} target="_blank" rel="noopener">{SHORT}</a> · <a href="/version.json" target="_blank">хеш збірки</a></p>
     </aside>
 

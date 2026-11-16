@@ -52,11 +52,15 @@ pub struct Envelope {
     pub to: MailboxId,
     /// hex від зашифрованого вмісту ([`crate::crypto`]).
     pub payload: String,
+    /// Підказка серверу, як будити отримувача: `Some("call")` — вхідний дзвінок (термінове
+    /// сповіщення). Це єдине, що сервер знає про вміст: що це дзвінок, але не від кого.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<String>,
 }
 
 impl Envelope {
     pub fn new(to: MailboxId, payload: &[u8]) -> Self {
-        Self { version: WIRE_VERSION, to, payload: hex::encode(payload) }
+        Self { version: WIRE_VERSION, to, payload: hex::encode(payload), wake: None }
     }
 
     pub fn payload_bytes(&self) -> Option<Vec<u8>> {

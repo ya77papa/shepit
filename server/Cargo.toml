@@ -20,6 +20,19 @@ hmac = "0.12"
 sha1 = "0.10"
 base64 = "0.22"
 rand = "0.9"
+# Web Push (сповіщення при закритому застосунку). Потребує OpenSSL, тому окрема фіча:
+# Docker-образ збирається з `--features push`; локально на Windows можна без неї.
+web-push = { version = "0.11", default-features = false, optional = true }
+ureq = { version = "3", optional = true }
+p256 = { version = "0.13", optional = true }
+http = { version = "0.2", optional = true }
+
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
 tower-http = { version = "0.6", features = ["fs", "set-header"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
+
+[features]
+push = ["dep:web-push", "dep:ureq", "dep:p256", "dep:http"]
+
+[dev-dependencies]
+ece = "2.4"

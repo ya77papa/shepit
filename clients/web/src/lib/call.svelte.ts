@@ -112,7 +112,44 @@ export class CallManager {
   constructor(private me: () => Shepit | null, private log: CallLog) {}
 
   private async signal(peer: string, body: Body) {
-    await this.me()!.send(peer, encode(body));
+    // Пропозиція дзвінка будить отримувача терміновим сповіщенням, навіть якщо застосунок закритий.
+    await this.me()!.send(peer, encode(body), body.t === 'call' && body.op === 'offer' ? 'call' : undefined);
+  }
+
+  /** Мікрофони пристрою. На Android у Chrome вибір мікрофона перемикає й динамік (вухо/гучний). */
+  inputs: MediaDeviceInfo[] = $state([]);
+  inputId = $state('');
+
+  private async listInputs() {
+    try {
+      this.inputs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audioinput' && d.deviceId);
+    } catch {
+      this.inputs = [];
+    }
+  }
+
+  /** Знайти «розмовний» мікрофон (до вуха), якщо браузер його показує. */
+  earpieceId(): string {
+    return this.inputs.find((d) => /earpiece|навушник|телефон|receiver/i.test(d.label) && !/headset|гарнітур/i.test(d.label))?.deviceId ?? '';
+  }
+
+  speakerId(): string {
+    return this.inputs.find((d) => /speaker|гучн|динамік/i.test(d.label))?.deviceId ?? '';
+  }
+
+  /** Перемкнути мікрофон (а з ним на Android — і вивід звуку) посеред розмови. */
+  async switchInput(deviceId: string) {
+    if (!this.pc || !deviceId) return;
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    const track = stream.getAudioTracks()[0];
+    track.enabled = !this.muted;
+    const sender = this.pc.getSenders().find((s) => s.track?.kind === 'audio');
+    await sender?.replaceTrack(track);
+    this.local?.getTracks().forEach((t) => t.stop());
+    this.local = stream;
+    this.inputId = deviceId;
   }
 
   private async makePc(): Promise<RTCPeerConnection> {
@@ -131,6 +168,19 @@ export class CallManager {
     this.local = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
+    // Після дозволу на мікрофон браузер показує назви пристроїв. Якщо є «до вуха» — почати з нього,
+    // як у звичайному телефонному дзвінку.
+    await this.listInputs();
+    const ear = this.earpieceId();
+    if (ear) {
+      this.local.getTracks().forEach((t) => t.stop());
+      this.local = await navigator.mediaDevices.getUserMedia({
+        audio: { deviceId: { exact: ear }, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      this.inputId = ear;
+    } else {
+      this.inputId = this.local.getAudioTracks()[0]?.getSettings().deviceId ?? '';
+    }
     this.local.getTracks().forEach((t) => pc.addTrack(t, this.local!));
     this.pc = pc;
     return pc;

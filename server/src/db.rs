@@ -10,6 +10,13 @@ use shepit_core::wire::{Envelope, KeyUpload, MailboxId, MailboxItem, PreKeyBundl
 
 pub struct Db(Mutex<Connection>);
 
+#[derive(Clone, Debug)]
+pub struct PushSub {
+    pub endpoint: String,
+    pub p256dh: String,
+    pub auth: String,
+}
+
 /// Скільки зберігати недоставлені конверти.
 const RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
@@ -29,7 +36,14 @@ impl Db {
                  envelope TEXT NOT NULL,
                  created  INTEGER NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS envelopes_mailbox ON envelopes(mailbox, id);",
+             CREATE INDEX IF NOT EXISTS envelopes_mailbox ON envelopes(mailbox, id);
+             CREATE TABLE IF NOT EXISTS push_subs (
+                 endpoint TEXT PRIMARY KEY,
+                 mailbox  TEXT NOT NULL,
+                 p256dh   TEXT NOT NULL,
+                 auth     TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS push_subs_mailbox ON push_subs(mailbox);",
         )?;
         Ok(Self(Mutex::new(c)))
     }
@@ -104,6 +118,28 @@ impl Db {
             .lock()
             .unwrap()
             .execute("DELETE FROM envelopes WHERE mailbox = ?1 AND id <= ?2", params![mailbox.to_hex(), upto])
+    }
+
+    /// Підписка браузера на сповіщення (Web Push) для скриньки.
+    pub fn put_push(&self, mailbox: &MailboxId, s: &PushSub) -> rusqlite::Result<()> {
+        self.0.lock().unwrap().execute(
+            "INSERT INTO push_subs(endpoint, mailbox, p256dh, auth) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(endpoint) DO UPDATE SET mailbox = excluded.mailbox, p256dh = excluded.p256dh, auth = excluded.auth",
+            params![s.endpoint, mailbox.to_hex(), s.p256dh, s.auth],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_push(&self, endpoint: &str) -> rusqlite::Result<usize> {
+        self.0.lock().unwrap().execute("DELETE FROM push_subs WHERE endpoint = ?1", [endpoint])
+    }
+
+    #[cfg_attr(not(feature = "push"), allow(dead_code))]
+    pub fn push_subs(&self, mailbox: &MailboxId) -> rusqlite::Result<Vec<PushSub>> {
+        let c = self.0.lock().unwrap();
+        let mut st = c.prepare("SELECT endpoint, p256dh, auth FROM push_subs WHERE mailbox = ?1")?;
+        let rows = st.query_map([mailbox.to_hex()], |r| Ok(PushSub { endpoint: r.get(0)?, p256dh: r.get(1)?, auth: r.get(2)? }))?;
+        rows.collect()
     }
 
     /// Видалити недоставлені конверти, старші за 30 днів.

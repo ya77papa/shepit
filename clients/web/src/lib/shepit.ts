@@ -113,6 +113,23 @@ export class Shepit {
     return this.turnCache.ice;
   }
 
+  /** Підписати цей браузер на сповіщення (дзвінки й нові повідомлення, коли застосунок закритий). */
+  async subscribePush(sub: PushSubscription): Promise<void> {
+    const body = new TextEncoder().encode(JSON.stringify(sub.toJSON()));
+    await http('PUT', '/v0/push', {
+      body,
+      headers: { 'content-type': 'application/json', [AUTH]: this.acc.authHeader('PUT /v0/push', body) },
+    });
+  }
+
+  async unsubscribePush(endpoint: string): Promise<void> {
+    const body = new TextEncoder().encode(JSON.stringify({ endpoint }));
+    await http('DELETE', '/v0/push', {
+      body,
+      headers: { 'content-type': 'application/json', [AUTH]: this.acc.authHeader('DELETE /v0/push', body) },
+    });
+  }
+
   /** Спільний з `peer` код безпеки (однаковий на обох пристроях). */
   safetyNumber(peer: string): string { return this.acc.safetyNumber(peer); }
 
@@ -174,7 +191,7 @@ export class Shepit {
     this.acc.setCertificate(await r.text());
   }
 
-  send(peer: string, text: string): Promise<void> {
+  send(peer: string, text: string, wake?: 'call'): Promise<void> {
     return serial(async () => {
       await this.ensureCertificate();
       if (!this.acc.hasSession(peer)) {
@@ -183,7 +200,7 @@ export class Shepit {
         if (!r.ok) throw new Error(`ключі отримувача: ${r.status}`);
         this.acc.startSession(await r.text());
       }
-      const envelope = this.acc.sealEnvelope(peer, text);
+      const envelope = this.acc.sealEnvelope(peer, text, wake);
       await this.save(); // зберегти стан ратчета ДО відправки
       await http('POST', '/v0/send', { body: envelope, headers: { 'content-type': 'application/json' } });
     });

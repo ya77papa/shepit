@@ -11,7 +11,7 @@ RUN rustup target add wasm32-unknown-unknown
 RUN cargo install --locked wasm-bindgen-cli --version 0.2.130
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked -p shepit-server \
+RUN cargo build --release --locked -p shepit-server --features push \
  && cargo build --release --locked -p shepit-web-core --target wasm32-unknown-unknown \
  && wasm-bindgen --target web --out-dir clients/web/src/wasm \
       target/wasm32-unknown-unknown/release/shepit_web_core.wasm
@@ -30,6 +30,10 @@ RUN npm run build
 
 # 3) Мінімальний образ для запуску
 FROM debian:bookworm-slim
+# libssl — шифрування Web Push; ca-certificates — HTTPS до сервісів сповіщень
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libssl3 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 --no-create-home shepit \
  && mkdir /data && chown shepit /data
 COPY --from=rust /src/target/release/shepit-server /usr/local/bin/shepit-server

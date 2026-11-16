@@ -27,6 +27,39 @@ self.addEventListener('message', (e) => {
   if (e.data === 'SKIP_WAITING') self.skipWaiting();
 });
 
+// Сповіщення, коли застосунок закритий. Вміст зашифрований і містить лише тип: дзвінок чи пошта.
+self.addEventListener('push', (e) => {
+  let t = 'mail';
+  try {
+    t = e.data?.json()?.t ?? 'mail';
+  } catch {
+    /* порожнє */
+  }
+  const call = t === 'call';
+  e.waitUntil(
+    self.registration.showNotification(call ? '📞 Вхідний дзвінок у Шепоті' : 'Шепіт', {
+      body: call ? 'Торкнись, щоб відповісти' : 'Нове повідомлення',
+      tag: call ? 'call' : 'mail',
+      renotify: true,
+      requireInteraction: call,
+      vibrate: call ? [600, 300, 600, 300, 600, 300, 600] : [200],
+      icon: '/icon-192.png',
+      badge: '/icon-192.png',
+      data: { t },
+    }),
+  );
+});
+
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  e.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
+      const w = list[0];
+      return w ? w.focus() : self.clients.openWindow('/');
+    }),
+  );
+});
+
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET' || url.origin !== location.origin) return;

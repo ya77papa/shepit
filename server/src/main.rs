@@ -12,6 +12,9 @@
 //! | POST  | /v0/mailbox/{id}/ack    | так    | «отримав і зберіг до N» — сервер видаляє |
 //! | GET   | /v0/events              | так    | потік подій (SSE): «у скриньці нова пошта» — миттєва доставка |
 //! | GET   | /v0/turn                | так    | тимчасовий логін до ретранслятора дзвінків (TURN) |
+//! | GET   | /v0/push/key            | —      | публічний ключ VAPID для підписки на сповіщення |
+//! | PUT   | /v0/push                | так    | підписати браузер на сповіщення (Web Push) |
+//! | DELETE| /v0/push                | так    | відписати |
 //!
 //! Також роздає веб-клієнт зі `$SHEPIT_WEB` (типово `./web`, якщо тека існує).
 //!
@@ -19,6 +22,8 @@
 //! Дані — у $SHEPIT_DATA: issuer.json (ключі сертифікатів) і shepit.db (SQLite: ключі, черги).
 
 mod db;
+#[cfg(feature = "push")]
+mod push;
 
 use std::{
     collections::HashMap,
@@ -46,6 +51,11 @@ struct App {
     turn: Option<Turn>,
     /// Сигнал зупинки: відкриті потоки подій мають закритися, інакше сервер не завершиться.
     shutdown: tokio::sync::watch::Receiver<bool>,
+    #[cfg(feature = "push")]
+    pusher: Arc<push::Pusher>,
+    /// Коли востаннє будили скриньку через «нову пошту» (не частіше ніж раз на 30 с).
+    #[cfg(feature = "push")]
+    last_mail_push: Mutex<HashMap<MailboxId, u64>>,
     /// Використані nonce → час. Захист від повторного відтворення підписаних запитів.
     /// У пам'яті: після перезапуску старі запити все одно відсіче вікно часу.
     nonces: Mutex<HashMap<String, u64>>,
@@ -151,9 +161,14 @@ async fn send(State(app): State<Shared>, Json(env): Json<Envelope>) -> StatusCod
     }
     match app.db.push(&env, MAX_QUEUE, now_ms()) {
         Ok(true) => {
-            if let Some(bell) = app.bells.lock().unwrap().get(&env.to) {
-                let _ = bell.send(());
-            }
+            let listening = match app.bells.lock().unwrap().get(&env.to) {
+                Some(bell) => bell.send(()).is_ok(),
+                None => false,
+            };
+            #[cfg(feature = "push")]
+            wake_up(&app, env.to, env.wake.as_deref() == Some("call"), listening);
+            #[cfg(not(feature = "push"))]
+            let _ = listening;
             StatusCode::ACCEPTED
         }
         Ok(false) => StatusCode::TOO_MANY_REQUESTS,
@@ -221,6 +236,94 @@ async fn events(
     Ok(([(header::HeaderName::from_static("x-accel-buffering"), HeaderValue::from_static("no"))], sse))
 }
 
+/// Розбудити отримувача через Web Push: дзвінок — завжди (терміново);
+/// звичайна пошта — лише якщо застосунок не слухає потік подій, і не частіше ніж раз на 30 с.
+#[cfg(feature = "push")]
+fn wake_up(app: &Shared, mailbox: MailboxId, call: bool, listening: bool) {
+    if !call {
+        if listening {
+            return;
+        }
+        let now = now_ms();
+        let mut last = app.last_mail_push.lock().unwrap();
+        if last.get(&mailbox).is_some_and(|t| now.saturating_sub(*t) < 30_000) {
+            return;
+        }
+        last.insert(mailbox, now);
+    }
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        let subs = match app.db.push_subs(&mailbox) {
+            Ok(s) => s,
+            Err(e) => return eprintln!("push: {e}"),
+        };
+        let kind = if call { push::Kind::Call } else { push::Kind::Mail };
+        for sub in subs {
+            match app.pusher.send(&sub, kind) {
+                push::Outcome::Sent => {}
+                push::Outcome::Gone => {
+                    let _ = app.db.delete_push(&sub.endpoint);
+                }
+                push::Outcome::Failed(e) => eprintln!("push: {e}"),
+            }
+        }
+    });
+}
+
+#[derive(serde::Deserialize)]
+struct PushKeys {
+    p256dh: String,
+    auth: String,
+}
+
+#[derive(serde::Deserialize)]
+struct PushSubscription {
+    endpoint: String,
+    keys: Option<PushKeys>,
+}
+
+async fn push_key(State(_app): State<Shared>) -> Result<String, StatusCode> {
+    #[cfg(feature = "push")]
+    return Ok(_app.pusher.public_b64.clone());
+    #[cfg(not(feature = "push"))]
+    Err(StatusCode::NOT_FOUND)
+}
+
+/// Дозволені сервіси сповіщень (щоб сервер не можна було змусити слати запити куди завгодно).
+fn push_endpoint_ok(endpoint: &str) -> bool {
+    const HOSTS: &[&str] = &[
+        "fcm.googleapis.com", "updates.push.services.mozilla.com", "web.push.apple.com",
+        "wns2-par02p.notify.windows.com", "notify.windows.com",
+    ];
+    let Some(rest) = endpoint.strip_prefix("https://") else { return false };
+    let host = rest.split(['/', ':']).next().unwrap_or("");
+    HOSTS.iter().any(|h| host == *h || host.ends_with(&format!(".{h}")))
+}
+
+async fn put_push(State(app): State<Shared>, headers: HeaderMap, body: Bytes) -> StatusCode {
+    let r = (|| {
+        let who = authenticate(&app, &headers, "PUT /v0/push", &body)?;
+        let mailbox = MailboxId::for_identity(&hex::decode(&who).map_err(|_| StatusCode::BAD_REQUEST)?);
+        let sub: PushSubscription = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let keys = sub.keys.ok_or(StatusCode::BAD_REQUEST)?;
+        if !push_endpoint_ok(&sub.endpoint) || sub.endpoint.len() > 1024 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let s = db::PushSub { endpoint: sub.endpoint, p256dh: keys.p256dh, auth: keys.auth };
+        app.db.put_push(&mailbox, &s).map_err(internal)
+    })();
+    r.map(|_| StatusCode::NO_CONTENT).unwrap_or_else(|s| s)
+}
+
+async fn delete_push(State(app): State<Shared>, headers: HeaderMap, body: Bytes) -> StatusCode {
+    let r = (|| {
+        authenticate(&app, &headers, "DELETE /v0/push", &body)?;
+        let sub: PushSubscription = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+        app.db.delete_push(&sub.endpoint).map_err(internal)
+    })();
+    r.map(|_| StatusCode::NO_CONTENT).unwrap_or_else(|s| s)
+}
+
 #[derive(serde::Serialize)]
 struct TurnCredentials {
     urls: Vec<String>,
@@ -282,7 +385,24 @@ fn app(issuer: Issuer, db: db::Db, shutdown: tokio::sync::watch::Receiver<bool>)
     use tower_http::{services::{ServeDir, ServeFile}, set_header::SetResponseHeaderLayer};
     let turn = load_turn();
     println!("Ретранслятор дзвінків: {}", turn.as_ref().map(|t| t.urls.join(", ")).unwrap_or_else(|| "не налаштовано".into()));
-    let shared = Arc::new(App { db, nonces: Mutex::default(), bells: Mutex::default(), turn, shutdown, issuer });
+    #[cfg(feature = "push")]
+    let pusher = {
+        let p = push::Pusher::load(&data_dir());
+        println!("Сповіщення (Web Push): увімкнено");
+        Arc::new(p)
+    };
+    let shared = Arc::new(App {
+        db,
+        nonces: Mutex::default(),
+        bells: Mutex::default(),
+        turn,
+        shutdown,
+        #[cfg(feature = "push")]
+        pusher,
+        #[cfg(feature = "push")]
+        last_mail_push: Mutex::default(),
+        issuer,
+    });
     // Раз на годину прибирати недоставлені конверти старші за 30 днів.
     let pruner = shared.clone();
     tokio::spawn(async move {
@@ -306,6 +426,8 @@ fn app(issuer: Issuer, db: db::Db, shutdown: tokio::sync::watch::Receiver<bool>)
         .route("/v0/mailbox/{id}/ack", post(ack))
         .route("/v0/events", get(events))
         .route("/v0/turn", get(turn_credentials))
+        .route("/v0/push/key", get(push_key))
+        .route("/v0/push", put(put_push).delete(delete_push))
         .with_state(shared)
         .layer(SetResponseHeaderLayer::overriding(header::CACHE_CONTROL, HeaderValue::from_static("no-store")));
 

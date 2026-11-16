@@ -101,3 +101,4 @@ button.big { padding: 12px 18px; }
 .overlay.call { z-index: 30; }
 .call-card { text-align: center; justify-items: center; }
 .call-avatar { font-size: 48px; }
+.notify-cta { width: 100%; text-align: left; background: #2b2a14; border: 1px solid #6b5f1f; line-height: 1.35; }

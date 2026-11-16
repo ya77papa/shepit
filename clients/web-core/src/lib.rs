@@ -111,11 +111,14 @@ impl WebAccount {
     }
 
     /// Зашифрувати і запакувати в конверт. Повертає JSON для `POST /v0/send`.
+    /// `wake = "call"` — попросити сервер терміново розбудити отримувача (вхідний дзвінок).
     #[wasm_bindgen(js_name = sealEnvelope)]
-    pub fn seal_envelope(&mut self, peer: &str, text: &str) -> Result<String, JsError> {
+    pub fn seal_envelope(&mut self, peer: &str, text: &str, wake: Option<String>) -> Result<String, JsError> {
         let to = MailboxId::for_identity(&identity_bytes(peer)?);
         let payload = self.inner.encrypt(peer, text).map_err(js_err)?;
-        serde_json::to_string(&Envelope::new(to, &payload)).map_err(js_err)
+        let mut env = Envelope::new(to, &payload);
+        env.wake = wake.filter(|w| w == "call");
+        serde_json::to_string(&env).map_err(js_err)
     }
 
     /// Розшифрувати конверт (поле `envelope` елемента з `GET /v0/mailbox/{id}`).
