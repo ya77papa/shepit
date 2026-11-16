@@ -140,7 +140,7 @@ class CallActivity : ComponentActivity() {
                     ToggleAction(if (muted) Icons.Default.MicOff else Icons.Default.Mic, if (muted) "Мікрофон вимк." else "Мікрофон", muted) { calls.toggleMute() }
                     ToggleAction(if (speaker) Icons.AutoMirrored.Filled.VolumeUp else Icons.Default.PhoneInTalk, if (speaker) "Гучний" else "До вуха", speaker) { calls.toggleSpeaker() }
                 }
-                Spacer(Modifier.height(36.dp))
+                Spacer(Modifier.height(40.dp))
                 RoundAction(Icons.Default.CallEnd, if (state == State.OUTGOING) "Скасувати" else "Завершити", Red, 76.dp) { calls.hangup() }
             }
             Spacer(Modifier.height(24.dp))
@@ -178,8 +178,6 @@ private fun RoundAction(icon: ImageVector, label: String, color: Color, size: Dp
             Modifier.size(size).scale(s).clip(CircleShape).background(color).clickable(onClick = onClick),
             contentAlignment = Alignment.Center,
         ) { Icon(icon, label, tint = Color.White, modifier = Modifier.size(size * 0.45f)) }
-        Spacer(Modifier.height(8.dp))
-        Text(label, color = Color.White, fontSize = 14.sp)
     }
 }
 
@@ -193,7 +191,5 @@ private fun ToggleAction(icon: ImageVector, label: String, on: Boolean, onClick:
                 .clickable(onClick = onClick),
             contentAlignment = Alignment.Center,
         ) { Icon(icon, label, tint = if (on) Color(0xFF0B111A) else Color.White, modifier = Modifier.size(28.dp)) }
-        Spacer(Modifier.height(8.dp))
-        Text(label, color = Color.White.copy(alpha = 0.85f), fontSize = 13.sp)
     }
 }
