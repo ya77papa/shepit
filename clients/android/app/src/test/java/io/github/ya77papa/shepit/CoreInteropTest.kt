@@ -73,4 +73,37 @@ class CoreInteropTest {
         val a2 = Core.load(a.export())
         assertEquals(a.identity(), a2.identity())
     }
+
+    /** Потік подій так, як його відкриває застосунок (OkHttp), + облікові дані TURN. */
+    @Test
+    fun eventsStreamAndTurn() {
+        assumeTrue("SHEPIT_TEST_SERVER не задано", server != null)
+        val api = io.github.ya77papa.shepit.data.Api(server!!)
+        val root = api.get("/v0/trust-root").trim()
+        val a = account(root)
+        val b = account(root)
+        val turn = api.get("/v0/turn", b.authHeader("GET /v0/turn", ByteArray(0)))
+        println("TURN: " + turn.take(200))
+        val got = java.util.concurrent.CompletableFuture<String>()
+        val t = Thread {
+            runCatching {
+                val req = okhttp3.Request.Builder().url(api.url("/v0/events"))
+                    .header(io.github.ya77papa.shepit.data.Api.AUTH, b.authHeader("GET /v0/events", ByteArray(0))).build()
+                api.streaming.newCall(req).execute().use { r ->
+                    println("events: HTTP ${r.code} ${r.protocol}")
+                    val src = r.body.source()
+                    while (true) {
+                        val line = src.readUtf8Line() ?: break
+                        println("events line: [$line]")
+                        if (line.startsWith("data")) { got.complete(line); break }
+                    }
+                }
+            }.onFailure { got.completeExceptionally(it) }
+        }
+        t.isDaemon = true; t.start()
+        Thread.sleep(1500)
+        a.startSession(http("GET", "/v0/keys/${b.identity()}"))
+        http("POST", "/v0/send", a.sealEnvelope(b.identity(), """{"v":1,"t":"call","op":"offer","id":"x","at":1}""", "call").toByteArray())
+        assertEquals("data: mail", got.get(15, java.util.concurrent.TimeUnit.SECONDS))
+    }
 }

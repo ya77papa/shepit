@@ -6,7 +6,7 @@
 // - За замовчуванням — лише через ретранслятор (TURN): співрозмовник не бачить твою IP-адресу.
 
 import { encode, type Body } from './content';
-import type { Shepit } from './shepit';
+import { serverNow, type Shepit } from './shepit';
 
 export type CallState = 'idle' | 'outgoing' | 'incoming' | 'connecting' | 'active';
 export type CallLog = (peer: string, text: string) => Promise<void>;
@@ -105,7 +105,7 @@ export class CallManager {
 
   private async hangupWithError(text: string) {
     const peer = this.peer;
-    await this.signal(peer, { t: 'call', op: 'end', id: this.id, at: Date.now() }).catch(() => {});
+    await this.signal(peer, { t: 'call', op: 'end', id: this.id, at: serverNow() }).catch(() => {});
     this.finish(text, true);
   }
 
@@ -214,7 +214,7 @@ export class CallManager {
       const sdp = await this.gathered(pc);
       this.localTypes = candidateTypes(sdp);
       if (this.state !== 'outgoing') return; // скасували, поки збирали кандидатів
-      await this.signal(peer, { t: 'call', op: 'offer', id: this.id, at: Date.now(), sdp });
+      await this.signal(peer, { t: 'call', op: 'offer', id: this.id, at: serverNow(), sdp });
       this.ringTimer = setTimeout(() => this.hangup('Без відповіді'), RING_MS);
     } catch (e) {
       this.finish(e instanceof DOMException && e.name === 'NotAllowedError' ? 'Немає доступу до мікрофона' : String(e), true);
@@ -224,12 +224,12 @@ export class CallManager {
   /** Обробити службове повідомлення дзвінка від `from`. */
   async onSignal(from: string, b: Extract<Body, { t: 'call' }>) {
     if (b.op === 'offer') {
-      if (Date.now() - b.at > OFFER_MAX_AGE_MS) {
+      if (serverNow() - b.at > OFFER_MAX_AGE_MS) {
         await this.log(from, '📞 Пропущений дзвінок');
         return;
       }
       if (this.state !== 'idle') {
-        if (b.id !== this.id) await this.signal(from, { t: 'call', op: 'busy', id: b.id, at: Date.now() });
+        if (b.id !== this.id) await this.signal(from, { t: 'call', op: 'busy', id: b.id, at: serverNow() });
         return;
       }
       this.state = 'incoming';
@@ -268,9 +268,9 @@ export class CallManager {
       const sdp = await this.gathered(pc);
       this.localTypes = candidateTypes(sdp);
       this.watchConnect();
-      await this.signal(this.peer, { t: 'call', op: 'answer', id: this.id, at: Date.now(), sdp });
+      await this.signal(this.peer, { t: 'call', op: 'answer', id: this.id, at: serverNow(), sdp });
     } catch (e) {
-      await this.signal(this.peer, { t: 'call', op: 'end', id: this.id, at: Date.now() }).catch(() => {});
+      await this.signal(this.peer, { t: 'call', op: 'end', id: this.id, at: serverNow() }).catch(() => {});
       this.finish(e instanceof DOMException && e.name === 'NotAllowedError' ? 'Немає доступу до мікрофона' : String(e), true);
     }
   }
@@ -278,14 +278,14 @@ export class CallManager {
   async reject() {
     if (this.state !== 'incoming') return;
     const peer = this.peer;
-    await this.signal(peer, { t: 'call', op: 'reject', id: this.id, at: Date.now() }).catch(() => {});
+    await this.signal(peer, { t: 'call', op: 'reject', id: this.id, at: serverNow() }).catch(() => {});
     this.finish('📞 Ти відхилив(-ла) дзвінок');
   }
 
   async hangup(reason?: string) {
     if (this.state === 'idle') return;
     const peer = this.peer;
-    await this.signal(peer, { t: 'call', op: 'end', id: this.id, at: Date.now() }).catch(() => {});
+    await this.signal(peer, { t: 'call', op: 'end', id: this.id, at: serverNow() }).catch(() => {});
     this.finish(reason ? `📞 ${reason}` : this.summary());
   }
 

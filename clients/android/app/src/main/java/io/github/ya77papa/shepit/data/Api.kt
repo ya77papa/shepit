@@ -23,10 +23,26 @@ class Api(private val base: String = BuildConfig.SERVER) {
 
     private val json = "application/json".toMediaType()
 
+    /**
+     * Різниця між годинником сервера і телефона (мс). Позначки часу дзвінків рахуємо за
+     * годинником сервера, щоб розбіжність годинників телефона й комп'ютера не ламала дзвінки.
+     */
+    @Volatile var clockOffset = 0L
+        private set
+
+    fun now() = System.currentTimeMillis() + clockOffset
+
+    fun noteDate(r: Response) {
+        val d = r.headers.getDate("Date") ?: return
+        // Date має точність до секунди: беремо середину секунди.
+        clockOffset = d.time + 500 - System.currentTimeMillis()
+    }
+
     fun url(path: String) = base + path
 
     private fun exec(req: Request): Response {
         val r = client.newCall(req).execute()
+        noteDate(r)
         if (!r.isSuccessful) {
             val code = r.code
             r.close()

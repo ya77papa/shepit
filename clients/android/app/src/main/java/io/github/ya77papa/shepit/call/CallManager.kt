@@ -53,6 +53,24 @@ class CallManager(private val ctx: Context, private val repo: Repo) {
     val relayed = MutableStateFlow(true)
     val error = MutableStateFlow("")
 
+    /** Журнал останнього дзвінка: що відбувалось і коли (для діагностики, без вмісту розмови). */
+    val log = MutableStateFlow<List<String>>(emptyList())
+    private var t0 = 0L
+    private val fmt = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.ROOT)
+
+    fun trace(msg: String) {
+        val now = System.currentTimeMillis()
+        if (t0 == 0L) t0 = now
+        log.value = (log.value + "${fmt.format(java.util.Date(now))} +${now - t0}мс  $msg").takeLast(80)
+        android.util.Log.i("ShepitCall", msg)
+    }
+
+    private fun newTrace(msg: String) {
+        t0 = 0L
+        log.value = emptyList()
+        trace(msg)
+    }
+
     private val scope = repo.scope
     private var id = ""
     private var outgoing = false
@@ -80,13 +98,24 @@ class CallManager(private val ctx: Context, private val repo: Repo) {
     }
 
     init {
-        scope.launch { repo.callSignals.collect { (from, b) -> runCatching { onSignal(from, b) } } }
+        scope.launch {
+            repo.callSignals.collect { (from, b) ->
+                runCatching { onSignal(from, b) }.onFailure { trace("✗ обробка ${b.op}: ${it.javaClass.simpleName}: ${it.message}") }
+            }
+        }
     }
 
     private fun newId(): String = ByteArray(8).also { SecureRandom().nextBytes(it) }.joinToString("") { "%02x".format(it) }
 
     private suspend fun signal(to: String, op: String, sdp: String? = null) {
-        repo.send(to, Body.Call(op, id, System.currentTimeMillis(), sdp), if (op == "offer") "call" else null)
+        trace("→ надсилаю $op")
+        try {
+            repo.send(to, Body.Call(op, id, repo.api.now(), sdp), if (op == "offer") "call" else null)
+            trace("→ $op надіслано")
+        } catch (e: Exception) {
+            trace("✗ $op не надіслано: ${e.message}")
+            throw e
+        }
     }
 
     // ---------- WebRTC ----------
@@ -95,7 +124,8 @@ class CallManager(private val ctx: Context, private val repo: Repo) {
         Regex(" typ (\\w+)").findAll(sdp).map { it.groupValues[1] }.toSet().joinToString(", ").ifEmpty { "жодного" }
 
     private fun makePc(): PeerConnection {
-        val turn = runCatching { repo.turn() }.getOrNull()
+        val turn = runCatching { repo.turn() }.onFailure { trace("✗ TURN: ${it.message}") }.getOrNull()
+        trace(if (turn != null) "TURN: ${turn.urls.joinToString()}" else "TURN немає — пряме з'єднання")
         relayed.value = turn != null
         val servers = turn?.let {
             listOf(PeerConnection.IceServer.builder(it.urls).setUsername(it.username).setPassword(it.credential).createIceServer())
@@ -108,9 +138,11 @@ class CallManager(private val ctx: Context, private val repo: Repo) {
         gathered = CompletableDeferred()
         val p = factory.createPeerConnection(cfg, object : PeerConnection.Observer {
             override fun onIceGatheringChange(s: PeerConnection.IceGatheringState) {
+                trace("збір кандидатів: $s")
                 if (s == PeerConnection.IceGatheringState.COMPLETE) gathered?.complete(Unit)
             }
             override fun onConnectionChange(s: PeerConnection.PeerConnectionState) {
+                trace("з'єднання: $s")
                 when (s) {
                     PeerConnection.PeerConnectionState.CONNECTED -> if (state.value != State.ACTIVE) {
                         state.value = State.ACTIVE
@@ -123,8 +155,8 @@ class CallManager(private val ctx: Context, private val repo: Repo) {
                     else -> {}
                 }
             }
-            override fun onSignalingChange(s: PeerConnection.SignalingState) {}
-            override fun onIceConnectionChange(s: PeerConnection.IceConnectionState) {}
+            override fun onSignalingChange(s: PeerConnection.SignalingState) { trace("сигналізація: $s") }
+            override fun onIceConnectionChange(s: PeerConnection.IceConnectionState) { trace("ICE: $s") }
             override fun onIceConnectionReceivingChange(b: Boolean) {}
             override fun onIceCandidate(c: IceCandidate) {}
             override fun onIceCandidatesRemoved(c: Array<out IceCandidate>) {}
@@ -164,15 +196,17 @@ class CallManager(private val ctx: Context, private val repo: Repo) {
 
     /** Без trickle: дочекатися всіх кандидатів (до 5 с) і віддати повний SDP. */
     private suspend fun gatheredSdp(p: PeerConnection): String {
-        withTimeoutOrNull(5000) { gathered?.await() }
-        return p.localDescription.description
+        if (withTimeoutOrNull(5000) { gathered?.await() } == null) trace("збір кандидатів: 5 с минуло, беру що є")
+        val sdp = p.localDescription.description
+        trace("мої кандидати: ${candidateTypes(sdp)}")
+        return sdp
     }
 
     private fun watchConnect() {
         connectJob?.cancel()
         connectJob = scope.launch {
             delay(25_000)
-            if (state.value != State.ACTIVE) hangupWithError(diagnose())
+            if (state.value != State.ACTIVE) { trace("25 с без з'єднання"); hangupWithError(diagnose()) }
         }
     }
 
@@ -182,6 +216,44 @@ class CallManager(private val ctx: Context, private val repo: Repo) {
         else -> "Не вдалося з'єднатися"
     }
 
+    /** Перевірка ретранслятора: чи видає він кандидата relay для цього телефона. */
+    suspend fun checkRelay(): String = kotlinx.coroutines.withContext(Dispatchers.IO) {
+        val turn = runCatching { repo.turn() }.getOrElse { return@withContext "✗ Не вдалося отримати дані ретранслятора: ${it.message}" }
+            ?: return@withContext "✗ Ретранслятор на сервері не налаштований"
+        turn.urls.map { url ->
+            val done = CompletableDeferred<Unit>()
+            val cfg = PeerConnection.RTCConfiguration(listOf(PeerConnection.IceServer.builder(url).setUsername(turn.username).setPassword(turn.credential).createIceServer())).apply {
+                iceTransportsType = PeerConnection.IceTransportsType.RELAY
+                sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+            }
+            val p = factory.createPeerConnection(cfg, object : PeerConnection.Observer {
+                override fun onIceGatheringChange(s: PeerConnection.IceGatheringState) { if (s == PeerConnection.IceGatheringState.COMPLETE) done.complete(Unit) }
+                override fun onSignalingChange(s: PeerConnection.SignalingState) {}
+                override fun onIceConnectionChange(s: PeerConnection.IceConnectionState) {}
+                override fun onIceConnectionReceivingChange(b: Boolean) {}
+                override fun onIceCandidate(c: IceCandidate) {}
+                override fun onIceCandidatesRemoved(c: Array<out IceCandidate>) {}
+                override fun onAddStream(s: MediaStream) {}
+                override fun onRemoveStream(s: MediaStream) {}
+                override fun onDataChannel(d: org.webrtc.DataChannel) {}
+                override fun onRenegotiationNeeded() {}
+                override fun onAddTrack(r: RtpReceiver, s: Array<out MediaStream>) {}
+            }) ?: return@map "✗ $url: не вдалося створити з'єднання"
+            try {
+                p.addTransceiver(org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO, org.webrtc.RtpTransceiver.RtpTransceiverInit(org.webrtc.RtpTransceiver.RtpTransceiverDirection.RECV_ONLY))
+                val o = p.sdp(offer = true)
+                p.set(local = true, d = o)
+                withTimeoutOrNull(8000) { done.await() }
+                val types = candidateTypes(p.localDescription.description)
+                if ("relay" in types) "✓ $url" else "✗ $url — немає відповіді"
+            } catch (e: Exception) {
+                "✗ $url: ${e.message}"
+            } finally {
+                runCatching { p.close(); p.dispose() }
+            }
+        }.joinToString("\n")
+    }
+
     // ---------- керування ----------
 
     fun start(to: String) {
@@ -189,6 +261,7 @@ class CallManager(private val ctx: Context, private val repo: Repo) {
         error.value = ""
         state.value = State.OUTGOING
         peer.value = to
+        newTrace("вихідний дзвінок")
         ShepitService.mic(ctx, true)
         id = newId()
         outgoing = true
@@ -204,19 +277,22 @@ class CallManager(private val ctx: Context, private val repo: Repo) {
                 startRingback()
                 ringJob = scope.launch { delay(45_000); if (state.value == State.OUTGOING) hangup("Без відповіді") }
             } catch (e: Exception) {
+                trace("✗ ${e.javaClass.simpleName}: ${e.message}")
                 finish("📞 ${e.message ?: "Помилка дзвінка"}", isError = true)
             }
         }
     }
 
     private suspend fun onSignal(from: String, b: Body.Call) {
+        if (b.op == "offer" && state.value == State.IDLE) newTrace("вхідний offer")
+        trace("← ${b.op} (вік ${repo.api.now() - b.at} мс)")
         if (b.op == "offer") {
-            if (System.currentTimeMillis() - b.at > 60_000) {
+            if (repo.api.now() - b.at > 60_000) {
                 repo.log(from, "📞 Пропущений дзвінок")
                 return
             }
             if (state.value != State.IDLE) {
-                if (b.id != id) repo.send(from, Body.Call("busy", b.id, System.currentTimeMillis()))
+                if (b.id != id) repo.send(from, Body.Call("busy", b.id, repo.api.now()))
                 return
             }
             state.value = State.INCOMING
@@ -225,11 +301,16 @@ class CallManager(private val ctx: Context, private val repo: Repo) {
             outgoing = false
             pendingOffer = b.sdp
             startRinging()
-            Notifications.showIncomingCall(ctx, repo.nameOf(from))
+            runCatching { Notifications.showIncomingCall(ctx, repo.nameOf(from)) }.onFailure { trace("✗ сповіщення: ${it.message}") }
+            // Застосунок відкритий — одразу показати екран дзвінка (повноекранне сповіщення
+            // спрацьовує лише на заблокованому/вимкненому екрані).
+            if (io.github.ya77papa.shepit.ui.MainActivity.visible) runCatching {
+                ctx.startActivity(android.content.Intent(ctx, io.github.ya77papa.shepit.ui.CallActivity::class.java).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+            }
             ringJob = scope.launch { delay(45_000); if (state.value == State.INCOMING) finish("📞 Пропущений дзвінок") }
             return
         }
-        if (from != peer.value || b.id != id) return
+        if (from != peer.value || b.id != id) { trace("пропускаю: чужий або старий дзвінок"); return }
         when (b.op) {
             "answer" -> if (state.value == State.OUTGOING && b.sdp != null) {
                 ringJob?.cancel()
@@ -237,7 +318,13 @@ class CallManager(private val ctx: Context, private val repo: Repo) {
                 state.value = State.CONNECTING
                 remoteTypes = candidateTypes(b.sdp)
                 watchConnect()
-                pc?.set(local = false, d = SessionDescription(SessionDescription.Type.ANSWER, b.sdp))
+                try {
+                    pc?.set(local = false, d = SessionDescription(SessionDescription.Type.ANSWER, b.sdp))
+                    trace("відповідь прийнято, кандидати співрозмовника: $remoteTypes")
+                } catch (e: Exception) {
+                    trace("✗ відповідь не прийнято: ${e.message}")
+                    hangupWithError("Помилка з'єднання: ${e.message}")
+                }
             }
             "reject" -> finish("📞 Дзвінок відхилено")
             "busy" -> finish("📞 Співрозмовник зайнятий")
@@ -252,11 +339,13 @@ class CallManager(private val ctx: Context, private val repo: Repo) {
         stopRinging()
         Notifications.cancelIncomingCall(ctx)
         state.value = State.CONNECTING
+        trace("приймаю дзвінок")
         ShepitService.mic(ctx, true)
         scope.launch(Dispatchers.IO) {
             try {
                 val p = makePc()
                 remoteTypes = candidateTypes(offer)
+                trace("кандидати співрозмовника: $remoteTypes")
                 p.set(local = false, d = SessionDescription(SessionDescription.Type.OFFER, offer))
                 val answer = p.sdp(offer = false)
                 p.set(local = true, d = answer)
@@ -265,6 +354,7 @@ class CallManager(private val ctx: Context, private val repo: Repo) {
                 watchConnect()
                 signal(peer.value, "answer", sdp)
             } catch (e: Exception) {
+                trace("✗ ${e.javaClass.simpleName}: ${e.message}")
                 runCatching { signal(peer.value, "end") }
                 finish("📞 ${e.message ?: "Помилка дзвінка"}", isError = true)
             }
@@ -318,6 +408,7 @@ class CallManager(private val ctx: Context, private val repo: Repo) {
     @Synchronized
     private fun finish(text: String, isError: Boolean = false) {
         if (state.value == State.IDLE) return
+        trace("кінець: $text")
         val who = peer.value
         ringJob?.cancel()
         connectJob?.cancel()

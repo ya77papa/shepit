@@ -476,6 +476,24 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
                 if (!battery) OutlinedButton(onClick = { act.askBattery() }) { Text("🔋 Дозволити працювати у фоні") } else Text("✅ Фонова робота дозволена")
                 if (!Notifications.canFullScreen(ctx)) OutlinedButton(onClick = { act.askFullScreen() }) { Text("📞 Дозволити дзвінки на весь екран") } else Text("✅ Дзвінки на весь екран дозволені")
             }
+            Section("Дзвінки: діагностика") {
+                var check by remember { mutableStateOf("") }
+                var checking by remember { mutableStateOf(false) }
+                val callLog by app.calls.log.collectAsState()
+                OutlinedButton(enabled = !checking, onClick = {
+                    checking = true; check = ""
+                    scope.launch { check = app.calls.checkRelay(); checking = false }
+                }) { Text(if (checking) "Перевіряю…" else "Перевірити ретранслятор") }
+                if (check.isNotEmpty()) Text(check, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                if (callLog.isNotEmpty()) {
+                    Text("Журнал останнього дзвінка (без вмісту розмови):", color = Muted, fontSize = 13.sp)
+                    Text(callLog.joinToString("\n"), fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                    OutlinedButton(onClick = {
+                        ctx.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Шепіт: журнал дзвінка", "Шепіт ${BuildConfig.VERSION_NAME}\n" + callLog.joinToString("\n")))
+                        toast("Журнал скопійовано")
+                    }) { Text("Копіювати журнал") }
+                }
+            }
             Section("Резервна копія") {
                 Text("Файл з ключами, контактами й історією, зашифрований паролем. Сумісний з веб-версією.", color = Muted, fontSize = 13.sp)
                 OutlinedTextField(pw1, { pw1 = it }, label = { Text("Пароль (щонайменше ${Backup.MIN_PASSWORD} символів)") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())

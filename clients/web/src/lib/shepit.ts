@@ -5,6 +5,17 @@ import { kv } from './db';
 export { fingerprintOf, isValidIdentity };
 
 const API = ''; // той самий домен, що й веб-клієнт
+
+/**
+ * Різниця між годинником сервера і цього пристрою (мс). Позначки часу дзвінків рахуємо
+ * за годинником сервера, щоб розбіжність годинників телефона й комп'ютера не ламала дзвінки.
+ */
+let clockOffset = 0;
+export function noteDate(r: Response) {
+  const d = Date.parse(r.headers.get('date') ?? '');
+  if (!Number.isNaN(d)) clockOffset = d + 500 - Date.now();
+}
+export const serverNow = () => Date.now() + clockOffset;
 const AUTH = 'x-shepit-auth';
 const MIN_ONE_TIME = 5;
 
@@ -22,6 +33,7 @@ function serial<T>(f: () => Promise<T>): Promise<T> {
 
 async function http(method: string, path: string, init: RequestInit = {}): Promise<Response> {
   const r = await fetch(API + path, { method, cache: 'no-store', ...init });
+  noteDate(r);
   if (r.status === 401) throw new Error('Сервер відхилив підпис — перевір час на пристрої');
   if (!r.ok) throw new Error(`${method} ${path}: ${r.status}`);
   return r;

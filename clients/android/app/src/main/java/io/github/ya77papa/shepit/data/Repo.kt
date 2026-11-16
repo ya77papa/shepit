@@ -257,6 +257,7 @@ class Repo(context: Context) {
                     .header(Api.AUTH, c.authHeader("GET /v0/events", ByteArray(0))).build()
                 api.streaming.newCall(req).execute().use { r ->
                     if (!r.isSuccessful) throw HttpException(r.code, "events ${r.code}")
+                    api.noteDate(r)
                     connected.value = true
                     delayMs = 1000
                     val src = r.body.source()
