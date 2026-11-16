@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { renderSVG } from 'uqr';
-  import { Shepit, announceAccountChange, fingerprintOf, isValidIdentity, loadWasm, onAccountChangedElsewhere } from './lib/shepit';
+  import { Shepit, announceAccountChange, fingerprintOf, isValidIdentity, loadWasm, normalizeInviteCode, onAccountChangedElsewhere, registrationMode, type RegistrationMode } from './lib/shepit';
   import { contacts as contactsDb, kv, messages as messagesDb, wipe, type Contact, type Message } from './lib/db';
   import { exportBackup, importBackup, MIN_PASSWORD } from './lib/backup';
   import { COMMIT, REPO, SHORT, commitUrl, compareUrl, registerServiceWorker } from './lib/pwa';
@@ -17,7 +17,7 @@
   const helloText = (name: string) => `👋 ${name || 'Новий контакт'} приєднується за запрошенням`;
   const KEYS_CHECK_MS = 10 * 60 * 1000;
 
-  type Invite = { key: string; name: string; fingerprint: string };
+  type Invite = { key: string; name: string; fingerprint: string; code?: string };
 
   let me: Shepit | null = $state(null);
   let myName = $state('');
@@ -33,6 +33,9 @@
   let unread: Record<string, number> = $state({});
 
   let invite: Invite | null = $state(null); // прийшли за посиланням-запрошенням
+  let regMode: RegistrationMode = $state('open');
+  let inviteCode = $state(''); // код запрошення для реєстрації (з посилання #i=… або введений)
+  let myInvite: { code: string | null; mode: RegistrationMode; left: number } | null = $state(null);
   let panel: '' | 'invite' | 'backup' | 'add' | 'restore' | 'calltest' | 'settings' = $state('');
   let relayResults: RelayCheck[] | null = $state(null);
   let pushState: 'unsupported' | 'off' | 'on' | 'denied' | 'busy' = $state('unsupported');
@@ -62,9 +65,16 @@
 
   const short = (fp: string) => fp.split(' ').slice(0, 2).join(' ');
   const inviteUrl = $derived(
-    me ? `${location.origin}/#add=${me.identity}${myName ? `&name=${encodeURIComponent(myName)}` : ''}` : '',
+    me
+      ? `${location.origin}/#add=${me.identity}${myName ? `&name=${encodeURIComponent(myName)}` : ''}${myInvite?.code ? `&i=${myInvite.code}` : ''}`
+      : '',
   );
   const qr = $derived(inviteUrl ? renderSVG(inviteUrl, { ecc: 'M', border: 2 }) : '');
+
+  // Відкрили «Запросити друга» — дізнатись, чи потрібен код (сервер «за запрошенням»).
+  $effect(() => {
+    if (panel === 'invite' && me) me.myInvite().then((v) => (myInvite = v)).catch(() => (myInvite = null));
+  });
 
   $effect(() => {
     if (calls.error) {
@@ -80,14 +90,19 @@
   function readInviteFromUrl(): Invite | null {
     const p = new URLSearchParams(location.hash.slice(1));
     const key = (p.get('add') ?? '').toLowerCase();
-    if (!key) return null;
+    const code = normalizeInviteCode(p.get('i') ?? '') ?? undefined;
+    if (code) inviteCode = code;
+    if (!key) {
+      if (code) history.replaceState(null, '', location.pathname);
+      return null;
+    }
     history.replaceState(null, '', location.pathname); // прибрати з адресного рядка
     if (!isValidIdentity(key)) {
       error = 'Посилання-запрошення пошкоджене';
       return null;
     }
     const fp = fingerprintOf(key);
-    return { key, name: (p.get('name') ?? '').trim().slice(0, 60) || `Контакт ${short(fp)}`, fingerprint: fp };
+    return { key, name: (p.get('name') ?? '').trim().slice(0, 60) || `Контакт ${short(fp)}`, fingerprint: fp, code };
   }
 
   async function refreshContacts() {
@@ -137,8 +152,10 @@
     busy = true;
     error = '';
     try {
+      const code = normalizeInviteCode(inviteCode);
+      if (regMode === 'invite' && !code) throw new Error(inviteCode.trim() ? 'Код запрошення має вигляд XXXX-XXXX-XXXX' : 'Потрібен код запрошення');
       await kv.set('myName', myName.trim());
-      me = await Shepit.register();
+      me = await Shepit.register(code);
       me.listen(poll, (ok) => (streamOk = ok));
       refreshPush().catch(() => {});
       if (invite) await acceptInvite();
@@ -425,6 +442,7 @@
         await loadWasm();
         invite = readInviteFromUrl();
         me = await Shepit.restore();
+        if (!me) regMode = await registrationMode();
         myName = (await kv.get<string>('myName')) ?? '';
         await refreshContacts();
         if (me) await me.ensureKeys();
@@ -483,9 +501,20 @@
         <p class="invite-banner"><b>{invite.name}</b> запрошує тебе поспілкуватися в Шепоті.</p>
       {/if}
       <p>Месенджер без номера телефону. Твоя «адреса» — криптографічний ключ, який створюється прямо тут, у браузері.</p>
-      {#if panel !== 'restore'}
+      {#if panel !== 'restore' && regMode === 'closed'}
+        <p class="warn">Реєстрацію нових користувачів на цьому сервері зараз закрито.</p>
+        <button class="ghost" onclick={() => { panel = 'restore'; error = ''; }}>У мене вже є акаунт — відновити з резервної копії</button>
+      {:else if panel !== 'restore'}
         <input placeholder="Як тебе називати (необов'язково)" bind:value={myName} maxlength="60" />
         <p class="muted small left">Ім'я бачать лише ті, кому ти надішлеш запрошення. Сервер його не знає.</p>
+        {#if regMode === 'invite'}
+          {#if invite?.code || (inviteCode && normalizeInviteCode(inviteCode))}
+            <p class="muted small left">🎟 Код запрошення: <span class="mono">{normalizeInviteCode(inviteCode)}</span></p>
+          {:else}
+            <input placeholder="Код запрошення: XXXX-XXXX-XXXX" bind:value={inviteCode} maxlength="20" autocomplete="off" class="mono" />
+            <p class="muted small left">Реєстрація на цьому сервері — лише за запрошенням. Код є в посиланні, яке тобі надіслали.</p>
+          {/if}
+        {/if}
         <button class="primary" onclick={register} disabled={busy}>{busy ? 'Створюю ключі…' : invite ? 'Створити акаунт і відповісти' : 'Створити акаунт'}</button>
         <button class="ghost" onclick={() => { panel = 'restore'; error = ''; }}>У мене вже є акаунт — відновити з резервної копії</button>
       {:else}
@@ -626,6 +655,15 @@
         {#if panel === 'invite'}
           <h2>Запросити друга</h2>
           {#if !myName}<p class="warn small">Підказка: вкажи своє ім'я зліва — тоді друг побачить, від кого запрошення.</p>{/if}
+          {#if myInvite?.mode === 'invite'}
+            {#if myInvite.code}
+              <p class="muted small">🎟 Реєстрація на сервері — за запрошенням. Посилання містить твій одноразовий код (діє 30 днів){myInvite.left ? `; ще можна створити ${myInvite.left}` : ''}.</p>
+            {:else}
+              <p class="warn small">Реєстрація на сервері — за запрошенням, а твої запрошення закінчились. Друг, який уже має Шепіт, може додати тебе за цим посиланням; новому користувачеві потрібен код від адміністратора.</p>
+            {/if}
+          {:else if myInvite?.mode === 'closed'}
+            <p class="warn small">Реєстрацію нових користувачів на сервері закрито — посилання спрацює лише для тих, хто вже має Шепіт.</p>
+          {/if}
           <div class="qr">{@html qr}</div>
           <p class="muted small">Друг сканує QR камерою телефона або відкриває посилання:</p>
           <div class="linkbox mono">{inviteUrl}</div>

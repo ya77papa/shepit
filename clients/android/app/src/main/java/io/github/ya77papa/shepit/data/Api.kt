@@ -45,8 +45,16 @@ class Api(private val base: String = BuildConfig.SERVER) {
         noteDate(r)
         if (!r.isSuccessful) {
             val code = r.code
+            val why = if (code == 403) runCatching { r.body.string().trim() }.getOrDefault("") else ""
             r.close()
-            throw HttpException(code, if (code == 401) "Сервер відхилив підпис — перевір час на телефоні" else "${req.method} ${req.url.encodedPath}: $code")
+            throw HttpException(
+                code,
+                when {
+                    code == 401 -> "Сервер відхилив підпис — перевір час на телефоні"
+                    REFUSALS.containsKey(why) -> REFUSALS.getValue(why)
+                    else -> "${req.method} ${req.url.encodedPath}: $code"
+                },
+            )
         }
         return r
     }
@@ -61,14 +69,35 @@ class Api(private val base: String = BuildConfig.SERVER) {
         if (e.code == 404) null else throw e
     }
 
-    fun send(method: String, path: String, body: ByteArray, auth: String? = null) {
+    fun send(method: String, path: String, body: ByteArray, auth: String? = null, extra: Map<String, String> = emptyMap()) {
         exec(
             Request.Builder().url(url(path)).method(method, body.toRequestBody(json))
-                .apply { if (auth != null) header(AUTH, auth) }.build(),
+                .apply { if (auth != null) header(AUTH, auth); extra.forEach { (k, v) -> header(k, v) } }.build(),
         ).close()
     }
 
+    /** POST з відповіддю. */
+    fun post(path: String, body: ByteArray, auth: String? = null): String =
+        exec(Request.Builder().url(url(path)).post(body.toRequestBody(json)).apply { if (auth != null) header(AUTH, auth) }.build())
+            .use { it.body.string() }
+
     companion object {
         const val AUTH = "x-shepit-auth"
+        const val INVITE = "x-shepit-invite"
+
+        /** Пояснення відмов сервера при реєстрації. */
+        val REFUSALS = mapOf(
+            "registration-closed" to "Реєстрацію нових користувачів на цьому сервері зараз закрито.",
+            "invite-required" to "На цьому сервері реєстрація лише за запрошенням. Попроси посилання в того, хто вже користується Шепотом, або введи код запрошення.",
+            "invite-invalid" to "Код запрошення недійсний: можливо, його вже використано, відкликано або минув термін дії.",
+        )
+
+        private val CODE_ALPHABET = Regex("^[ABCDEFGHJKMNPQRSTUVWXYZ2-9]{12}$")
+
+        /** Код запрошення у вигляді XXXX-XXXX-XXXX (або null). */
+        fun normalizeInviteCode(input: String?): String? {
+            val raw = input.orEmpty().uppercase().filter { it in 'A'..'Z' || it in '0'..'9' }
+            return if (CODE_ALPHABET.matches(raw)) "${raw.take(4)}-${raw.substring(4, 8)}-${raw.substring(8)}" else null
+        }
     }
 }

@@ -53,7 +53,7 @@ import java.util.Locale
 private enum class Screen { CONTACTS, CHAT, SETTINGS }
 
 @Composable
-fun AppUi(app: ShepitApp, act: MainActivity, pendingInvite: MutableState<Pair<String, String?>?>, openRequest: MutableState<String?>) {
+fun AppUi(app: ShepitApp, act: MainActivity, pendingInvite: MutableState<Pair<String, String?>?>, openRequest: MutableState<String?>, inviteCode: MutableState<String?>) {
     val repo = app.repo
     var hasAccount by remember { mutableStateOf(repo.hasAccount()) }
     var loaded by remember { mutableStateOf(false) }
@@ -68,7 +68,7 @@ fun AppUi(app: ShepitApp, act: MainActivity, pendingInvite: MutableState<Pair<St
     Scaffold(snackbarHost = { SnackbarHost(snack) }, containerColor = MaterialTheme.colorScheme.background) { pad ->
         Box(Modifier.padding(pad).fillMaxSize()) {
             if (!hasAccount) {
-                Welcome(app, pendingInvite.value, onDone = { hasAccount = true }, onError = { scope.launch { snack.showSnackbar(it) } })
+                Welcome(app, pendingInvite.value, inviteCode.value, onDone = { hasAccount = true }, onError = { scope.launch { snack.showSnackbar(it) } })
             } else if (loaded) {
                 Main(app, act, pendingInvite, openRequest, onLogout = { hasAccount = false; loaded = false }, toast = { scope.launch { snack.showSnackbar(it) } })
             }
@@ -79,13 +79,16 @@ fun AppUi(app: ShepitApp, act: MainActivity, pendingInvite: MutableState<Pair<St
 // ---------------- вітання ----------------
 
 @Composable
-private fun Welcome(app: ShepitApp, invite: Pair<String, String?>?, onDone: () -> Unit, onError: (String) -> Unit) {
+private fun Welcome(app: ShepitApp, invite: Pair<String, String?>?, linkCode: String?, onDone: () -> Unit, onError: (String) -> Unit) {
     val repo = app.repo
     val scope = rememberCoroutineScope()
     var name by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var restoreData by remember { mutableStateOf<ByteArray?>(null) }
     var password by remember { mutableStateOf("") }
+    var mode by remember { mutableStateOf("open") }
+    var code by remember(linkCode) { mutableStateOf(linkCode ?: "") }
+    LaunchedEffect(Unit) { mode = repo.registrationMode() }
     val ctx = LocalContext.current
     val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) restoreData = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
@@ -104,15 +107,34 @@ private fun Welcome(app: ShepitApp, invite: Pair<String, String?>?, onDone: () -
         }
         Text("Месенджер без номера телефону. Твоя «адреса» — криптографічний ключ, який створюється прямо на цьому телефоні.", color = Muted)
         Spacer(Modifier.height(20.dp))
-        if (restoreData == null) {
+        if (restoreData == null && mode == "closed") {
+            Surface(color = Color(0xFF2B2A14), shape = RoundedCornerShape(10.dp)) {
+                Text("Реєстрацію нових користувачів на цьому сервері зараз закрито.", Modifier.padding(12.dp))
+            }
+            TextButton(onClick = { pick.launch(arrayOf("*/*")) }) { Text("У мене вже є акаунт — відновити з резервної копії") }
+        } else if (restoreData == null) {
             OutlinedTextField(name, { name = it.take(60) }, label = { Text("Як тебе називати (необов'язково)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             Text("Ім'я бачать лише ті, кого ти запросиш. Сервер його не знає.", color = Muted, fontSize = 12.sp)
+            if (mode == "invite") {
+                Spacer(Modifier.height(12.dp))
+                if (linkCode != null) {
+                    Text("🎟 Код запрошення: $linkCode", fontFamily = FontFamily.Monospace)
+                } else {
+                    OutlinedTextField(code, { code = it.take(20) }, label = { Text("Код запрошення: XXXX-XXXX-XXXX") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    Text("Реєстрація на цьому сервері — лише за запрошенням. Код є в посиланні, яке тобі надіслали.", color = Muted, fontSize = 12.sp)
+                }
+            }
             Spacer(Modifier.height(16.dp))
             Button(
                 onClick = {
+                    val c = io.github.ya77papa.shepit.data.Api.normalizeInviteCode(code)
+                    if (mode == "invite" && c == null) {
+                        onError(if (code.isBlank()) "Потрібен код запрошення" else "Код запрошення має вигляд XXXX-XXXX-XXXX")
+                        return@Button
+                    }
                     busy = true
                     scope.launch {
-                        runCatching { repo.register(name) }
+                        runCatching { repo.register(name, c) }
                             .onSuccess {
                                 if (invite != null) runCatching { repo.addContact(invite.first, invite.second); repo.sendHello(invite.first) }
                                 onDone()
@@ -255,7 +277,9 @@ private fun ContactsScreen(app: ShepitApp, contacts: List<Contact>, onOpen: (Con
 @Composable
 private fun InviteDialog(app: ShepitApp, onClose: () -> Unit) {
     val ctx = LocalContext.current
-    val url = remember { app.repo.inviteUrl() }
+    var mine by remember { mutableStateOf<io.github.ya77papa.shepit.data.Repo.MyInvite?>(null) }
+    LaunchedEffect(Unit) { mine = app.repo.myInvite() }
+    val url = remember(mine) { app.repo.inviteUrl(mine?.code) }
     val qr = remember(url) { qrBitmap(url) }
     AlertDialog(
         onDismissRequest = onClose,
@@ -265,6 +289,15 @@ private fun InviteDialog(app: ShepitApp, onClose: () -> Unit) {
                 Image(qr, "QR-код запрошення", Modifier.size(240.dp).clip(RoundedCornerShape(12.dp)).background(Color.White))
                 Spacer(Modifier.height(8.dp))
                 Text("Друг сканує QR камерою або відкриває посилання. Воно містить лише твій публічний ключ.", color = Muted, fontSize = 13.sp)
+                mine?.let { m ->
+                    val note = when {
+                        m.mode == "invite" && m.code != null -> "🎟 Реєстрація на сервері — за запрошенням. Посилання містить твій одноразовий код (діє 30 днів)" + if (m.left > 0) "; ще можна створити ${m.left}." else "."
+                        m.mode == "invite" -> "Твої запрошення закінчились. Друг, який уже має Шепіт, може додати тебе за цим посиланням; новому користувачеві потрібен код від адміністратора."
+                        m.mode == "closed" -> "Реєстрацію нових користувачів закрито — посилання спрацює лише для тих, хто вже має Шепіт."
+                        else -> null
+                    }
+                    if (note != null) { Spacer(Modifier.height(6.dp)); Text(note, fontSize = 13.sp, color = if (m.code == null) Color(0xFFE0B45A) else Muted) }
+                }
             }
         },
         confirmButton = {

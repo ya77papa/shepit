@@ -8,7 +8,8 @@
 const VERSION = __VERSION__;
 const FILES = __FILES__;
 const CACHE = `shepit-${VERSION}`;
-const NO_CACHE = ['/v0/', '/health', '/sw.js', '/version.json'];
+// Адмін-панель — окрема сторінка, завжди свіжа з мережі.
+const NO_CACHE = ['/v0/', '/health', '/sw.js', '/version.json', '/admin'];
 
 self.addEventListener('install', (e) => {
   // Без skipWaiting: нова версія не стає активною без згоди користувача.

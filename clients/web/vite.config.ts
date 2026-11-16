@@ -40,7 +40,7 @@ function shepitPwa(): Plugin {
       const version = `${COMMIT.slice(0, 12)}-${build.slice(0, 12)}`;
       const sw = readFileSync('sw.template.js', 'utf8')
         .replace('__VERSION__', JSON.stringify(version))
-        .replace('__FILES__', JSON.stringify(['/', ...files.filter((f) => f !== '/index.html'), '/index.html']));
+        .replace('__FILES__', JSON.stringify(['/', ...files.filter((f) => f !== '/index.html' && !f.startsWith('/admin/')), '/index.html']));
       writeFileSync(join(outDir, 'sw.js'), sw);
       writeFileSync(join(outDir, 'version.json'), JSON.stringify({ commit: COMMIT, build, version, files: hashes }, null, 2));
       console.log(`shepit: версія ${version}, хеш збірки ${build}`);
@@ -51,7 +51,12 @@ function shepitPwa(): Plugin {
 export default defineConfig({
   plugins: [svelte(), shepitPwa()],
   define: { __SHEPIT_COMMIT__: JSON.stringify(COMMIT) },
-  build: { target: 'es2022', sourcemap: false },
+  build: {
+    target: 'es2022',
+    sourcemap: false,
+    // Дві сторінки: застосунок і адмін-панель (/admin/).
+    rollupOptions: { input: { main: 'index.html', admin: 'admin/index.html' } },
+  },
   // Розробка: API проксюємо на локальний сервер (cargo run -p shepit-server).
   server: {
     proxy: {

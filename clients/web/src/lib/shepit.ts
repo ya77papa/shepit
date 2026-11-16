@@ -31,10 +31,41 @@ function serial<T>(f: () => Promise<T>): Promise<T> {
   return p;
 }
 
+/** Пояснення відмов сервера при реєстрації. */
+const REFUSALS: Record<string, string> = {
+  'registration-closed': 'Реєстрацію нових користувачів на цьому сервері зараз закрито.',
+  'invite-required': 'На цьому сервері реєстрація лише за запрошенням. Попроси посилання в того, хто вже користується Шепотом, або введи код запрошення.',
+  'invite-invalid': 'Код запрошення недійсний: можливо, його вже використано, відкликано або минув термін дії.',
+};
+
+export type RegistrationMode = 'open' | 'invite' | 'closed';
+
+/** Режим реєстрації на сервері (без входу). */
+export async function registrationMode(): Promise<RegistrationMode> {
+  try {
+    const r = await fetch(`${API}/v0/registration`, { cache: 'no-store' });
+    if (!r.ok) return 'open'; // старий сервер без режимів
+    return (await r.json()).mode as RegistrationMode;
+  } catch {
+    return 'open';
+  }
+}
+
+/** Привести код запрошення до вигляду XXXX-XXXX-XXXX (або null, якщо не схоже на код). */
+export function normalizeInviteCode(input: string): string | null {
+  const raw = input.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (!/^[ABCDEFGHJKMNPQRSTUVWXYZ2-9]{12}$/.test(raw)) return null;
+  return `${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8)}`;
+}
+
 async function http(method: string, path: string, init: RequestInit = {}): Promise<Response> {
   const r = await fetch(API + path, { method, cache: 'no-store', ...init });
   noteDate(r);
   if (r.status === 401) throw new Error('Сервер відхилив підпис — перевір час на пристрої');
+  if (r.status === 403) {
+    const why = REFUSALS[(await r.text().catch(() => '')).trim()];
+    if (why) throw new Error(why);
+  }
   if (!r.ok) throw new Error(`${method} ${path}: ${r.status}`);
   return r;
 }
@@ -157,7 +188,7 @@ export class Shepit {
   }
 
   /** Створити акаунт: ключі генеруються тут, у браузері. Сервер бачить лише публічні. */
-  static async register(): Promise<Shepit> {
+  static async register(invite?: string | null): Promise<Shepit> {
     await loadWasm();
     // Акаунт уже створено в іншій вкладці цього браузера — не перезаписувати його!
     const existing = await Shepit.restore();
@@ -165,19 +196,34 @@ export class Shepit {
     const root = (await (await http('GET', '/v0/trust-root')).text()).trim();
     const acc = WebAccount.create(root);
     const s = new Shepit(acc);
-    await s.publishKeys(acc.keyUploadJson()!);
+    // Якщо сервер відмовить (закрито / немає запрошення) — нічого не збережеться.
+    await s.publishKeys(acc.keyUploadJson()!, invite);
     await s.ensureCertificate();
     await s.save();
     announceAccountChange();
     return s;
   }
 
-  private async publishKeys(uploadJson: string) {
+  private async publishKeys(uploadJson: string, invite?: string | null) {
     const body = new TextEncoder().encode(uploadJson);
-    await http('PUT', '/v0/keys', {
-      body,
-      headers: { 'content-type': 'application/json', [AUTH]: this.acc.authHeader('PUT /v0/keys', body) },
+    const headers: Record<string, string> = { 'content-type': 'application/json', [AUTH]: this.acc.authHeader('PUT /v0/keys', body) };
+    if (invite) headers['x-shepit-invite'] = invite;
+    await http('PUT', '/v0/keys', { body, headers });
+  }
+
+  /**
+   * Код запрошення для мого посилання (коли сервер працює «за запрошенням»).
+   * Сервер видає той самий код, поки ним не скористались, і новий — у межах ліміту.
+   */
+  async myInvite(): Promise<{ code: string | null; mode: RegistrationMode; left: number }> {
+    const r = await fetch(`${API}/v0/invites/mine`, {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { [AUTH]: this.acc.authHeader('POST /v0/invites/mine', new Uint8Array()) },
     });
+    if (r.status === 404 || r.status === 405) return { code: null, mode: 'open', left: 0 }; // старий сервер
+    if (!r.ok) throw new Error(`запрошення: ${r.status}`);
+    return r.json();
   }
 
   /** Перевірити, що сервер має мої ключі і їх вистачає; інакше опублікувати нові. */

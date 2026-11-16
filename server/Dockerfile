@@ -11,6 +11,8 @@ RUN rustup target add wasm32-unknown-unknown
 RUN cargo install --locked wasm-bindgen-cli --version 0.2.130
 WORKDIR /src
 COPY . .
+ARG SHEPIT_COMMIT=dev
+ENV SHEPIT_COMMIT=$SHEPIT_COMMIT
 RUN cargo build --release --locked -p shepit-server --features push \
  && cargo build --release --locked -p shepit-web-core --target wasm32-unknown-unknown \
  && wasm-bindgen --target web --out-dir clients/web/src/wasm \

@@ -15,12 +15,19 @@
 //! | GET   | /v0/push/key            | —      | публічний ключ VAPID для підписки на сповіщення |
 //! | PUT   | /v0/push                | так    | підписати браузер на сповіщення (Web Push) |
 //! | DELETE| /v0/push                | так    | відписати |
+//! | GET   | /v0/registration        | —      | режим реєстрації: open / invite / closed |
+//! | POST  | /v0/invites/mine        | так    | моє запрошення (код) для нових користувачів |
+//! | …     | /v0/admin/…             | сесія  | адмін-панель (див. `admin.rs`) |
+//!
+//! Нова ідентичність реєструється першою публікацією ключів (PUT /v0/keys). У режимі
+//! «за запрошенням» запит має містити заголовок `x-shepit-invite: <код>`.
 //!
 //! Також роздає веб-клієнт зі `$SHEPIT_WEB` (типово `./web`, якщо тека існує).
 //!
 //! Сервер бачить: хто отримує (скринька) і розмір. НЕ бачить: текст і відправника.
 //! Дані — у $SHEPIT_DATA: issuer.json (ключі сертифікатів) і shepit.db (SQLite: ключі, черги).
 
+mod admin;
 mod db;
 #[cfg(feature = "push")]
 mod push;
@@ -60,6 +67,52 @@ struct App {
     /// У пам'яті: після перезапуску старі запити все одно відсіче вікно часу.
     nonces: Mutex<HashMap<String, u64>>,
     issuer: Issuer,
+    admin: admin::Admin,
+    started: u64,
+    /// Кому вже позначено активність сьогодні (щоб не писати в базу на кожен запит).
+    seen: Mutex<HashMap<String, u64>>,
+}
+
+const INVITE_HEADER: &str = "x-shepit-invite";
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Mode {
+    Open,
+    Invite,
+    Closed,
+}
+
+impl App {
+    fn mode(&self) -> Mode {
+        match self.db.setting("registration").ok().flatten().as_deref() {
+            Some("invite") => Mode::Invite,
+            Some("closed") => Mode::Closed,
+            _ => Mode::Open,
+        }
+    }
+
+    fn user_invite_limit(&self) -> usize {
+        self.db.setting("user_invite_limit").ok().flatten().and_then(|v| v.parse().ok()).unwrap_or(5)
+    }
+
+    /// Лише зареєстровані акаунти отримують сертифікати відправника й доступ до ретранслятора.
+    fn require_account(&self, who: &str) -> Result<(), StatusCode> {
+        if self.db.is_account(who).map_err(internal)? { Ok(()) } else { Err(StatusCode::FORBIDDEN) }
+    }
+
+    fn touch(&self, who: &str) {
+        let day = now_ms() / db::DAY_MS;
+        let mut seen = self.seen.lock().unwrap();
+        if seen.get(who) == Some(&day) {
+            return;
+        }
+        if seen.len() > 100_000 {
+            seen.clear();
+        }
+        seen.insert(who.to_owned(), day);
+        let _ = self.db.touch(who, day);
+    }
 }
 
 /// Ретранслятор дзвінків (coturn з `use-auth-secret`): сервер видає тимчасові логіни,
@@ -106,6 +159,8 @@ fn authenticate(app: &App, headers: &HeaderMap, purpose: &str, body: &[u8]) -> R
     if nonces.insert(auth.nonce.clone(), now).is_some() {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    drop(nonces);
+    app.touch(&auth.identity);
     Ok(auth.identity)
 }
 
@@ -113,25 +168,83 @@ async fn trust_root(State(app): State<Shared>) -> String {
     app.issuer.trust_root_hex()
 }
 
-async fn put_keys(State(app): State<Shared>, headers: HeaderMap, body: Bytes) -> StatusCode {
-    let who = match authenticate(&app, &headers, "PUT /v0/keys", &body) {
-        Ok(w) => w,
-        Err(s) => return s,
-    };
-    let Ok(up) = serde_json::from_slice::<KeyUpload>(&body) else {
-        return StatusCode::BAD_REQUEST;
-    };
+/// Відповідь з поясненням причини відмови (клієнт показує її людині).
+type Refusal = (StatusCode, &'static str);
+
+async fn put_keys(State(app): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<StatusCode, Refusal> {
+    let plain = |s: StatusCode| (s, "");
+    let who = authenticate(&app, &headers, "PUT /v0/keys", &body).map_err(plain)?;
+    let up = serde_json::from_slice::<KeyUpload>(&body).map_err(|_| plain(StatusCode::BAD_REQUEST))?;
     // Опублікувати ключі можна лише для себе: identity у тілі = той, хто підписав.
     if up.identity != who {
-        return StatusCode::FORBIDDEN;
+        return Err(plain(StatusCode::FORBIDDEN));
     }
     if up.one_time.len() > MAX_ONE_TIME {
-        return StatusCode::BAD_REQUEST;
+        return Err(plain(StatusCode::BAD_REQUEST));
     }
-    match app.db.put_keys(&up) {
-        Ok(()) => StatusCode::NO_CONTENT,
-        Err(e) => internal(e),
+    // Нова ідентичність — це реєстрація: перевірити режим і запрошення.
+    if !app.db.is_account(&who).map_err(|e| plain(internal(e)))? {
+        let invite = headers.get(INVITE_HEADER).and_then(|v| v.to_str().ok()).and_then(admin::normalize_code);
+        let invite = match (app.mode(), invite) {
+            (Mode::Closed, _) => return Err((StatusCode::FORBIDDEN, "registration-closed")),
+            (Mode::Invite, None) => return Err((StatusCode::FORBIDDEN, "invite-required")),
+            (Mode::Invite, Some(code)) => Some(code),
+            // Вільна реєстрація: код, якщо є, все одно зараховується (статистика запрошень).
+            (Mode::Open, code) => code,
+        };
+        let mut r = app.db.register(&who, invite.as_deref(), now_ms()).map_err(|e| plain(internal(e)))?;
+        if r == db::Register::BadInvite && app.mode() == Mode::Open {
+            r = app.db.register(&who, None, now_ms()).map_err(|e| plain(internal(e)))?;
+        }
+        if r == db::Register::BadInvite {
+            return Err((StatusCode::FORBIDDEN, "invite-invalid"));
+        }
     }
+    app.db.put_keys(&up).map_err(|e| plain(internal(e)))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Serialize)]
+struct Registration {
+    mode: Mode,
+}
+
+async fn registration(State(app): State<Shared>) -> Json<Registration> {
+    Json(Registration { mode: app.mode() })
+}
+
+#[derive(serde::Serialize)]
+struct MyInvite {
+    /// None — у вільному режимі код не потрібен або ліміт вичерпано.
+    code: Option<String>,
+    mode: Mode,
+    /// Скільки ще нових запрошень можна створити.
+    left: usize,
+}
+
+/// Код запрошення для мого посилання: чинний (ще не використаний) або новий у межах ліміту.
+async fn my_invite(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<MyInvite>, StatusCode> {
+    let who = authenticate(&app, &headers, "POST /v0/invites/mine", b"")?;
+    app.require_account(&who)?;
+    let mode = app.mode();
+    let limit = app.user_invite_limit();
+    let now = now_ms();
+    let (active, total) = app.db.user_invite(&who, now).map_err(internal)?;
+    if mode != Mode::Invite {
+        return Ok(Json(MyInvite { code: None, mode, left: limit.saturating_sub(total) }));
+    }
+    if let Some(code) = active {
+        return Ok(Json(MyInvite { code: Some(code), mode, left: limit.saturating_sub(total) }));
+    }
+    if total >= limit {
+        return Ok(Json(MyInvite { code: None, mode, left: 0 }));
+    }
+    let inv = db::Invite {
+        code: admin::new_invite_code(), created: now, creator: Some(who), note: String::new(),
+        max_uses: 1, uses: 0, expires: Some(now + 30 * db::DAY_MS), revoked: false,
+    };
+    app.db.create_invite(&inv).map_err(internal)?;
+    Ok(Json(MyInvite { code: Some(inv.code), mode, left: limit - total - 1 }))
 }
 
 async fn get_keys(State(app): State<Shared>, Path(identity): Path<String>) -> Result<Json<PreKeyBundle>, StatusCode> {
@@ -151,6 +264,7 @@ async fn key_status(State(app): State<Shared>, headers: HeaderMap) -> Result<Jso
 
 async fn certificate(State(app): State<Shared>, headers: HeaderMap) -> Result<String, StatusCode> {
     let who = authenticate(&app, &headers, "GET /v0/certificate", b"")?;
+    app.require_account(&who)?;
     let cert = app.issuer.issue(&who, now_ms()).map_err(|_| StatusCode::BAD_REQUEST)?;
     Ok(hex::encode(cert))
 }
@@ -336,7 +450,8 @@ async fn turn_credentials(State(app): State<Shared>, headers: HeaderMap) -> Resu
     use base64::Engine;
     use hmac::{Hmac, Mac};
     use rand::Rng;
-    authenticate(&app, &headers, "GET /v0/turn", b"")?;
+    let who = authenticate(&app, &headers, "GET /v0/turn", b"")?;
+    app.require_account(&who)?;
     let t = app.turn.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     // Логін не містить ідентичності користувача — ретранслятор не знає, хто дзвонить.
     let expiry = now_ms() / 1000 + TURN_TTL_S;
@@ -402,6 +517,9 @@ fn app(issuer: Issuer, db: db::Db, shutdown: tokio::sync::watch::Receiver<bool>)
         #[cfg(feature = "push")]
         last_mail_push: Mutex::default(),
         issuer,
+        admin: admin::Admin::default(),
+        started: now_ms(),
+        seen: Mutex::default(),
     });
     // Раз на годину прибирати недоставлені конверти старші за 30 днів.
     let pruner = shared.clone();
@@ -428,6 +546,14 @@ fn app(issuer: Issuer, db: db::Db, shutdown: tokio::sync::watch::Receiver<bool>)
         .route("/v0/turn", get(turn_credentials))
         .route("/v0/push/key", get(push_key))
         .route("/v0/push", put(put_push).delete(delete_push))
+        .route("/v0/registration", get(registration))
+        .route("/v0/invites/mine", post(my_invite))
+        .route("/v0/admin/login", post(admin_login))
+        .route("/v0/admin/logout", post(admin_logout))
+        .route("/v0/admin/overview", get(admin_overview))
+        .route("/v0/admin/settings", put(admin_settings))
+        .route("/v0/admin/invites", get(admin_invites).post(admin_create_invite))
+        .route("/v0/admin/invites/{code}", axum::routing::delete(admin_revoke_invite))
         .with_state(shared)
         .layer(SetResponseHeaderLayer::overriding(header::CACHE_CONTROL, HeaderValue::from_static("no-store")));
 
@@ -476,8 +602,173 @@ async fn shutdown_signal(tx: tokio::sync::watch::Sender<bool>) {
     let _ = tx.send(true);
 }
 
+// ---------- адмін-панель ----------
+
+#[derive(serde::Deserialize)]
+struct LoginReq {
+    password: String,
+}
+
+async fn admin_login(State(app): State<Shared>, Json(req): Json<LoginReq>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let a = app.clone();
+    let r = tokio::task::spawn_blocking(move || a.admin.login(&data_dir(), &req.password, now_ms())).await;
+    match r {
+        Ok(admin::Login::Ok(token)) => {
+            (StatusCode::NO_CONTENT, [(header::SET_COOKIE, admin::set_cookie(&token))]).into_response()
+        }
+        Ok(admin::Login::Wrong) => (StatusCode::UNAUTHORIZED, "wrong-password").into_response(),
+        Ok(admin::Login::Locked(s)) => (StatusCode::TOO_MANY_REQUESTS, format!("locked:{s}")).into_response(),
+        Ok(admin::Login::NotConfigured) => (StatusCode::NOT_FOUND, "not-configured").into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn admin_logout(State(app): State<Shared>, headers: HeaderMap) -> impl axum::response::IntoResponse {
+    app.admin.logout(&headers);
+    (StatusCode::NO_CONTENT, [(header::SET_COOKIE, admin::clear_cookie())])
+}
+
+fn admin_guard(app: &App, headers: &HeaderMap) -> Result<(), StatusCode> {
+    app.admin.check(&data_dir(), headers, now_ms())
+}
+
+#[derive(serde::Serialize)]
+struct Settings {
+    registration: Mode,
+    user_invite_limit: usize,
+}
+
+#[derive(serde::Serialize)]
+struct ServerInfo {
+    version: &'static str,
+    commit: &'static str,
+    started: u64,
+    now: u64,
+    turn: Vec<String>,
+    web_push: bool,
+    live_connections: usize,
+    db_bytes: u64,
+    disk_free: Option<u64>,
+    disk_total: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+struct Overview {
+    settings: Settings,
+    stats: db::Stats,
+    server: ServerInfo,
+}
+
+async fn admin_overview(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<Overview>, StatusCode> {
+    admin_guard(&app, &headers)?;
+    let dir = data_dir();
+    let db_bytes = ["shepit.db", "shepit.db-wal"].iter().filter_map(|f| std::fs::metadata(dir.join(f)).ok()).map(|m| m.len()).sum();
+    let disk = admin::disk_space(&dir);
+    let live = app.bells.lock().unwrap().values().map(|b| b.receiver_count()).sum();
+    Ok(Json(Overview {
+        settings: Settings { registration: app.mode(), user_invite_limit: app.user_invite_limit() },
+        stats: app.db.stats(now_ms()).map_err(internal)?,
+        server: ServerInfo {
+            version: env!("CARGO_PKG_VERSION"),
+            commit: option_env!("SHEPIT_COMMIT").unwrap_or("dev"),
+            started: app.started,
+            now: now_ms(),
+            turn: app.turn.as_ref().map(|t| t.urls.clone()).unwrap_or_default(),
+            web_push: cfg!(feature = "push"),
+            live_connections: live,
+            db_bytes,
+            disk_free: disk.map(|d| d.0),
+            disk_total: disk.map(|d| d.1),
+        },
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct SettingsReq {
+    registration: Option<Mode>,
+    user_invite_limit: Option<usize>,
+}
+
+async fn admin_settings(State(app): State<Shared>, headers: HeaderMap, Json(req): Json<SettingsReq>) -> StatusCode {
+    if let Err(s) = admin_guard(&app, &headers) {
+        return s;
+    }
+    let r = (|| {
+        if let Some(m) = req.registration {
+            let v = match m { Mode::Open => "open", Mode::Invite => "invite", Mode::Closed => "closed" };
+            app.db.set_setting("registration", v)?;
+            println!("Адмін: режим реєстрації → {v}");
+        }
+        if let Some(n) = req.user_invite_limit {
+            app.db.set_setting("user_invite_limit", &n.min(1000).to_string())?;
+        }
+        Ok::<_, rusqlite::Error>(())
+    })();
+    r.map(|_| StatusCode::NO_CONTENT).unwrap_or_else(internal)
+}
+
+#[derive(serde::Serialize)]
+struct AdminInvite {
+    #[serde(flatten)]
+    inv: db::Invite,
+    /// Чинний зараз (не відкликаний, не прострочений, є невикористані).
+    active: bool,
+}
+
+async fn admin_invites(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<Vec<AdminInvite>>, StatusCode> {
+    admin_guard(&app, &headers)?;
+    let now = now_ms();
+    let list = app.db.invites(500).map_err(internal)?;
+    Ok(Json(list.into_iter().map(|inv| {
+        let active = !inv.revoked && inv.uses < inv.max_uses && inv.expires.is_none_or(|e| e > now);
+        AdminInvite { inv, active }
+    }).collect()))
+}
+
+#[derive(serde::Deserialize)]
+struct NewInvite {
+    #[serde(default)]
+    note: String,
+    max_uses: u32,
+    /// Скільки днів діє; None — безстроково.
+    days: Option<u32>,
+}
+
+async fn admin_create_invite(State(app): State<Shared>, headers: HeaderMap, Json(req): Json<NewInvite>) -> Result<Json<db::Invite>, StatusCode> {
+    admin_guard(&app, &headers)?;
+    if req.max_uses == 0 || req.max_uses > 10_000 || req.note.chars().count() > 200 || req.days == Some(0) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let now = now_ms();
+    let inv = db::Invite {
+        code: admin::new_invite_code(), created: now, creator: None, note: req.note, max_uses: req.max_uses,
+        uses: 0, expires: req.days.map(|d| now + d as u64 * db::DAY_MS), revoked: false,
+    };
+    app.db.create_invite(&inv).map_err(internal)?;
+    Ok(Json(inv))
+}
+
+async fn admin_revoke_invite(State(app): State<Shared>, headers: HeaderMap, Path(code): Path<String>) -> StatusCode {
+    if let Err(s) = admin_guard(&app, &headers) {
+        return s;
+    }
+    match app.db.revoke_invite(&code) {
+        Ok(1..) => StatusCode::NO_CONTENT,
+        Ok(_) => StatusCode::NOT_FOUND,
+        Err(e) => internal(e),
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("admin-password") {
+        if let Err(e) = admin::set_password_cli(&data_dir()) {
+            eprintln!("Помилка: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let addr: SocketAddr = std::env::var("SHEPIT_LISTEN")
         .unwrap_or_else(|_| "0.0.0.0:8443".into())
         .parse()
@@ -485,6 +776,10 @@ async fn main() {
     let issuer = load_issuer();
     let db = db::Db::open(&data_dir().join("shepit.db")).expect("open shepit.db");
     println!("Корінь довіри: {}", issuer.trust_root_hex());
+    println!(
+        "Адмін-панель: {}",
+        if admin::configured(&data_dir()) { "увімкнена (/admin/)" } else { "вимкнена — задай пароль: shepit-server admin-password" }
+    );
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     println!("shepit-server listening on {addr}");
     let (tx, rx) = tokio::sync::watch::channel(false);

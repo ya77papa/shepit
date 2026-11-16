@@ -25,6 +25,8 @@ class MainActivity : ComponentActivity() {
     /** Запрошення, з яким відкрили застосунок (посилання #add=…). */
     private val pendingInvite = mutableStateOf<Pair<String, String?>?>(null)
     private val openRequest = mutableStateOf<String?>(null)
+    /** Код запрошення з посилання (#i=…) — для реєстрації на сервері «за запрошенням». */
+    private val inviteCode = mutableStateOf<String?>(null)
 
     private val notifPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
     val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
@@ -35,7 +37,7 @@ class MainActivity : ComponentActivity() {
         handleIntent(intent)
         setContent {
             ShepitTheme {
-                AppUi(app, this, pendingInvite, openRequest)
+                AppUi(app, this, pendingInvite, openRequest, inviteCode)
             }
         }
     }
@@ -46,7 +48,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleIntent(i: Intent?) {
-        i?.data?.toString()?.let { url -> app.repo.parseInvite(url)?.let { pendingInvite.value = it } }
+        i?.data?.toString()?.let { url ->
+            app.repo.inviteCodeFrom(url)?.let { inviteCode.value = it }
+            app.repo.parseInvite(url)?.let { pendingInvite.value = it }
+        }
         i?.getStringExtra(EXTRA_PEER)?.let { openRequest.value = it }
     }
 

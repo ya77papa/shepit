@@ -77,17 +77,35 @@ class Repo(context: Context) {
 
     // ---------- реєстрація / ключі ----------
 
-    suspend fun register(name: String) = withContext(Dispatchers.IO) {
+    suspend fun register(name: String, invite: String? = null) = withContext(Dispatchers.IO) {
         lock.withLock {
             if (secure.exists()) return@withLock
             val root = api.get("/v0/trust-root").trim()
             val c = Core.create(root)
+            // Якщо сервер відмовить (закрито / немає запрошення) — нічого не збережеться.
+            val body = c.keyUploadJson()!!.toByteArray()
+            api.send("PUT", "/v0/keys", body, c.authHeader("PUT /v0/keys", body), invite?.let { mapOf(Api.INVITE to it) } ?: emptyMap())
             core = c
-            publishKeys(c.keyUploadJson()!!)
             ensureCertificate()
             save()
             myName = name
         }
+    }
+
+    /** Режим реєстрації на сервері: open / invite / closed. */
+    suspend fun registrationMode(): String = withContext(Dispatchers.IO) {
+        runCatching { JSONObject(api.get("/v0/registration")).optString("mode", "open") }.getOrDefault("open")
+    }
+
+    data class MyInvite(val code: String?, val mode: String, val left: Int)
+
+    /** Мій код запрошення (сервер «за запрошенням»): той самий, поки ним не скористались. */
+    suspend fun myInvite(): MyInvite? = withContext(Dispatchers.IO) {
+        val c = core ?: return@withContext null
+        runCatching {
+            val j = JSONObject(api.post("/v0/invites/mine", ByteArray(0), c.authHeader("POST /v0/invites/mine", ByteArray(0))))
+            MyInvite(j.optString("code").takeIf { !j.isNull("code") && it.isNotEmpty() }, j.optString("mode", "open"), j.optInt("left"))
+        }.getOrNull()
     }
 
     private fun publishKeys(json: String) {
@@ -137,20 +155,27 @@ class Repo(context: Context) {
     fun nameOf(identity: String): String =
         db.contacts().firstOrNull { it.identity == identity }?.name ?: "Контакт ${short(fingerprintOf(identity))}"
 
-    fun inviteUrl(): String {
+    fun inviteUrl(code: String? = null): String {
         val id = core?.identity() ?: return ""
         val n = myName
-        return api.url("/#add=$id") + if (n.isNotEmpty()) "&name=" + java.net.URLEncoder.encode(n, "UTF-8").replace("+", "%20") else ""
+        return api.url("/#add=$id") +
+            (if (n.isNotEmpty()) "&name=" + java.net.URLEncoder.encode(n, "UTF-8").replace("+", "%20") else "") +
+            (if (code != null) "&i=$code" else "")
     }
+
+    private fun fragment(text: String): Map<String, String> =
+        text.trim().substringAfter('#', "").split('&')
+            .mapNotNull { p -> p.split('=', limit = 2).takeIf { it.size == 2 }?.let { it[0] to java.net.URLDecoder.decode(it[1], "UTF-8") } }
+            .toMap()
 
     /** Розібрати посилання-запрошення: (ключ, ім'я). */
     fun parseInvite(text: String): Pair<String, String?>? {
-        val t = text.trim()
-        val frag = t.substringAfter('#', "")
-        val params = frag.split('&').mapNotNull { p -> p.split('=', limit = 2).takeIf { it.size == 2 }?.let { it[0] to java.net.URLDecoder.decode(it[1], "UTF-8") } }.toMap()
-        val key = (params["add"] ?: t).lowercase()
-        return if (isValidIdentity(key)) key to params["name"] else null
+        val key = (fragment(text)["add"] ?: text.trim()).lowercase()
+        return if (isValidIdentity(key)) key to fragment(text)["name"] else null
     }
+
+    /** Код запрошення з посилання (#i=…), якщо є. */
+    fun inviteCodeFrom(text: String): String? = Api.normalizeInviteCode(fragment(text)["i"])
 
     // ---------- повідомлення ----------
 
