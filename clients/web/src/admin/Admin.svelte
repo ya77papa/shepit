@@ -34,6 +34,13 @@
   let uses = $state(1);
   let days = $state<number | ''>(7);
   let created: Invite | null = $state(null);
+  type User = { identity: string; fingerprint: string; created: number; last_seen: number; invite: string | null; invited_by: string | null };
+  type Blocked = { identity: string; fingerprint: string; at: number };
+  let users: User[] = $state([]);
+  let blocked: Blocked[] = $state([]);
+  let query = $state('');
+  let deleting: User | null = $state(null);
+  let block = $state(true);
   let copied = $state('');
 
   const H = { 'x-shepit-admin': '1' };
@@ -54,9 +61,10 @@
   }
 
   async function load() {
-    const [o, i] = await Promise.all([api('GET', 'overview'), api('GET', 'invites')]);
+    const [o, i, u] = await Promise.all([api('GET', 'overview'), api('GET', 'invites'), api('GET', 'users')]);
     ov = await o.json();
     invites = await i.json();
+    ({ users, blocked } = await u.json());
     if (state !== 'ready') {
       mode = ov!.settings.registration;
       limit = ov!.settings.user_invite_limit;
@@ -122,6 +130,28 @@
     if (!confirm(`Відкликати запрошення ${code}? Ним більше не можна буде зареєструватись.`)) return;
     act(() => api('DELETE', `invites/${encodeURIComponent(code)}`), 'Запрошення відкликано');
   };
+
+  const deleteUser = (u: User) =>
+    act(async () => {
+      await api('DELETE', `users/${u.identity}?block=${block ? 1 : 0}`);
+      deleting = null;
+    }, block ? 'Акаунт видалено і заблоковано' : 'Акаунт видалено');
+
+  const unblock = (b: Blocked) => {
+    if (!confirm(`Розблокувати ${short(b.fingerprint)}…? Цей ключ знову зможе зареєструватися (за правилами поточного режиму).`)) return;
+    act(() => api('DELETE', `blocked/${b.identity}`), 'Розблоковано');
+  };
+
+  const digits = (s: string) => s.replace(/\D/g, '');
+  const short = (fp: string) => fp.split(' ').slice(0, 2).join(' ');
+  const day = (ms: number) => {
+    if (!ms) return '—';
+    const today = Math.floor((ov?.server.now ?? Date.now()) / 86400000) * 86400000;
+    if (ms >= today) return 'сьогодні';
+    if (ms >= today - 86400000) return 'вчора';
+    return new Date(ms).toLocaleDateString('uk');
+  };
+  const shownUsers = $derived(query.trim() ? users.filter((u) => digits(u.fingerprint).includes(digits(query)) && digits(query).length > 0) : users);
 
   const linkOf = (code: string) => `${location.origin}/#i=${code}`;
 
@@ -222,6 +252,54 @@
         <div class="tile"><span class="n">{ov.stats.invites_active}</span><span class="small muted">чинних запрошень</span></div>
       </div>
       <p class="small muted">Активність рахується з точністю до дня. Вміст повідомлень і те, хто кому пише, сервер не знає.</p>
+    </section>
+
+    <section class="card">
+      <h2>Користувачі ({users.length})</h2>
+      <input placeholder="Пошук за «Мій ID»: попроси людину продиктувати кілька перших цифр" bind:value={query} inputmode="numeric" />
+      <p class="small muted">Сервер не знає імен — лише ключі. «Мій ID» кожен бачить у своїх налаштуваннях.</p>
+      {#if deleting}
+        <div class="created danger-box">
+          <div>Видалити акаунт <b class="mono">{short(deleting.fingerprint)}…</b>?</div>
+          <div class="small muted">Зі сервера буде стерто його ключі, недоставлену пошту, підписки на сповіщення; його невикористані запрошення відкликано. Листування на пристроях людей залишиться.</div>
+          <label class="row small"><input type="checkbox" class="cb" bind:checked={block} /> заборонити повторну реєстрацію цим ключем</label>
+          <div class="row wrap">
+            <button class="danger-btn" onclick={() => deleteUser(deleting!)} disabled={busy}>Видалити назавжди</button>
+            <button class="ghost" onclick={() => (deleting = null)}>Скасувати</button>
+          </div>
+        </div>
+      {/if}
+      {#if shownUsers.length === 0}
+        <p class="muted small">{query ? 'Нікого не знайдено.' : 'Користувачів ще немає.'}</p>
+      {:else}
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Мій ID</th><th>Зареєстровано</th><th>Активність</th><th>Запрошення</th><th></th></tr></thead>
+            <tbody>
+              {#each shownUsers.slice(0, 200) as u (u.identity)}
+                <tr>
+                  <td class="mono fpcell">{u.fingerprint}</td>
+                  <td>{u.created ? date(u.created) : 'давно'}</td>
+                  <td>{day(u.last_seen)}</td>
+                  <td class="small">{u.invite ? (u.invited_by ? `від користувача ${short(users.find((x) => x.identity === u.invited_by)?.fingerprint ?? '')}…` : `код адміна`) : '—'}</td>
+                  <td><button class="small danger" onclick={() => { deleting = u; block = true; }}>Видалити</button></td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+        {#if shownUsers.length > 200}<p class="small muted">Показано 200 з {shownUsers.length} — уточни пошук.</p>{/if}
+      {/if}
+      {#if blocked.length}
+        <h3>Заблоковані ({blocked.length})</h3>
+        <table>
+          <tbody>
+            {#each blocked as b (b.identity)}
+              <tr><td class="mono fpcell">{b.fingerprint}</td><td>{date(b.at)}</td><td><button class="small" onclick={() => unblock(b)}>Розблокувати</button></td></tr>
+            {/each}
+          </tbody>
+        </table>
+      {/if}
     </section>
 
     <section class="card">
@@ -329,6 +407,11 @@
   th { color: var(--muted); font-weight: 500; font-size: .8rem; }
   tr.dim { opacity: .5; }
   button.danger { color: var(--danger); }
+  .danger-box { border-color: var(--danger); margin: 12px 0; }
+  .danger-btn { background: var(--danger); color: #2a0b0b; font-weight: 600; }
+  .fpcell { font-size: .78rem; word-spacing: .15em; max-width: 260px; }
+  h3 { font-size: .95rem; margin: 16px 0 6px; color: var(--muted); }
+  section > input { margin-bottom: 6px; }
   button.small { padding: 4px 8px; }
   dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 16px; margin: 0; }
   dt { color: var(--muted); }

@@ -3,11 +3,24 @@
 
 export type CallOp = 'offer' | 'answer' | 'end' | 'reject' | 'busy';
 
+// id — випадковий ідентифікатор повідомлення: за ним відправник може видалити його «у всіх».
 export type Body =
-  | { t: 'text'; text: string }
+  | { t: 'text'; text: string; id?: string }
   | { t: 'hello'; name: string }
-  | { t: 'voice'; mime: string; dur: number; data: string; ptt?: boolean }
-  | { t: 'call'; op: CallOp; id: string; at: number; sdp?: string };
+  | { t: 'voice'; mime: string; dur: number; data: string; ptt?: boolean; id?: string }
+  | { t: 'call'; op: CallOp; id: string; at: number; sdp?: string }
+  // Видалити мої повідомлення з цими id у співрозмовника.
+  | { t: 'delete'; ids: string[] }
+  // Очистити всю нашу бесіду у співрозмовника.
+  | { t: 'clear' };
+
+/** Новий ідентифікатор повідомлення (128 біт). */
+export function newMsgId(): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+const MSG_ID = /^[0-9a-f]{32}$/;
+export const validMsgId = (id: unknown): id is string => typeof id === 'string' && MSG_ID.test(id);
 
 const LEGACY_HELLO = '\u0001hello ';
 

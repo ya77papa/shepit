@@ -27,6 +27,8 @@ class MainActivity : ComponentActivity() {
     private val openRequest = mutableStateOf<String?>(null)
     /** Код запрошення з посилання (#i=…) — для реєстрації на сервері «за запрошенням». */
     private val inviteCode = mutableStateOf<String?>(null)
+    /** Показати вікно оновлення (з сповіщення «Доступна нова версія»). */
+    private val showUpdate = mutableStateOf(false)
 
     private val notifPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
     val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
@@ -37,7 +39,7 @@ class MainActivity : ComponentActivity() {
         handleIntent(intent)
         setContent {
             ShepitTheme {
-                AppUi(app, this, pendingInvite, openRequest, inviteCode)
+                AppUi(app, this, pendingInvite, openRequest, inviteCode, showUpdate)
             }
         }
     }
@@ -53,6 +55,7 @@ class MainActivity : ComponentActivity() {
             app.repo.parseInvite(url)?.let { pendingInvite.value = it }
         }
         i?.getStringExtra(EXTRA_PEER)?.let { openRequest.value = it }
+        if (i?.getBooleanExtra(EXTRA_UPDATE, false) == true) showUpdate.value = true
     }
 
     override fun onResume() {
@@ -73,6 +76,7 @@ class MainActivity : ComponentActivity() {
             notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
         app.repo.scope.launch { runCatching { app.repo.load(); app.repo.receive() } }
+        app.repo.scope.launch { runCatching { app.updater.checkIfDue() } }
     }
 
     fun hasMic() = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
@@ -94,6 +98,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_PEER = "peer"
+        const val EXTRA_UPDATE = "update"
         @Volatile var visible = false
         @Volatile var openPeer: String? = null
     }

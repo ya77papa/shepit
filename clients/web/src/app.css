@@ -107,3 +107,8 @@ button.big { padding: 12px 18px; }
 .wide { width: 100%; margin-top: 12px; }
 .field { display: grid; gap: 6px; padding: 10px 0; border-top: 1px solid var(--line); }
 .field .mono { font-size: .85rem; word-spacing: .2em; }
+/* дії з повідомленням */
+.msg.selected .bubble { outline: 2px solid var(--accent); }
+.msg .bubble { cursor: default; }
+.msg-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.modal > button { text-align: left; }

@@ -9,6 +9,7 @@ class ShepitApp : Application() {
     lateinit var repo: Repo
         private set
     val calls: CallManager by lazy { CallManager(this, repo) }
+    val updater: io.github.ya77papa.shepit.update.Updater by lazy { io.github.ya77papa.shepit.update.Updater(this, repo.db) }
 
     override fun onCreate() {
         super.onCreate()

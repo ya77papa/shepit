@@ -23,6 +23,18 @@ pub const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 pub enum Register {
     Ok,
     BadInvite,
+    Blocked,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Account {
+    pub identity: String,
+    pub created: u64,
+    /// День останньої активності (мс початку дня); 0 — невідомо.
+    pub last_seen: u64,
+    pub invite: Option<String>,
+    /// Хто створив запрошення: None — адмін або без запрошення.
+    pub invited_by: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -100,6 +112,11 @@ impl Db {
                  revoked  INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS invites_creator ON invites(creator);
+             -- Видалені адміністратором ключі: повторна реєстрація заборонена.
+             CREATE TABLE IF NOT EXISTS blocked (
+                 identity TEXT PRIMARY KEY,
+                 at       INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS settings (
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL
@@ -123,6 +140,9 @@ impl Db {
         let tx = c.transaction()?;
         if tx.query_row("SELECT 1 FROM accounts WHERE identity = ?1", [identity], |_| Ok(())).optional()?.is_some() {
             return Ok(Register::Ok);
+        }
+        if tx.query_row("SELECT 1 FROM blocked WHERE identity = ?1", [identity], |_| Ok(())).optional()?.is_some() {
+            return Ok(Register::Blocked);
         }
         if let Some(code) = invite {
             let n = tx.execute(
@@ -161,6 +181,59 @@ impl Db {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    pub fn accounts(&self) -> rusqlite::Result<Vec<Account>> {
+        let c = self.0.lock().unwrap();
+        let mut st = c.prepare(
+            "SELECT a.identity, a.created, a.last_seen, a.invite, i.creator
+             FROM accounts a LEFT JOIN invites i ON i.code = a.invite ORDER BY a.created DESC",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(Account {
+                identity: r.get(0)?,
+                created: r.get::<_, i64>(1)? as u64,
+                last_seen: r.get::<_, i64>(2)? as u64 * DAY_MS,
+                invite: r.get(3)?,
+                invited_by: r.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Видалити акаунт з усіма даними на сервері: ключі, недоставлена пошта, підписки,
+    /// невикористані запрошення. З `block` — заборонити повторну реєстрацію цим ключем.
+    pub fn delete_account(&self, identity: &str, mailbox: &MailboxId, block: bool, now_ms: u64) -> rusqlite::Result<bool> {
+        let mut c = self.0.lock().unwrap();
+        let tx = c.transaction()?;
+        let n = tx.execute("DELETE FROM accounts WHERE identity = ?1", [identity])?;
+        tx.execute("DELETE FROM keys WHERE identity = ?1", [identity])?;
+        tx.execute("DELETE FROM envelopes WHERE mailbox = ?1", [mailbox.to_hex()])?;
+        tx.execute("DELETE FROM push_subs WHERE mailbox = ?1", [mailbox.to_hex()])?;
+        tx.execute("UPDATE invites SET revoked = 1 WHERE creator = ?1", [identity])?;
+        if block {
+            tx.execute("INSERT OR REPLACE INTO blocked(identity, at) VALUES (?1, ?2)", params![identity, now_ms as i64])?;
+        }
+        tx.commit()?;
+        Ok(n > 0 || block)
+    }
+
+    pub fn is_blocked(&self, identity: &str) -> rusqlite::Result<bool> {
+        Ok(self.0.lock().unwrap()
+            .query_row("SELECT 1 FROM blocked WHERE identity = ?1", [identity], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    pub fn blocked(&self) -> rusqlite::Result<Vec<(String, u64)>> {
+        let c = self.0.lock().unwrap();
+        let mut st = c.prepare("SELECT identity, at FROM blocked ORDER BY at DESC")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)))?;
+        rows.collect()
+    }
+
+    pub fn unblock(&self, identity: &str) -> rusqlite::Result<usize> {
+        self.0.lock().unwrap().execute("DELETE FROM blocked WHERE identity = ?1", [identity])
     }
 
     // ---------- запрошення ----------
@@ -410,6 +483,22 @@ mod tests {
         let s = db.stats(1000).unwrap();
         assert_eq!(s.users, 3);
         assert_eq!(s.invites_active, 0);
+        // видалення з блокуванням
+        let list = db.accounts().unwrap();
+        assert_eq!(list.iter().find(|a| a.identity == "05z").unwrap().invited_by.as_deref(), Some("05u"));
+        db.put_keys(&upload("05x", 1)).unwrap();
+        let mb = MailboxId([9; 32]);
+        db.push(&Envelope::new(mb, b"x"), 10, 1).unwrap();
+        db.create_invite(&inv("X1", Some("05x"), 1, None)).unwrap();
+        assert!(db.delete_account("05x", &mb, true, 2000).unwrap());
+        assert!(!db.is_account("05x").unwrap());
+        assert_eq!(db.one_time_left("05x").unwrap(), None);
+        assert!(db.list(&mb, 10).unwrap().is_empty());
+        assert_eq!(db.register("05q", Some("X1"), 3000).unwrap(), Register::BadInvite, "запрошення видаленого відкликано");
+        assert_eq!(db.register("05x", None, 3000).unwrap(), Register::Blocked);
+        assert_eq!(db.blocked().unwrap().len(), 1);
+        db.unblock("05x").unwrap();
+        assert_eq!(db.register("05x", None, 3000).unwrap(), Register::Ok);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

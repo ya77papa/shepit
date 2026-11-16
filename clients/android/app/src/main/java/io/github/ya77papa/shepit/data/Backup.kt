@@ -41,6 +41,7 @@ object Backup {
                     put(JSONObject().apply {
                         put("peer", m.peer); put("out", m.out); put("text", m.text); put("at", m.at)
                         if (m.kind != "text") put("kind", m.kind)
+                        if (m.mid != null) put("mid", m.mid)
                         if (m.voice != null) put("voice", JSONObject().put("data", b64(m.voice)).put("mime", m.voiceMime).put("dur", m.voiceDur))
                     })
                 }
@@ -77,6 +78,7 @@ object Backup {
                     peer = o.getString("peer"), out = o.getBoolean("out"), text = o.getString("text"), at = o.getLong("at"),
                     kind = o.optString("kind", if (v != null) "voice" else "text"),
                     voiceMime = v?.optString("mime"), voiceDur = v?.optLong("dur") ?: 0, voice = v?.let { unb64(it.getString("data")) },
+                    mid = o.optString("mid").takeIf { it.length == 32 },
                 )
             }
         }

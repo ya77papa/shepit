@@ -43,6 +43,7 @@ class ShepitService : Service() {
                 // Запасний варіант і поповнення ключів.
                 while (true) {
                     runCatching { if (repo.load()) { repo.ensureKeys(); repo.receive() } }
+                    checkUpdate()
                     delay(15 * 60 * 1000L)
                 }
             }
@@ -61,6 +62,15 @@ class ShepitService : Service() {
         jobs.forEach { it.cancel() }
         jobs.clear()
         super.onDestroy()
+    }
+
+    /** Раз на 12 год: є нова версія — сповістити (один раз на версію), якщо застосунок не відкритий. */
+    private suspend fun checkUpdate() {
+        val app = application as ShepitApp
+        val rel = runCatching { app.updater.checkIfDue() }.getOrNull() ?: return
+        if (MainActivity.visible || app.repo.db.get("update_notified") == rel.versionName) return
+        app.repo.db.set("update_notified", rel.versionName)
+        Notifications.showUpdate(this, rel.versionName)
     }
 
     companion object {

@@ -6,7 +6,7 @@
 //! | PUT   | /v0/keys                | так    | опублікувати свої ключі (тільки власник ключа) |
 //! | GET   | /v0/keys/status         | так    | скільки моїх одноразових ключів лишилось (404 — ключів немає) |
 //! | GET   | /v0/keys/{identity}     | —      | пакет ключів людини (забирає 1 одноразовий) |
-//! | GET   | /v0/certificate         | так    | сертифікат відправника на 24 год |
+//! | GET   | /v0/certificate         | так    | сертифікат відправника на 4 год (лише зареєстрованим) |
 //! | POST  | /v0/send                | —      | покласти конверт у скриньку (sealed sender: відправник невідомий) |
 //! | GET   | /v0/mailbox/{id}        | так    | переглянути конверти (тільки власник скриньки) |
 //! | POST  | /v0/mailbox/{id}/ack    | так    | «отримав і зберіг до N» — сервер видаляє |
@@ -97,8 +97,14 @@ impl App {
     }
 
     /// Лише зареєстровані акаунти отримують сертифікати відправника й доступ до ретранслятора.
-    fn require_account(&self, who: &str) -> Result<(), StatusCode> {
-        if self.db.is_account(who).map_err(internal)? { Ok(()) } else { Err(StatusCode::FORBIDDEN) }
+    fn require_account(&self, who: &str) -> Result<(), Refusal> {
+        if self.db.is_account(who).map_err(|e| (internal(e), ""))? {
+            Ok(())
+        } else if self.db.is_blocked(who).unwrap_or(false) {
+            Err((StatusCode::FORBIDDEN, "account-blocked"))
+        } else {
+            Err((StatusCode::FORBIDDEN, "not-registered"))
+        }
     }
 
     fn touch(&self, who: &str) {
@@ -184,6 +190,9 @@ async fn put_keys(State(app): State<Shared>, headers: HeaderMap, body: Bytes) ->
     }
     // Нова ідентичність — це реєстрація: перевірити режим і запрошення.
     if !app.db.is_account(&who).map_err(|e| plain(internal(e)))? {
+        if app.db.is_blocked(&who).map_err(|e| plain(internal(e)))? {
+            return Err((StatusCode::FORBIDDEN, "account-blocked"));
+        }
         let invite = headers.get(INVITE_HEADER).and_then(|v| v.to_str().ok()).and_then(admin::normalize_code);
         let invite = match (app.mode(), invite) {
             (Mode::Closed, _) => return Err((StatusCode::FORBIDDEN, "registration-closed")),
@@ -196,8 +205,10 @@ async fn put_keys(State(app): State<Shared>, headers: HeaderMap, body: Bytes) ->
         if r == db::Register::BadInvite && app.mode() == Mode::Open {
             r = app.db.register(&who, None, now_ms()).map_err(|e| plain(internal(e)))?;
         }
-        if r == db::Register::BadInvite {
-            return Err((StatusCode::FORBIDDEN, "invite-invalid"));
+        match r {
+            db::Register::BadInvite => return Err((StatusCode::FORBIDDEN, "invite-invalid")),
+            db::Register::Blocked => return Err((StatusCode::FORBIDDEN, "account-blocked")),
+            db::Register::Ok => {}
         }
     }
     app.db.put_keys(&up).map_err(|e| plain(internal(e)))?;
@@ -223,9 +234,10 @@ struct MyInvite {
 }
 
 /// Код запрошення для мого посилання: чинний (ще не використаний) або новий у межах ліміту.
-async fn my_invite(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<MyInvite>, StatusCode> {
-    let who = authenticate(&app, &headers, "POST /v0/invites/mine", b"")?;
+async fn my_invite(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<MyInvite>, Refusal> {
+    let who = authenticate(&app, &headers, "POST /v0/invites/mine", b"").map_err(|s| (s, ""))?;
     app.require_account(&who)?;
+    let internal = |e| (internal(e), "");
     let mode = app.mode();
     let limit = app.user_invite_limit();
     let now = now_ms();
@@ -262,10 +274,10 @@ async fn key_status(State(app): State<Shared>, headers: HeaderMap) -> Result<Jso
     Ok(Json(KeyStatus { one_time: n }))
 }
 
-async fn certificate(State(app): State<Shared>, headers: HeaderMap) -> Result<String, StatusCode> {
-    let who = authenticate(&app, &headers, "GET /v0/certificate", b"")?;
+async fn certificate(State(app): State<Shared>, headers: HeaderMap) -> Result<String, Refusal> {
+    let who = authenticate(&app, &headers, "GET /v0/certificate", b"").map_err(|s| (s, ""))?;
     app.require_account(&who)?;
-    let cert = app.issuer.issue(&who, now_ms()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let cert = app.issuer.issue(&who, now_ms()).map_err(|_| (StatusCode::BAD_REQUEST, ""))?;
     Ok(hex::encode(cert))
 }
 
@@ -446,13 +458,13 @@ struct TurnCredentials {
     ttl: u64,
 }
 
-async fn turn_credentials(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<TurnCredentials>, StatusCode> {
+async fn turn_credentials(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<TurnCredentials>, Refusal> {
     use base64::Engine;
     use hmac::{Hmac, Mac};
     use rand::Rng;
-    let who = authenticate(&app, &headers, "GET /v0/turn", b"")?;
+    let who = authenticate(&app, &headers, "GET /v0/turn", b"").map_err(|s| (s, ""))?;
     app.require_account(&who)?;
-    let t = app.turn.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let t = app.turn.as_ref().ok_or((StatusCode::NOT_FOUND, ""))?;
     // Логін не містить ідентичності користувача — ретранслятор не знає, хто дзвонить.
     let expiry = now_ms() / 1000 + TURN_TTL_S;
     let username = format!("{expiry}:{}", hex::encode(rand::rng().random::<[u8; 8]>()));
@@ -554,6 +566,9 @@ fn app(issuer: Issuer, db: db::Db, shutdown: tokio::sync::watch::Receiver<bool>)
         .route("/v0/admin/settings", put(admin_settings))
         .route("/v0/admin/invites", get(admin_invites).post(admin_create_invite))
         .route("/v0/admin/invites/{code}", axum::routing::delete(admin_revoke_invite))
+        .route("/v0/admin/users", get(admin_users))
+        .route("/v0/admin/users/{identity}", axum::routing::delete(admin_delete_user))
+        .route("/v0/admin/blocked/{identity}", axum::routing::delete(admin_unblock))
         .with_state(shared)
         .layer(SetResponseHeaderLayer::overriding(header::CACHE_CONTROL, HeaderValue::from_static("no-store")));
 
@@ -754,6 +769,84 @@ async fn admin_revoke_invite(State(app): State<Shared>, headers: HeaderMap, Path
         return s;
     }
     match app.db.revoke_invite(&code) {
+        Ok(1..) => StatusCode::NO_CONTENT,
+        Ok(_) => StatusCode::NOT_FOUND,
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct AdminUser {
+    #[serde(flatten)]
+    acc: db::Account,
+    /// «Мій ID», який користувач бачить у налаштуваннях.
+    fingerprint: String,
+}
+
+#[derive(serde::Serialize)]
+struct AdminBlocked {
+    identity: String,
+    fingerprint: String,
+    at: u64,
+}
+
+#[derive(serde::Serialize)]
+struct AdminUsers {
+    users: Vec<AdminUser>,
+    blocked: Vec<AdminBlocked>,
+}
+
+fn fingerprint_hex(identity: &str) -> String {
+    hex::decode(identity).map(|b| shepit_core::wire::fingerprint(&b)).unwrap_or_default()
+}
+
+async fn admin_users(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<AdminUsers>, StatusCode> {
+    admin_guard(&app, &headers)?;
+    let users = app.db.accounts().map_err(internal)?.into_iter()
+        .map(|acc| AdminUser { fingerprint: fingerprint_hex(&acc.identity), acc })
+        .collect();
+    let blocked = app.db.blocked().map_err(internal)?.into_iter()
+        .map(|(identity, at)| AdminBlocked { fingerprint: fingerprint_hex(&identity), identity, at })
+        .collect();
+    Ok(Json(AdminUsers { users, blocked }))
+}
+
+#[derive(serde::Deserialize)]
+struct DeleteQuery {
+    /// `1` / `true` — заборонити повторну реєстрацію.
+    block: Option<String>,
+}
+
+async fn admin_delete_user(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Path(identity): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<DeleteQuery>,
+) -> StatusCode {
+    if let Err(s) = admin_guard(&app, &headers) {
+        return s;
+    }
+    let Ok(bytes) = hex::decode(&identity) else { return StatusCode::BAD_REQUEST };
+    let mailbox = MailboxId::for_identity(&bytes);
+    let block = matches!(q.block.as_deref(), Some("1" | "true"));
+    match app.db.delete_account(&identity, &mailbox, block, now_ms()) {
+        Ok(true) => {
+            // Закрити відкриті потоки подій цього користувача.
+            app.bells.lock().unwrap().remove(&mailbox);
+            app.seen.lock().unwrap().remove(&identity);
+            println!("Адмін: видалено акаунт {}…{}", &identity[..identity.len().min(10)], if block { " (заблоковано)" } else { "" });
+            StatusCode::NO_CONTENT
+        }
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(e) => internal(e),
+    }
+}
+
+async fn admin_unblock(State(app): State<Shared>, headers: HeaderMap, Path(identity): Path<String>) -> StatusCode {
+    if let Err(s) = admin_guard(&app, &headers) {
+        return s;
+    }
+    match app.db.unblock(&identity) {
         Ok(1..) => StatusCode::NO_CONTENT,
         Ok(_) => StatusCode::NOT_FOUND,
         Err(e) => internal(e),

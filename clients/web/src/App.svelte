@@ -5,7 +5,7 @@
   import { contacts as contactsDb, kv, messages as messagesDb, wipe, type Contact, type Message } from './lib/db';
   import { exportBackup, importBackup, MIN_PASSWORD } from './lib/backup';
   import { COMMIT, REPO, SHORT, commitUrl, compareUrl, registerServiceWorker } from './lib/pwa';
-  import { decode, encode, fromBase64, toBase64, fmtDuration } from './lib/content';
+  import { decode, encode, fromBase64, toBase64, fmtDuration, newMsgId, validMsgId } from './lib/content';
   import { VoiceRecorder, MAX_VOICE_MS } from './lib/recorder';
   import { CallManager, checkRelay, type RelayCheck } from './lib/call.svelte';
   import VoiceMsg from './VoiceMsg.svelte';
@@ -36,7 +36,7 @@
   let regMode: RegistrationMode = $state('open');
   let inviteCode = $state(''); // код запрошення для реєстрації (з посилання #i=… або введений)
   let myInvite: { code: string | null; mode: RegistrationMode; left: number } | null = $state(null);
-  let panel: '' | 'invite' | 'backup' | 'add' | 'restore' | 'calltest' | 'settings' = $state('');
+  let panel: '' | 'invite' | 'backup' | 'add' | 'restore' | 'calltest' | 'settings' | 'chat' = $state('');
   let relayResults: RelayCheck[] | null = $state(null);
   let pushState: 'unsupported' | 'off' | 'on' | 'denied' | 'busy' = $state('unsupported');
   let newName = $state('');
@@ -46,6 +46,56 @@
   let restoreFile: File | null = $state(null);
   let copied = $state('');
   let showSafety = $state(false);
+  let selected: Message | null = $state(null); // повідомлення, для якого відкрито дії
+
+  /** Видалити повідомлення: лише в мене або в обох (лише свої, нові повідомлення). */
+  async function deleteMessage(m: Message, everywhere: boolean) {
+    if (!me || !current) return;
+    const peer = current;
+    busy = true;
+    error = '';
+    try {
+      if (everywhere && m.mid) await me.send(peer.identity, encode({ t: 'delete', ids: [m.mid] }));
+      await messagesDb.delete(m.id!);
+      selected = null;
+      await openThread(peer);
+    } catch (e) {
+      fail(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function clearChat(everywhere: boolean) {
+    if (!me || !current) return;
+    const peer = current;
+    if (!confirm(everywhere
+      ? `Очистити всю бесіду з ${peer.name} — і в тебе, і в співрозмовника? Цього не скасувати.`
+      : `Очистити всю бесіду з ${peer.name} лише в тебе? У співрозмовника все залишиться.`)) return;
+    busy = true;
+    try {
+      if (everywhere) await me.send(peer.identity, encode({ t: 'clear' }));
+      await messagesDb.clear(peer.identity);
+      panel = '';
+      await openThread(peer);
+    } catch (e) {
+      fail(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function deleteContact() {
+    if (!current) return;
+    const peer = current;
+    if (!confirm(`Видалити контакт ${peer.name} і всю бесіду з ним у тебе? Якщо ця людина напише знову, вона з'явиться як новий контакт.`)) return;
+    await messagesDb.clear(peer.identity);
+    await contactsDb.delete(peer.identity);
+    panel = '';
+    current = null;
+    thread = [];
+    await refreshContacts();
+  }
   let threadEl: HTMLElement | undefined = $state();
   let applyUpdate: (() => void) | null = $state(null); // є нова версія, чекає згоди
   let updatedFrom = $state(''); // версію щойно змінено (показати, з якої)
@@ -184,8 +234,9 @@
     busy = true;
     error = '';
     try {
-      await me.send(peer.identity, encode({ t: 'text', text }));
-      await messagesDb.add({ peer: peer.identity, out: true, text, at: Date.now() });
+      const mid = newMsgId();
+      await me.send(peer.identity, encode({ t: 'text', text, id: mid }));
+      await messagesDb.add({ peer: peer.identity, out: true, text, at: Date.now(), mid });
       draft = '';
       if (current?.identity === peer.identity) await openThread(peer);
     } catch (e) {
@@ -200,8 +251,9 @@
     const peer = current;
     busy = true;
     try {
-      await me.send(peer.identity, encode({ t: 'voice', mime, dur, data: toBase64(await blob.arrayBuffer()) }));
-      await messagesDb.add({ peer: peer.identity, out: true, text: '🎤 Голосове', at: Date.now(), kind: 'voice', voice: { blob, mime, dur } });
+      const mid = newMsgId();
+      await me.send(peer.identity, encode({ t: 'voice', mime, dur, data: toBase64(await blob.arrayBuffer()), id: mid }));
+      await messagesDb.add({ peer: peer.identity, out: true, text: '🎤 Голосове', at: Date.now(), kind: 'voice', voice: { blob, mime, dur }, mid });
       if (current?.identity === peer.identity) await openThread(peer);
     } catch (e) {
       fail(e);
@@ -295,6 +347,7 @@
   async function poll() {
     if (!me) return;
     const known = new Set(contacts.map((c) => c.identity));
+    const changedPeers = new Set<string>();
     let firstFrom = '';
     let delivered = 0;
     try {
@@ -311,22 +364,41 @@
           await calls.onSignal(m.from, body); // службове — у стрічку не пишемо
           return;
         }
+        // Співрозмовник видалив свої повідомлення «у всіх» або очистив бесіду.
+        if (body.t === 'delete') {
+          const ids = Array.isArray(body.ids) ? body.ids.filter(validMsgId).slice(0, 500) : [];
+          if (ids.length && (await messagesDb.deleteIncoming(m.from, ids))) changedPeers.add(m.from);
+          return;
+        }
+        if (body.t === 'clear') {
+          await messagesDb.clear(m.from);
+          await messagesDb.add({ peer: m.from, out: false, text: `🧹 ${nameOf(m.from)} очистив(-ла) бесіду`, at: Date.now(), kind: 'call' });
+          changedPeers.add(m.from);
+          return;
+        }
         firstFrom ||= m.from;
         delivered++;
         if (body.t === 'voice') {
           const blob = new Blob([fromBase64(body.data)], { type: body.mime });
           await messagesDb.add({
             peer: m.from, out: false, text: '🎤 Голосове', at: Date.now(), kind: 'voice',
-            voice: { blob, mime: body.mime, dur: body.dur },
+            voice: { blob, mime: body.mime, dur: body.dur }, mid: validMsgId(body.id) ? body.id : undefined,
           });
+        } else if (body.t === 'hello') {
+          await messagesDb.add({ peer: m.from, out: false, text: helloText(body.name.trim()), at: Date.now() });
+        } else if (body.t === 'text') {
+          await messagesDb.add({ peer: m.from, out: false, text: body.text, at: Date.now(), mid: validMsgId(body.id) ? body.id : undefined });
         } else {
-          const text = body.t === 'hello' ? helloText(body.name.trim()) : body.text;
-          await messagesDb.add({ peer: m.from, out: false, text, at: Date.now() });
+          return; // невідомий тип (новіша версія) — пропустити
         }
         if (current?.identity !== m.from) unread[m.from] = (unread[m.from] ?? 0) + 1;
       });
     } catch (e) {
       fail(e); // повідомлення вже збережені локально — показуємо їх нижче
+    }
+    if (current && changedPeers.has(current.identity) && !delivered) {
+      await openThread(current);
+      if (selected && !thread.some((t) => t.id === selected!.id)) selected = null;
     }
     if (!delivered) return;
     await refreshContacts();
@@ -587,6 +659,7 @@
           <button class="ghost small" onclick={() => (showSafety = !showSafety)}>🔒 код безпеки</button>
           <span class="spacer"></span>
           <button class="ghost" title="Голосовий дзвінок" disabled={calls.state !== 'idle'} onclick={() => calls.start(current!.identity)}>📞</button>
+          <button class="ghost" title="Бесіда: очистити, видалити контакт" onclick={() => (panel = 'chat')}>⋯</button>
         </header>
         {#if showSafety}
           <div class="safety">
@@ -596,11 +669,16 @@
         {/if}
         <div class="thread" bind:this={threadEl}>
           {#each thread as m (m.id)}
-            <div class="msg" class:out={m.out} class:system={m.kind === 'call'}>
+            <div
+              class="msg" class:out={m.out} class:system={m.kind === 'call'} class:selected={selected?.id === m.id}
+              role="listitem"
+              oncontextmenu={(e) => { e.preventDefault(); selected = selected?.id === m.id ? null : m; }}
+            >
               {#if m.kind === 'voice' && m.voice}
                 <div class="bubble"><VoiceMsg voice={m.voice} /></div>
               {:else}
-                <div class="bubble">{m.text}</div>
+                <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+                <div class="bubble" onclick={() => (selected = selected?.id === m.id ? null : m)}>{m.text}</div>
               {/if}
               <div class="time">{new Date(m.at).toLocaleTimeString('uk', { hour: '2-digit', minute: '2-digit' })}</div>
             </div>
@@ -608,7 +686,17 @@
             <p class="muted center-text">Повідомлень ще немає. Усе, що ви напишете, шифрується на пристрої — сервер бачить лише шифротекст.</p>
           {/each}
         </div>
-        {#if recording}
+        {#if selected}
+          <div class="composer msg-actions">
+            <span class="muted small">Повідомлення:</span>
+            <span class="spacer"></span>
+            <button onclick={() => deleteMessage(selected!, false)} disabled={busy}>🗑 Видалити в мене</button>
+            {#if selected.out && selected.mid}
+              <button class="danger" onclick={() => deleteMessage(selected!, true)} disabled={busy}>Видалити у всіх</button>
+            {/if}
+            <button class="ghost" onclick={() => (selected = null)}>✕</button>
+          </div>
+        {:else if recording}
           <div class="composer recording-bar">
             <span class="rec-dot"></span>
             <span>Запис {fmtDuration(recNow - recStart)} / {fmtDuration(MAX_VOICE_MS)}</span>
@@ -652,7 +740,13 @@
   {#if panel}
     <div class="overlay" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) panel = ''; }}>
       <div class="card modal">
-        {#if panel === 'invite'}
+        {#if panel === 'chat' && current}
+          <h2>{current.name}</h2>
+          <button onclick={() => clearChat(false)} disabled={busy}>🧹 Очистити бесіду в мене</button>
+          <button onclick={() => clearChat(true)} disabled={busy}>🧹 Очистити в мене і в {current.name}</button>
+          <button class="danger" onclick={deleteContact} disabled={busy}>Видалити контакт</button>
+          <p class="muted small">Щоб видалити окреме повідомлення — натисни на нього (на телефоні можна довго втримати). «Видалити у всіх» доступне для твоїх повідомлень, надісланих у цій версії Шепоту.</p>
+        {:else if panel === 'invite'}
           <h2>Запросити друга</h2>
           {#if !myName}<p class="warn small">Підказка: вкажи своє ім'я зліва — тоді друг побачить, від кого запрошення.</p>{/if}
           {#if myInvite?.mode === 'invite'}

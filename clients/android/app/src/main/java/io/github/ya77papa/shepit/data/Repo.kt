@@ -199,14 +199,38 @@ class Repo(context: Context) {
     }
 
     suspend fun sendText(peer: String, text: String) {
-        send(peer, Body.Text(text))
-        db.addMessage(Message(peer = peer, out = true, text = text, at = System.currentTimeMillis()))
+        val mid = Content.newMsgId()
+        send(peer, Body.Text(text, mid))
+        db.addMessage(Message(peer = peer, out = true, text = text, at = System.currentTimeMillis(), mid = mid))
         _changed.emit(peer)
     }
 
     suspend fun sendVoice(peer: String, mime: String, dur: Long, data: ByteArray) {
-        send(peer, Body.Voice(mime, dur, Base64.encodeToString(data, Base64.NO_WRAP)))
-        db.addMessage(Message(peer = peer, out = true, text = "🎤 Голосове", at = System.currentTimeMillis(), kind = "voice", voiceMime = mime, voiceDur = dur, voice = data))
+        val mid = Content.newMsgId()
+        send(peer, Body.Voice(mime, dur, Base64.encodeToString(data, Base64.NO_WRAP), mid))
+        db.addMessage(Message(peer = peer, out = true, text = "🎤 Голосове", at = System.currentTimeMillis(), kind = "voice", voiceMime = mime, voiceDur = dur, voice = data, mid = mid))
+        _changed.emit(peer)
+    }
+
+    // ---------- видалення ----------
+
+    /** Видалити повідомлення: лише в мене або в обох (лише свої, з id). */
+    suspend fun deleteMessage(m: Message, everywhere: Boolean) {
+        if (everywhere && m.out && m.mid != null) send(m.peer, Body.Delete(listOf(m.mid)))
+        withContext(Dispatchers.IO) { db.deleteMessage(m.id) }
+        _changed.emit(m.peer)
+    }
+
+    suspend fun clearChat(peer: String, everywhere: Boolean) {
+        if (everywhere) send(peer, Body.Clear)
+        withContext(Dispatchers.IO) { db.clearChat(peer) }
+        _changed.emit(peer)
+    }
+
+    /** Видалити контакт і бесіду з ним (лише в мене). */
+    suspend fun deleteContact(peer: String) {
+        withContext(Dispatchers.IO) { db.deleteContact(peer) }
+        refreshContacts()
         _changed.emit(peer)
     }
 
@@ -243,6 +267,22 @@ class Repo(context: Context) {
 
     private suspend fun deliver(from: String, raw: String): Boolean {
         val body = Content.decode(raw)
+        // Службові: співрозмовник видалив свої повідомлення «у всіх» або очистив бесіду.
+        when (body) {
+            is Body.Delete -> {
+                if (db.deleteIncoming(from, body.ids) > 0) _changed.emit(from)
+                return false
+            }
+            Body.Clear -> {
+                if (db.contacts().none { it.identity == from }) return false
+                db.clearChat(from)
+                db.addMessage(Message(peer = from, out = false, text = "🧹 ${nameOf(from)} очистив(-ла) бесіду", at = System.currentTimeMillis(), kind = "call"))
+                _changed.emit(from)
+                return false
+            }
+            Body.Unknown -> return false
+            else -> {}
+        }
         val known = db.contacts().any { it.identity == from }
         if (!known) {
             val fp = fingerprintOf(from)
@@ -257,11 +297,12 @@ class Repo(context: Context) {
                 return false
             }
             is Body.Hello -> Message(peer = from, out = false, text = "👋 ${body.name.ifEmpty { "Новий контакт" }} приєднується за запрошенням", at = now)
-            is Body.Text -> Message(peer = from, out = false, text = body.text, at = now)
+            is Body.Text -> Message(peer = from, out = false, text = body.text, at = now, mid = body.id)
             is Body.Voice -> Message(
                 peer = from, out = false, text = "🎤 Голосове", at = now, kind = "voice",
-                voiceMime = body.mime, voiceDur = body.dur, voice = Base64.decode(body.data, Base64.DEFAULT),
+                voiceMime = body.mime, voiceDur = body.dur, voice = Base64.decode(body.data, Base64.DEFAULT), mid = body.id,
             )
+            else -> return false
         }
         val id = db.addMessage(m)
         _changed.emit(from)

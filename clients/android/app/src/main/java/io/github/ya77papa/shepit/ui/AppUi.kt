@@ -10,6 +10,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -53,7 +54,10 @@ import java.util.Locale
 private enum class Screen { CONTACTS, CHAT, SETTINGS }
 
 @Composable
-fun AppUi(app: ShepitApp, act: MainActivity, pendingInvite: MutableState<Pair<String, String?>?>, openRequest: MutableState<String?>, inviteCode: MutableState<String?>) {
+fun AppUi(
+    app: ShepitApp, act: MainActivity, pendingInvite: MutableState<Pair<String, String?>?>, openRequest: MutableState<String?>,
+    inviteCode: MutableState<String?>, showUpdate: MutableState<Boolean>,
+) {
     val repo = app.repo
     var hasAccount by remember { mutableStateOf(repo.hasAccount()) }
     var loaded by remember { mutableStateOf(false) }
@@ -67,10 +71,11 @@ fun AppUi(app: ShepitApp, act: MainActivity, pendingInvite: MutableState<Pair<St
 
     Scaffold(snackbarHost = { SnackbarHost(snack) }, containerColor = MaterialTheme.colorScheme.background) { pad ->
         Box(Modifier.padding(pad).fillMaxSize()) {
+            if (showUpdate.value) UpdateDialog(app, act) { showUpdate.value = false }
             if (!hasAccount) {
                 Welcome(app, pendingInvite.value, inviteCode.value, onDone = { hasAccount = true }, onError = { scope.launch { snack.showSnackbar(it) } })
             } else if (loaded) {
-                Main(app, act, pendingInvite, openRequest, onLogout = { hasAccount = false; loaded = false }, toast = { scope.launch { snack.showSnackbar(it) } })
+                Main(app, act, pendingInvite, openRequest, onUpdate = { showUpdate.value = true }, onLogout = { hasAccount = false; loaded = false }, toast = { scope.launch { snack.showSnackbar(it) } })
             }
         }
     }
@@ -175,7 +180,7 @@ private fun Welcome(app: ShepitApp, invite: Pair<String, String?>?, linkCode: St
 @Composable
 private fun Main(
     app: ShepitApp, act: MainActivity, pendingInvite: MutableState<Pair<String, String?>?>, openRequest: MutableState<String?>,
-    onLogout: () -> Unit, toast: (String) -> Unit,
+    onUpdate: () -> Unit, onLogout: () -> Unit, toast: (String) -> Unit,
 ) {
     val repo = app.repo
     val contacts by repo.contacts.collectAsState()
@@ -220,15 +225,15 @@ private fun Main(
     if (showAdd) AddDialog(app, onDone = { c -> showAdd = false; if (c != null) { current = c; screen = Screen.CHAT } }, toast)
 
     when (screen) {
-        Screen.CONTACTS -> ContactsScreen(app, contacts, onOpen = { current = it; screen = Screen.CHAT }, onInvite = { showInvite = true }, onAdd = { showAdd = true }, onSettings = { screen = Screen.SETTINGS }, act)
+        Screen.CONTACTS -> ContactsScreen(app, contacts, onUpdate, onOpen = { current = it; screen = Screen.CHAT }, onInvite = { showInvite = true }, onAdd = { showAdd = true }, onSettings = { screen = Screen.SETTINGS }, act)
         Screen.CHAT -> current?.let { c -> ChatScreen(app, act, contacts.firstOrNull { it.identity == c.identity } ?: c, onBack = { screen = Screen.CONTACTS; current = null }, toast) }
-        Screen.SETTINGS -> SettingsScreen(app, act, onBack = { screen = Screen.CONTACTS }, onLogout = onLogout, toast)
+        Screen.SETTINGS -> SettingsScreen(app, act, onBack = { screen = Screen.CONTACTS }, onUpdate = onUpdate, onLogout = onLogout, toast)
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ContactsScreen(app: ShepitApp, contacts: List<Contact>, onOpen: (Contact) -> Unit, onInvite: () -> Unit, onAdd: () -> Unit, onSettings: () -> Unit, act: MainActivity) {
+private fun ContactsScreen(app: ShepitApp, contacts: List<Contact>, onUpdate: () -> Unit, onOpen: (Contact) -> Unit, onInvite: () -> Unit, onAdd: () -> Unit, onSettings: () -> Unit, act: MainActivity) {
     val repo = app.repo
     val connected by repo.connected.collectAsState()
     Column(Modifier.fillMaxSize()) {
@@ -245,6 +250,12 @@ private fun ContactsScreen(app: ShepitApp, contacts: List<Contact>, onOpen: (Con
             },
             colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
         )
+        val update by app.updater.available.collectAsState()
+        update?.let { u ->
+            Surface(color = Color(0xFF1F2B18), modifier = Modifier.fillMaxWidth().clickable(onClick = onUpdate)) {
+                Text("⬆️ Доступна нова версія ${u.versionName} — торкнись, щоб оновити", Modifier.padding(12.dp))
+            }
+        }
         if (!Notifications.canFullScreen(act)) {
             Surface(color = Color(0xFF2B2A14), modifier = Modifier.fillMaxWidth().clickable { act.askFullScreen() }) {
                 Text("⚠️ Дозволь Шепоту показувати вхідні дзвінки на весь екран — торкнись тут", Modifier.padding(12.dp))
@@ -357,6 +368,13 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, contact: Contact, onBa
     var recMs by remember { mutableLongStateOf(0L) }
     var playing by remember { mutableLongStateOf(-1L) }
     val callState by app.calls.state.collectAsState()
+    var actionsFor by remember { mutableStateOf<Message?>(null) }
+    var menu by remember { mutableStateOf(false) }
+    var confirm by remember { mutableStateOf<String?>(null) } // clear-me | clear-all | contact
+
+    fun runOp(op: suspend () -> Unit) {
+        scope.launch { runCatching { op() }.onFailure { toast(it.message ?: "Помилка") } }
+    }
 
     suspend fun reload() {
         messages = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { repo.db.messages(contact.identity) }
@@ -380,6 +398,14 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, contact: Contact, onBa
                     app.calls.start(contact.identity)
                     ctx.startActivity(Intent(ctx, CallActivity::class.java))
                 }) { Icon(Icons.Default.Call, "Голосовий дзвінок") }
+                Box {
+                    IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "Ще") }
+                    DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                        DropdownMenuItem(text = { Text("Очистити бесіду в мене") }, onClick = { menu = false; confirm = "clear-me" })
+                        DropdownMenuItem(text = { Text("Очистити в мене і в ${contact.name}") }, onClick = { menu = false; confirm = "clear-all" })
+                        DropdownMenuItem(text = { Text("Видалити контакт", color = Danger) }, onClick = { menu = false; confirm = "contact" })
+                    }
+                }
             },
             colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
         )
@@ -393,10 +419,12 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, contact: Contact, onBa
             }
         }
         LazyColumn(Modifier.weight(1f).padding(horizontal = 12.dp), state = list) {
-            items(messages, key = { it.id }) { m -> Bubble(m, playing == m.id) {
-                VoicePlayer.toggle(ctx, m.id, m.voice ?: return@Bubble, m.voiceMime) { playing = VoicePlayer.playingId }
-                playing = VoicePlayer.playingId
-            } }
+            items(messages, key = { it.id }) { m ->
+                Bubble(m, playing == m.id, onLongPress = { actionsFor = m }) {
+                    VoicePlayer.toggle(ctx, m.id, m.voice ?: return@Bubble, m.voiceMime) { playing = VoicePlayer.playingId }
+                    playing = VoicePlayer.playingId
+                }
+            }
         }
         Surface(color = MaterialTheme.colorScheme.surface) {
             Row(Modifier.fillMaxWidth().padding(8.dp).navigationBarsPadding(), verticalAlignment = Alignment.CenterVertically) {
@@ -427,6 +455,55 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, contact: Contact, onBa
             }
         }
     }
+    actionsFor?.let { m ->
+        AlertDialog(
+            onDismissRequest = { actionsFor = null },
+            title = { Text("Повідомлення") },
+            text = {
+                Column {
+                    if (m.kind != "voice" && m.kind != "call") Text(m.text, maxLines = 4, color = Muted)
+                    if (m.out && m.mid == null && m.kind != "call") Text("Це повідомлення надіслане старою версією — видалити його можна лише в себе.", fontSize = 12.sp, color = Muted)
+                }
+            },
+            confirmButton = {
+                Column(horizontalAlignment = Alignment.End) {
+                    if (m.out && m.mid != null) TextButton(onClick = { actionsFor = null; runOp { repo.deleteMessage(m, everywhere = true) } }) { Text("Видалити у всіх", color = Danger) }
+                    TextButton(onClick = { actionsFor = null; runOp { repo.deleteMessage(m, everywhere = false) } }) { Text("Видалити в мене") }
+                    if (m.kind == "text") TextButton(onClick = {
+                        actionsFor = null
+                        ctx.getSystemService(android.content.ClipboardManager::class.java).setPrimaryClip(android.content.ClipData.newPlainText("Шепіт", m.text))
+                    }) { Text("Копіювати") }
+                    TextButton(onClick = { actionsFor = null }) { Text("Скасувати") }
+                }
+            },
+        )
+    }
+    confirm?.let { what ->
+        AlertDialog(
+            onDismissRequest = { confirm = null },
+            title = { Text(when (what) { "contact" -> "Видалити контакт?"; else -> "Очистити бесіду?" }) },
+            text = {
+                Text(when (what) {
+                    "clear-me" -> "Уся бесіда з ${contact.name} зникне лише в тебе. У співрозмовника все залишиться."
+                    "clear-all" -> "Уся бесіда зникне і в тебе, і в ${contact.name}. Цього не скасувати."
+                    else -> "Контакт ${contact.name} і вся бесіда з ним зникнуть у тебе. Якщо ця людина напише знову, вона з'явиться як новий контакт."
+                })
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirm = null
+                    runOp {
+                        when (what) {
+                            "clear-me" -> repo.clearChat(contact.identity, everywhere = false)
+                            "clear-all" -> repo.clearChat(contact.identity, everywhere = true)
+                            else -> { repo.deleteContact(contact.identity); onBack() }
+                        }
+                    }
+                }) { Text(if (what == "contact") "Видалити" else "Очистити", color = Danger) }
+            },
+            dismissButton = { TextButton(onClick = { confirm = null }) { Text("Скасувати") } },
+        )
+    }
     if (rename) {
         var n by remember { mutableStateOf(contact.name) }
         AlertDialog(
@@ -441,20 +518,25 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, contact: Contact, onBa
 
 private val timeFmt = SimpleDateFormat("HH:mm", Locale("uk"))
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun Bubble(m: Message, playing: Boolean, onPlay: () -> Unit) {
+private fun Bubble(m: Message, playing: Boolean, onLongPress: () -> Unit, onPlay: () -> Unit) {
     val system = m.kind == "call"
     Column(
         Modifier.fillMaxWidth().padding(vertical = 3.dp),
         horizontalAlignment = when { system -> Alignment.CenterHorizontally; m.out -> Alignment.End; else -> Alignment.Start },
     ) {
         if (system) {
-            Text(m.text, color = Muted, fontSize = 13.sp)
+            Text(m.text, color = Muted, fontSize = 13.sp, modifier = Modifier.combinedClickable(onClick = {}, onLongClick = onLongPress))
             return@Column
         }
-        Surface(color = if (m.out) OutBubble else InBubble, shape = RoundedCornerShape(14.dp), modifier = Modifier.widthIn(max = 300.dp)) {
+        Surface(
+            color = if (m.out) OutBubble else InBubble, shape = RoundedCornerShape(14.dp),
+            modifier = Modifier.widthIn(max = 300.dp).clip(RoundedCornerShape(14.dp))
+                .combinedClickable(onClick = { if (m.kind == "voice") onPlay() }, onLongClick = onLongPress),
+        ) {
             if (m.kind == "voice") {
-                Row(Modifier.clickable(onClick = onPlay).padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(if (playing) Icons.Default.Stop else Icons.Default.PlayArrow, null)
                     Spacer(Modifier.width(8.dp))
                     Text("🎤 ${Content.fmtDuration(m.voiceDur)}")
@@ -471,7 +553,7 @@ private fun Bubble(m: Message, playing: Boolean, onPlay: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit, onLogout: () -> Unit, toast: (String) -> Unit) {
+private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit, onUpdate: () -> Unit, onLogout: () -> Unit, toast: (String) -> Unit) {
     val repo = app.repo
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -542,7 +624,31 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
                     }
                 }) { Text(if (busy) "Шифрую…" else "💾 Зберегти у файл") }
             }
-            Section("Версія") { Text("${BuildConfig.VERSION_NAME} (${BuildConfig.COMMIT.take(7)}) · відкритий код: github.com/ya77papa/shepit", color = Muted, fontSize = 13.sp) }
+            Section("Версія й оновлення") {
+                val upd = app.updater
+                val available by upd.available.collectAsState()
+                var auto by remember { mutableStateOf(upd.auto) }
+                var checking by remember { mutableStateOf(false) }
+                var status by remember { mutableStateOf("") }
+                Text("${BuildConfig.VERSION_NAME} (${BuildConfig.COMMIT.take(7)}) · відкритий код: github.com/ya77papa/shepit", color = Muted, fontSize = 13.sp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Перевіряти оновлення автоматично", Modifier.weight(1f))
+                    Switch(checked = auto, onCheckedChange = { auto = it; upd.auto = it })
+                }
+                Text("Раз на 12 год застосунок питає GitHub про нову версію (GitHub бачить лише IP-адресу). Оновлення ставиться тільки після твого підтвердження і тільки якщо підписане тим самим ключем.", color = Muted, fontSize = 12.sp)
+                if (available != null) {
+                    Button(onClick = onUpdate) { Text("⬆️ Оновити до ${available!!.versionName}") }
+                } else {
+                    OutlinedButton(enabled = !checking, onClick = {
+                        checking = true; status = ""
+                        scope.launch {
+                            status = runCatching { upd.check() }.fold({ if (it == null) "✅ У тебе найновіша версія" else "" }, { "Не вдалося перевірити: ${it.message}" })
+                            checking = false
+                        }
+                    }) { Text(if (checking) "Перевіряю…" else "Перевірити оновлення") }
+                    if (status.isNotEmpty()) Text(status, fontSize = 13.sp)
+                }
+            }
             Button(onClick = { confirmLogout = true }, colors = ButtonDefaults.buttonColors(containerColor = Danger, contentColor = Color.White), modifier = Modifier.fillMaxWidth()) {
                 Text("Вийти й стерти ключі з цього телефона")
             }
@@ -554,6 +660,49 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
         text = { Text("Без резервної копії ключі буде втрачено назавжди.") },
         confirmButton = { TextButton(onClick = { repo.wipe(); confirmLogout = false; ctx.stopService(Intent(ctx, io.github.ya77papa.shepit.service.ShepitService::class.java)); onLogout() }) { Text("Стерти", color = Danger) } },
         dismissButton = { TextButton(onClick = { confirmLogout = false }) { Text("Скасувати") } },
+    )
+}
+
+@Composable
+private fun UpdateDialog(app: ShepitApp, act: MainActivity, onClose: () -> Unit) {
+    val upd = app.updater
+    val rel by upd.available.collectAsState()
+    val progress by upd.progress.collectAsState()
+    val err by upd.error.collectAsState()
+    val scope = rememberCoroutineScope()
+    var canInstall by remember { mutableStateOf(upd.canInstall()) }
+    var checked by remember { mutableStateOf(rel != null) }
+    LifecycleResume { canInstall = upd.canInstall() }
+    LaunchedEffect(Unit) { if (rel == null) { runCatching { upd.check() }; checked = true } }
+    AlertDialog(
+        onDismissRequest = { if (progress == null) onClose() },
+        title = { Text("Оновлення Шепоту") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                val r = rel
+                when {
+                    !checked -> Text("Перевіряю…")
+                    r == null -> Text("У тебе найновіша версія (${BuildConfig.VERSION_NAME}).")
+                    else -> {
+                        Text("Нова версія: ${r.versionName} (зараз ${BuildConfig.VERSION_NAME}), ${r.size / 1_000_000} МБ.")
+                        if (!canInstall) Text("Спершу дозволь Шепоту встановлювати оновлення — це одноразове налаштування Android.", color = Muted, fontSize = 13.sp)
+                        progress?.let { p ->
+                            LinearProgressIndicator(progress = { p }, modifier = Modifier.fillMaxWidth())
+                            Text(if (p >= 1f) "Перевіряю й встановлюю…" else "Завантажую… ${(p * 100).toInt()}%", fontSize = 13.sp)
+                        }
+                    }
+                }
+                if (err.isNotEmpty()) Text(err, color = Danger, fontSize = 13.sp)
+            }
+        },
+        confirmButton = {
+            val r = rel
+            if (r != null && progress == null) {
+                if (!canInstall) TextButton(onClick = { upd.openInstallPermission(act) }) { Text("Дозволити") }
+                else TextButton(onClick = { scope.launch { runCatching { upd.downloadAndInstall(r) } } }) { Text("Оновити") }
+            }
+        },
+        dismissButton = { if (progress == null) TextButton(onClick = onClose) { Text(if (rel == null) "Закрити" else "Пізніше") } },
     )
 }
 
