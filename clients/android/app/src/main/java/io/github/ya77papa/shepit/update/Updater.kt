@@ -53,7 +53,8 @@ class Updater(private val ctx: Context, private val db: Db) {
     }
 
     suspend fun check(): Release? = withContext(Dispatchers.IO) {
-        val req = Request.Builder().url("https://api.github.com/repos/$REPO/releases?per_page=10")
+        // «Останній» реліз за позначкою GitHub (CI ставить make_latest) — не залежить від сортування тегів.
+        val req = Request.Builder().url("https://api.github.com/repos/$REPO/releases/latest")
             .header("Accept", "application/vnd.github+json").build()
         val json = http.newCall(req).execute().use { r ->
             if (!r.isSuccessful) error("GitHub: ${r.code}")
@@ -136,9 +137,13 @@ class Updater(private val ctx: Context, private val db: Db) {
     companion object {
         const val REPO = "ya77papa/shepit"
 
-        /** Найновіший Android-реліз з відповіді GitHub, якщо він новіший за [current]. */
+        /**
+         * Найновіший Android-реліз з відповіді GitHub (один реліз або список), якщо він новіший
+         * за [current]. Порівнюємо номери збірок як числа: GitHub сортує теги як текст (0.1.9 > 0.1.10).
+         */
         fun newest(json: String, current: Int): Release? {
-            val list = JSONArray(json)
+            val list = if (json.trimStart().startsWith("{")) JSONArray().put(org.json.JSONObject(json)) else JSONArray(json)
+            var best: Release? = null
             for (i in 0 until list.length()) {
                 val o = list.getJSONObject(i)
                 val tag = o.optString("tag_name")
@@ -153,9 +158,9 @@ class Updater(private val ctx: Context, private val db: Db) {
                     ?: Regex("\\b[0-9a-f]{64}\\b").find(o.optString("body"))?.value
                     ?: continue
                 val rel = Release(name, code, apk.getString("browser_download_url"), apk.optLong("size"), sha, o.optString("html_url"))
-                return rel.takeIf { it.versionCode > current }
+                if (best == null || rel.versionCode > best.versionCode) best = rel
             }
-            return null
+            return best?.takeIf { it.versionCode > current }
         }
     }
 }

@@ -18,6 +18,15 @@ class UpdaterTest {
         assert(r.url.endsWith(".apk"))
     }
 
+    /** GitHub сортує теги як текст: 0.1.9 стоїть перед 0.1.10 — брати треба найбільший номер збірки. */
+    @Test
+    fun numericNotLexicographic() {
+        fun rel(v: String) = """{"tag_name":"android-v$v","draft":false,"prerelease":false,"body":"","html_url":"","assets":[{"name":"s.apk","size":1,"digest":"sha256:${"a".repeat(64)}","browser_download_url":"https://x/s.apk"}]}"""
+        assertEquals("0.1.10", Updater.newest("[${rel("0.1.9")},${rel("0.1.10")}]", 9)!!.versionName)
+        assertEquals("0.2.11", Updater.newest(rel("0.2.11"), 10)!!.versionName)
+        assertNull(Updater.newest(rel("0.2.11"), 11))
+    }
+
     @Test
     fun nothingWhenCurrent() {
         assertNull(Updater.newest(json, 6))
