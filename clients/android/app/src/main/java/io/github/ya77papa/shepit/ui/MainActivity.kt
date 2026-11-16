@@ -31,6 +31,8 @@ class MainActivity : ComponentActivity() {
     private val showUpdate = mutableStateOf(false)
     /** Посилання на канал (#c=…&k=…). */
     private val channelLink = mutableStateOf<Pair<String, String?>?>(null)
+    /** Текст, яким поділились з іншого застосунку (ACTION_SEND). */
+    private val shared = mutableStateOf<String?>(null)
 
     private val notifPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
     val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
@@ -39,9 +41,19 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         darkSystemBars()
         handleIntent(intent)
+        applySecureFlag()
         setContent {
             ShepitTheme {
-                AppUi(app, this, pendingInvite, openRequest, inviteCode, showUpdate, channelLink)
+                val locked by app.lock.locked.collectAsState()
+                androidx.compose.foundation.layout.Box {
+                    AppUi(app, this@MainActivity, pendingInvite, openRequest, inviteCode, showUpdate, channelLink, shared)
+                    if (locked && app.repo.hasAccount()) LockScreen(app.lock, this@MainActivity) {
+                        app.repo.wipe()
+                        app.lock.clearPin(); app.lock.bioEnabled = false; app.lock.unlock()
+                        stopService(Intent(this@MainActivity, ShepitService::class.java))
+                        recreate()
+                    }
+                }
             }
         }
     }
@@ -52,6 +64,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleIntent(i: Intent?) {
+        if (i?.action == Intent.ACTION_SEND && i.type?.startsWith("text/") == true) {
+            val subject = i.getStringExtra(Intent.EXTRA_SUBJECT)?.trim().orEmpty()
+            val text = i.getStringExtra(Intent.EXTRA_TEXT)?.trim().orEmpty()
+            val all = listOf(subject, text).filter { it.isNotEmpty() }.distinct().joinToString("\n")
+            if (all.isNotEmpty()) shared.value = all.take(4000)
+            return
+        }
         i?.data?.toString()?.let { url ->
             io.github.ya77papa.shepit.data.Channels.parseLink(url)?.let { channelLink.value = it }
             app.repo.inviteCodeFrom(url)?.let { inviteCode.value = it }
@@ -59,6 +78,23 @@ class MainActivity : ComponentActivity() {
         }
         i?.getStringExtra(EXTRA_PEER)?.let { openRequest.value = it }
         if (i?.getBooleanExtra(EXTRA_UPDATE, false) == true) showUpdate.value = true
+    }
+
+    override fun onStart() {
+        super.onStart()
+        app.lock.onForeground()
+        applySecureFlag()
+    }
+
+    override fun onStop() {
+        if (!isChangingConfigurations) app.lock.onBackground()
+        super.onStop()
+    }
+
+    /** Приховувати вміст у списку застосунків і на скріншотах — якщо увімкнено в налаштуваннях. */
+    fun applySecureFlag() {
+        if (app.lock.secureScreen) window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+        else window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
     }
 
     override fun onResume() {
@@ -88,12 +124,14 @@ class MainActivity : ComponentActivity() {
 
     @Suppress("BatteryLife")
     fun askBattery() {
+        app.lock.expectReturn()
         runCatching {
             startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
         }
     }
 
     fun askFullScreen() {
+        app.lock.expectReturn()
         if (Build.VERSION.SDK_INT >= 34) runCatching {
             startActivity(Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:$packageName")))
         }

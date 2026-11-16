@@ -203,7 +203,7 @@ fun rememberAvatarPicker(onError: (String) -> Unit, onPicked: suspend (String) -
             scope.launch { runCatching { onPicked(b64) }.onFailure { onError(it.message ?: "Помилка") } }
         }
     }
-    return { launcher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
+    return { (ctx.applicationContext as io.github.ya77papa.shepit.ShepitApp).lock.expectReturn(); launcher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -476,7 +476,7 @@ private val postTime = SimpleDateFormat("dd.MM HH:mm", Locale("uk"))
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ChannelScreen(
-    app: ShepitApp, initial: ChannelRec, subscribed: Boolean,
+    app: ShepitApp, initial: ChannelRec, subscribed: Boolean, initialDraft: String? = null,
     onBack: () -> Unit, onSubscribe: (ChannelRec) -> Unit, onGone: () -> Unit, toast: (String) -> Unit,
 ) {
     val repo = app.repo
@@ -488,7 +488,7 @@ fun ChannelScreen(
     var posts by remember { mutableStateOf(emptyList<Channels.Post>()) }
     var more by remember { mutableStateOf(false) }
     var loading by remember { mutableStateOf(true) }
-    var draft by remember { mutableStateOf("") }
+    var draft by remember(initial.id) { mutableStateOf(initialDraft ?: "") }
     var busy by remember { mutableStateOf(false) }
     var info by remember { mutableStateOf(false) }
     var edit by remember { mutableStateOf(false) }
@@ -608,7 +608,7 @@ fun ChannelScreen(
                     Text(link, fontFamily = FontFamily.Monospace, fontSize = 11.sp, color = Muted)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(onClick = {
-                            ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, "Канал «${ch.name}» у Шепоті: $link"), "Поділитися"))
+                            (ctx.applicationContext as io.github.ya77papa.shepit.ShepitApp).lock.expectReturn(); ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, "Канал «${ch.name}» у Шепоті: $link"), "Поділитися"))
                         }) { Text("Поділитися") }
                     }
                     if (ch.mine) {

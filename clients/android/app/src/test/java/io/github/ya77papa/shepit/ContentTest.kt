@@ -42,6 +42,18 @@ class ContentTest {
     }
 
     @Test
+    fun reactionsFromWeb() {
+        assertEquals(Body.React(id, "👍"), Content.decode("""{"t":"react","id":"$id","e":"👍","v":1}"""))
+        assertEquals(Body.React(id, "❤️", id), Content.decode("""{"t":"react","id":"$id","e":"❤️","g":"$id","v":1}"""))
+        assertEquals(Body.React(id, ""), Content.decode("""{"t":"react","id":"$id","e":"","v":1}"""))
+        assertEquals("латиниця/розмітка — не реакція", Body.Unknown, Content.decode("""{"t":"react","id":"$id","e":"<b>","v":1}"""))
+        assertEquals(Body.Unknown, Content.decode("""{"t":"react","id":"x","e":"👍","v":1}"""))
+        val r = Body.React(id, "🇺🇦", id)
+        assertEquals(r, Content.decode(Content.encode(r)))
+        assertTrue(Content.EMOJI.flatMap { it.second }.all { Content.validReaction(it) })
+    }
+
+    @Test
     fun roundTrip() {
         val mid = Content.newMsgId()
         assertTrue(mid.matches(Regex("[0-9a-f]{32}")))

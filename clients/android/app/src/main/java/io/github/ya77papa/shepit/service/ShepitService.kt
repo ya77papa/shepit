@@ -50,7 +50,8 @@ class ShepitService : Service() {
             jobs += repo.scope.launch {
                 repo.incoming.collect { m ->
                     if (!MainActivity.visible || MainActivity.openPeer != m.peer) {
-                        Notifications.showMessage(
+                        val hide = (application as ShepitApp).lock.enabled // заблоковано — без тексту й імен
+                        if (hide) Notifications.showMessage(this@ShepitService, "Шепіт", m.peer, "Нове повідомлення") else Notifications.showMessage(
                             this@ShepitService, repo.nameOf(m.peer), m.peer,
                             // У групі — хто написав.
                             if (m.sender != null) "${repo.memberName(m.sender, repo.db.group(m.peer.removePrefix("g:")))}: ${m.text}" else m.text,

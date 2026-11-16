@@ -48,6 +48,7 @@ object Backup {
                         if (m.kind != "text") put("kind", m.kind)
                         if (m.mid != null) put("mid", m.mid)
                         if (m.sender != null) put("from", m.sender)
+                        if (m.reactions.isNotEmpty()) put("reactions", JSONObject(m.reactions as Map<*, *>))
                         if (m.voice != null) put("voice", JSONObject().put("data", b64(m.voice)).put("mime", m.voiceMime).put("dur", m.voiceDur))
                     })
                 }
@@ -90,6 +91,7 @@ object Backup {
                     voiceMime = v?.optString("mime"), voiceDur = v?.optLong("dur") ?: 0, voice = v?.let { unb64(it.getString("data")) },
                     mid = o.optString("mid").takeIf { it.length == 32 },
                     sender = o.optString("from").ifEmpty { null },
+                    reactions = o.optJSONObject("reactions")?.let { r -> r.keys().asSequence().associateWith { r.getString(it) } } ?: emptyMap(),
                 )
             }
         }

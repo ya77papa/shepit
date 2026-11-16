@@ -54,12 +54,13 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-private enum class Screen { CONTACTS, CHAT, SETTINGS, GROUP_INFO, NEW_GROUP, CHANNEL, NEW_CHANNEL, FIND_CHANNEL }
+private enum class Screen { CONTACTS, CHAT, SETTINGS, GROUP_INFO, NEW_GROUP, CHANNEL, NEW_CHANNEL, FIND_CHANNEL, SHARE }
 
 @Composable
 fun AppUi(
     app: ShepitApp, act: MainActivity, pendingInvite: MutableState<Pair<String, String?>?>, openRequest: MutableState<String?>,
     inviteCode: MutableState<String?>, showUpdate: MutableState<Boolean>, channelLink: MutableState<Pair<String, String?>?>,
+    shared: MutableState<String?>,
 ) {
     val repo = app.repo
     var hasAccount by remember { mutableStateOf(repo.hasAccount()) }
@@ -78,7 +79,7 @@ fun AppUi(
             if (!hasAccount) {
                 Welcome(app, pendingInvite.value, inviteCode.value, onDone = { hasAccount = true }, onError = { scope.launch { snack.showSnackbar(it) } })
             } else if (loaded) {
-                Main(app, act, pendingInvite, openRequest, channelLink, onUpdate = { showUpdate.value = true }, onLogout = { hasAccount = false; loaded = false }, toast = { scope.launch { snack.showSnackbar(it) } })
+                Main(app, act, pendingInvite, openRequest, channelLink, shared, onUpdate = { showUpdate.value = true }, onLogout = { hasAccount = false; loaded = false }, toast = { scope.launch { snack.showSnackbar(it) } })
             }
         }
     }
@@ -183,7 +184,7 @@ private fun Welcome(app: ShepitApp, invite: Pair<String, String?>?, linkCode: St
 @Composable
 private fun Main(
     app: ShepitApp, act: MainActivity, pendingInvite: MutableState<Pair<String, String?>?>, openRequest: MutableState<String?>,
-    channelLink: MutableState<Pair<String, String?>?>,
+    channelLink: MutableState<Pair<String, String?>?>, shared: MutableState<String?>,
     onUpdate: () -> Unit, onLogout: () -> Unit, toast: (String) -> Unit,
 ) {
     val repo = app.repo
@@ -196,8 +197,11 @@ private fun Main(
     var showInvite by remember { mutableStateOf(false) }
     var showAdd by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    /** Чернетка для відкритої бесіди/каналу (текст, яким поділились). */
+    var draftFor by remember { mutableStateOf<Pair<String, String>?>(null) }
 
     fun openChat(p: String) { peer = p; screen = Screen.CHAT }
+    LaunchedEffect(shared.value) { if (shared.value != null) screen = Screen.SHARE }
     fun home() { screen = Screen.CONTACTS; peer = null; channel = null }
 
     /** Канал за ідентифікатором (і ключем): підписаний — одразу, інакше попередній перегляд. */
@@ -265,7 +269,16 @@ private fun Main(
             onInvite = { showInvite = true }, onAdd = { showAdd = true }, onSettings = { screen = Screen.SETTINGS },
             onNewGroup = { screen = Screen.NEW_GROUP }, onNewChannel = { screen = Screen.NEW_CHANNEL }, onFindChannel = { screen = Screen.FIND_CHANNEL }, act,
         )
-        Screen.CHAT -> peer?.let { p -> ChatScreen(app, act, p, onBack = { home() }, onGroupInfo = { screen = Screen.GROUP_INFO }, toast) }
+        Screen.CHAT -> peer?.let { p ->
+            val initial = draftFor?.takeIf { it.first == p }?.second
+            ChatScreen(app, act, p, onBack = { home() }, onGroupInfo = { screen = Screen.GROUP_INFO }, toast, initialDraft = initial)
+        }
+        Screen.SHARE -> ShareScreen(
+            app, shared.value.orEmpty(),
+            onBack = { shared.value = null; home() },
+            onChat = { p -> draftFor = p to shared.value.orEmpty(); shared.value = null; openChat(p) },
+            onChannel = { c -> draftFor = "c:${c.id}" to shared.value.orEmpty(); shared.value = null; channel = c; channelSub = true; screen = Screen.CHANNEL },
+        )
         Screen.GROUP_INFO -> peer?.let { p -> GroupInfoScreen(app, p.removePrefix("g:"), onBack = { screen = Screen.CHAT }, onDeleted = { home() }, toast) }
         Screen.SETTINGS -> SettingsScreen(app, act, onBack = { home() }, onUpdate = onUpdate, onLogout = onLogout, toast)
         Screen.NEW_GROUP -> NewGroupScreen(app, onBack = { home() }, onCreated = { openChat("g:${it.id}") }, toast)
@@ -273,7 +286,7 @@ private fun Main(
         Screen.FIND_CHANNEL -> FindChannelScreen(app, onBack = { home() }, onOpen = { openChannel(it, null) }, toast)
         Screen.CHANNEL -> channel?.let { c ->
             ChannelScreen(
-                app, c, channelSub, onBack = { home() },
+                app, c, channelSub, initialDraft = draftFor?.takeIf { it.first == "c:${c.id}" }?.second, onBack = { home() },
                 onSubscribe = { rec -> scope.launch { repo.saveChannel(rec); channelSub = true; toast("Ти підписався(-лась) на «${rec.name}»") } },
                 onGone = { home() }, toast = toast,
             )
@@ -412,7 +425,7 @@ private fun InviteDialog(app: ShepitApp, onClose: () -> Unit) {
         },
         confirmButton = {
             TextButton(onClick = {
-                ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, "Пиши мені в Шепоті — без номера телефону, з наскрізним шифруванням: $url"), "Поділитися"))
+                (ctx.applicationContext as io.github.ya77papa.shepit.ShepitApp).lock.expectReturn(); ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, "Пиши мені в Шепоті — без номера телефону, з наскрізним шифруванням: $url"), "Поділитися"))
             }) { Text("Поділитися") }
         },
         dismissButton = {
@@ -452,7 +465,7 @@ private fun AddDialog(app: ShepitApp, onDone: (Contact?) -> Unit, toast: (String
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: () -> Unit, onGroupInfo: () -> Unit, toast: (String) -> Unit) {
+private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: () -> Unit, onGroupInfo: () -> Unit, toast: (String) -> Unit, initialDraft: String? = null) {
     val repo = app.repo
     val contacts by repo.contacts.collectAsState()
     val groups by repo.groups.collectAsState()
@@ -463,7 +476,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var messages by remember { mutableStateOf(emptyList<Message>()) }
-    var draft by remember { mutableStateOf("") }
+    var draft by remember(peer) { mutableStateOf(initialDraft ?: "") }
     var busy by remember { mutableStateOf(false) }
     var showSafety by remember { mutableStateOf(false) }
     var rename by remember { mutableStateOf(false) }
@@ -474,6 +487,9 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
     var playing by remember { mutableLongStateOf(-1L) }
     val callState by app.calls.state.collectAsState()
     var actionsFor by remember { mutableStateOf<Message?>(null) }
+    var emojiOpen by remember { mutableStateOf(false) }
+    val myId = remember { repo.core?.identity() }
+    fun react(m: Message, e: String) = scope.launch { runCatching { repo.react(m, e) }.onFailure { toast(it.message ?: "Помилка") } }
     var menu by remember { mutableStateOf(false) }
     var confirm by remember { mutableStateOf<String?>(null) } // clear-me | clear-all | contact
 
@@ -543,7 +559,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
         }
         LazyColumn(Modifier.weight(1f).padding(horizontal = 12.dp), state = list) {
             items(messages, key = { it.id }) { m ->
-                Bubble(m, playing == m.id, sender = if (group != null && !m.out && m.kind != "call") displayName(app, contacts, group, m.sender) else null, onLongPress = { actionsFor = m }) {
+                Bubble(m, playing == m.id, sender = if (group != null && !m.out && m.kind != "call") displayName(app, contacts, group, m.sender) else null, myId = myId, onReact = { e -> react(m, e) }, onLongPress = { actionsFor = m }) {
                     VoicePlayer.toggle(ctx, m.id, m.voice ?: return@Bubble, m.voiceMime) { playing = VoicePlayer.playingId }
                     playing = VoicePlayer.playingId
                 }
@@ -552,6 +568,8 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
         if (group?.left == true) Surface(color = MaterialTheme.colorScheme.surface) {
             Text("Ти не в цій групі — писати сюди не можна.", Modifier.fillMaxWidth().padding(16.dp).navigationBarsPadding(), color = Muted)
         } else Surface(color = MaterialTheme.colorScheme.surface) {
+            Column {
+            if (emojiOpen && !recording) EmojiPanel { e -> draft += e }
             Row(Modifier.fillMaxWidth().padding(8.dp).navigationBarsPadding(), verticalAlignment = Alignment.CenterVertically) {
                 if (recording) {
                     Text("Запис ${Content.fmtDuration(recMs)} / ${Content.fmtDuration(VoiceRecorder.MAX_MS)}", Modifier.weight(1f).padding(8.dp))
@@ -561,6 +579,9 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
                         recorder.stop()?.let { (d, dur) -> scope.launch { runCatching { repo.sendVoice(peer, recorder.mime, dur, d) }.onFailure { toast(it.message ?: "Помилка") } } }
                     }) { Text("Надіслати") }
                 } else {
+                    IconButton(onClick = { emojiOpen = !emojiOpen }) {
+                        Icon(if (emojiOpen) Icons.Default.Keyboard else Icons.Default.EmojiEmotions, "Емодзі", tint = if (emojiOpen) Accent else Muted)
+                    }
                     OutlinedTextField(draft, { draft = it }, placeholder = { Text("Повідомлення") }, modifier = Modifier.weight(1f), maxLines = 5)
                     if (draft.isNotBlank()) {
                         IconButton(enabled = !busy, onClick = {
@@ -578,6 +599,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
                     }
                 }
             }
+            }
         }
     }
     actionsFor?.let { m ->
@@ -586,6 +608,17 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
             title = { Text("Повідомлення") },
             text = {
                 Column {
+                    if (m.mid != null && m.kind != "call") {
+                        Row(Modifier.fillMaxWidth().padding(bottom = 10.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Content.QUICK_REACTIONS.forEach { e ->
+                                val mine = myId != null && m.reactions[myId] == e
+                                Box(
+                                    Modifier.clip(CircleShape).background(if (mine) Accent.copy(alpha = 0.25f) else Color.Transparent)
+                                        .clickable { actionsFor = null; react(m, e) }.padding(4.dp),
+                                ) { Text(e, fontSize = 24.sp) }
+                            }
+                        }
+                    }
                     if (m.kind != "voice" && m.kind != "call") Text(m.text, maxLines = 4, color = Muted)
                     if (m.out && m.mid == null && m.kind != "call") Text("Це повідомлення надіслане старою версією — видалити його можна лише в себе.", fontSize = 12.sp, color = Muted)
                 }
@@ -645,7 +678,10 @@ private val timeFmt = SimpleDateFormat("HH:mm", Locale("uk"))
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun Bubble(m: Message, playing: Boolean, sender: String? = null, onLongPress: () -> Unit, onPlay: () -> Unit) {
+private fun Bubble(
+    m: Message, playing: Boolean, sender: String? = null, myId: String? = null,
+    onReact: (String) -> Unit = {}, onLongPress: () -> Unit, onPlay: () -> Unit,
+) {
     val system = m.kind == "call"
     Column(
         Modifier.fillMaxWidth().padding(vertical = 3.dp),
@@ -669,6 +705,19 @@ private fun Bubble(m: Message, playing: Boolean, sender: String? = null, onLongP
                 }
             } else {
                 Text(m.text, Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+            }
+        }
+        if (m.reactions.isNotEmpty()) {
+            Row(Modifier.padding(top = 3.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                m.reactions.entries.groupBy { it.value }.forEach { (e, who) ->
+                    val mine = who.any { it.key == myId }
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = if (mine) Accent.copy(alpha = 0.18f) else InBubble,
+                        border = androidx.compose.foundation.BorderStroke(1.dp, if (mine) Accent else Color(0xFF243246)),
+                        modifier = Modifier.clip(RoundedCornerShape(12.dp)).clickable { onReact(e) },
+                    ) { Text("$e ${who.size}", Modifier.padding(horizontal = 8.dp, vertical = 2.dp), fontSize = 13.sp) }
+                }
             }
         }
         Text(timeFmt.format(Date(m.at)), color = Muted, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 6.dp))
@@ -756,6 +805,92 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
                     }) { Text("Копіювати журнал") }
                 }
             }
+            Section("Блокування") {
+                val lock = app.lock
+                var pinOn by remember { mutableStateOf(lock.pinEnabled) }
+                var bioOn by remember { mutableStateOf(lock.bioEnabled) }
+                var delayMs by remember { mutableLongStateOf(lock.delayMs) }
+                var secure by remember { mutableStateOf(lock.secureScreen) }
+                var pinDialog by remember { mutableStateOf<String?>(null) } // set | off
+                val bioOk = remember { lock.biometricAvailable() }
+                Text("Хто тримає розблокований телефон, не відкриє Шепіт без PIN-коду чи відбитка. Вхідні дзвінки можна прийняти й без розблокування. Поки блокування увімкнене, сповіщення не показують текст повідомлень.", color = Muted, fontSize = 12.sp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("PIN-код", Modifier.weight(1f))
+                    Switch(checked = pinOn, onCheckedChange = { pinDialog = if (it) "set" else "off" })
+                }
+                if (pinOn) TextButton(onClick = { pinDialog = "change" }) { Text("Змінити PIN-код") }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Відбиток пальця")
+                        if (!bioOk) Text("Недоступно: на телефоні немає сканера або не додано відбиток.", color = Muted, fontSize = 12.sp)
+                        else if (!pinOn) Text("Запасний варіант — блокування самого телефона.", color = Muted, fontSize = 12.sp)
+                    }
+                    Switch(enabled = bioOk, checked = bioOn, onCheckedChange = { on ->
+                        if (!on) { lock.bioEnabled = false; bioOn = false }
+                        else lock.promptBiometric(act, "Підтверди відбиток", onSuccess = { lock.bioEnabled = true; bioOn = true }, onFallback = {})
+                    })
+                }
+                if (pinOn || bioOn) {
+                    Text("Блокувати після виходу з застосунку", color = Muted, fontSize = 13.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf(0L to "Одразу", 60_000L to "Через 1 хв", 300_000L to "Через 5 хв").forEach { (ms, label) ->
+                            FilterChip(selected = delayMs == ms, onClick = { lock.delayMs = ms; delayMs = ms }, label = { Text(label) })
+                        }
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Приховувати вміст")
+                        Text("У списку відкритих застосунків і на скріншотах (скріншоти Шепоту стануть неможливими).", color = Muted, fontSize = 12.sp)
+                    }
+                    Switch(checked = secure, onCheckedChange = { lock.secureScreen = it; secure = it; act.applySecureFlag() })
+                }
+                pinDialog?.let { mode ->
+                    var step by remember(mode) { mutableStateOf(if (mode == "set") "new" else "current") }
+                    var first by remember(mode) { mutableStateOf("") }
+                    var msg by remember(mode) { mutableStateOf("") }
+                    var checking by remember(mode) { mutableStateOf(false) }
+                    AlertDialog(
+                        onDismissRequest = { pinDialog = null },
+                        title = { Text(when (step) { "current" -> "Поточний PIN-код"; "new" -> "Новий PIN-код (4–8 цифр)"; else -> "Повтори PIN-код" }) },
+                        text = {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                                if (msg.isNotEmpty()) Text(msg, color = Danger, fontSize = 13.sp)
+                                Spacer(Modifier.height(8.dp))
+                                key(step) {
+                                    PinPad(if (step == "current") lock.pinLength else if (step == "repeat") first.length else 0, enabled = !checking) { pin ->
+                                        when (step) {
+                                            "current" -> {
+                                                checking = true
+                                                scope.launch {
+                                                    val ok = withContext(kotlinx.coroutines.Dispatchers.Default) { lock.checkPin(pin) }
+                                                    checking = false
+                                                    when {
+                                                        !ok -> msg = if (lock.waitSeconds() > 0) "Забагато спроб — зачекай ${lock.waitSeconds()} с" else "Неправильний PIN-код"
+                                                        mode == "off" -> { lock.clearPin(); pinOn = false; pinDialog = null }
+                                                        else -> { msg = ""; step = "new" }
+                                                    }
+                                                }
+                                            }
+                                            "new" -> { first = pin; msg = ""; step = "repeat" }
+                                            else -> if (pin == first) {
+                                                checking = true
+                                                scope.launch {
+                                                    withContext(kotlinx.coroutines.Dispatchers.Default) { lock.setPin(pin) }
+                                                    checking = false; pinOn = true; pinDialog = null
+                                                    toast("PIN-код збережено")
+                                                }
+                                            } else { msg = "PIN-коди не збігаються — спробуй ще раз"; first = ""; step = "new" }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        confirmButton = {},
+                        dismissButton = { TextButton(onClick = { pinDialog = null }) { Text("Скасувати") } },
+                    )
+                }
+            }
             Section("Резервна копія") {
                 Text("Файл з ключами, контактами й історією, зашифрований паролем. Сумісний з веб-версією.", color = Muted, fontSize = 13.sp)
                 OutlinedTextField(pw1, { pw1 = it }, label = { Text("Пароль (щонайменше ${Backup.MIN_PASSWORD} символів)") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
@@ -765,7 +900,7 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
                     busy = true
                     scope.launch {
                         runCatching { repo.exportBackup(pw1) }
-                            .onSuccess { pendingBackup = it; pw1 = ""; pw2 = ""; save.launch("shepit-${SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).format(Date())}.shepit-backup") }
+                            .onSuccess { pendingBackup = it; pw1 = ""; pw2 = ""; (ctx.applicationContext as io.github.ya77papa.shepit.ShepitApp).lock.expectReturn(); save.launch("shepit-${SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).format(Date())}.shepit-backup") }
                             .onFailure { toast(it.message ?: "Помилка") }
                         busy = false
                     }
@@ -869,5 +1004,74 @@ private fun LifecycleResume(onResume: () -> Unit) {
         val obs = androidx.lifecycle.LifecycleEventObserver { _, e -> if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) onResume() }
         owner.lifecycle.addObserver(obs)
         onDispose { owner.lifecycle.removeObserver(obs) }
+    }
+}
+
+
+/** Панель емодзі над полем введення (ті самі групи, що у веб-версії). */
+@Composable
+private fun EmojiPanel(onPick: (String) -> Unit) {
+    androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
+        columns = androidx.compose.foundation.lazy.grid.GridCells.Adaptive(44.dp),
+        modifier = Modifier.fillMaxWidth().height(240.dp).padding(horizontal = 8.dp),
+    ) {
+        Content.EMOJI.forEach { (title, list) ->
+            item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }) {
+                Text(title, color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp, bottom = 2.dp, start = 4.dp))
+            }
+            items(list.size) { i ->
+                Box(Modifier.size(44.dp).clip(RoundedCornerShape(10.dp)).clickable { onPick(list[i]) }, contentAlignment = Alignment.Center) {
+                    Text(list[i], fontSize = 24.sp)
+                }
+            }
+        }
+    }
+}
+
+
+/** «Поділитися» з іншого застосунку: кому надіслати (текст стане чернеткою — можна доповнити). */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ShareScreen(app: ShepitApp, text: String, onBack: () -> Unit, onChat: (String) -> Unit, onChannel: (ChannelRec) -> Unit) {
+    val repo = app.repo
+    val contacts by repo.contacts.collectAsState()
+    val groups by repo.groups.collectAsState()
+    val channels by repo.channels.collectAsState()
+    BackHandler(onBack = onBack)
+    Column(Modifier.fillMaxSize()) {
+        TopAppBar(
+            navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Скасувати") } },
+            title = { Text("Надіслати в Шепіт", fontWeight = FontWeight.Bold) },
+            colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
+        )
+        Surface(color = InBubble, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(12.dp)) {
+            Text(text, Modifier.padding(12.dp), maxLines = 6, color = Muted)
+        }
+        LazyColumn(Modifier.weight(1f)) {
+            if (contacts.isNotEmpty()) item { SectionLabel("Контакти") }
+            items(contacts, key = { it.identity }) { c ->
+                ListItem(
+                    leadingContent = { AvatarView(c.name, c.avatar, 40.dp) }, headlineContent = { Text(c.name) },
+                    modifier = Modifier.clickable { onChat(c.identity) }, colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                )
+            }
+            val active = groups.filter { !it.left }
+            if (active.isNotEmpty()) item { SectionLabel("Групи") }
+            items(active, key = { "g:" + it.id }) { g ->
+                ListItem(
+                    leadingContent = { AvatarView(g.name, g.avatar, 40.dp) }, headlineContent = { Text(g.name) },
+                    modifier = Modifier.clickable { onChat("g:${g.id}") }, colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                )
+            }
+            val mine = channels.filter { it.mine }
+            if (mine.isNotEmpty()) item { SectionLabel("Мої канали") }
+            items(mine, key = { "c:" + it.id }) { c ->
+                ListItem(
+                    leadingContent = { AvatarView(c.name, c.avatar, 40.dp) }, headlineContent = { Text(c.name) },
+                    modifier = Modifier.clickable { onChannel(c) }, colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                )
+            }
+            if (contacts.isEmpty() && active.isEmpty() && mine.isEmpty()) item { Text("Немає кому надіслати — спершу додай контакт.", Modifier.padding(16.dp), color = Muted) }
+        }
     }
 }

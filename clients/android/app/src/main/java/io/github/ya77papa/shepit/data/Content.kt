@@ -21,6 +21,8 @@ sealed interface Body {
     data class GroupState(val g: String, val name: String, val avatar: String?, val members: List<Member>, val admins: List<String>, val ver: Int) : Body
     /** Я виходжу з групи. */
     data class Leave(val g: String) : Body
+    /** Реакція на повідомлення з id (порожня e — прибрати мою). У групі — з g. */
+    data class React(val id: String, val e: String, val g: String? = null) : Body
     /** Очистити всю бесіду у співрозмовника. */
     data object Clear : Body
     /** Тип з новішої версії — пропустити. */
@@ -44,6 +46,7 @@ object Content {
                 put("admins", org.json.JSONArray(b.admins)); put("ver", b.ver)
             }
             is Body.Leave -> { put("t", "leave"); put("g", b.g) }
+            is Body.React -> { put("t", "react"); put("id", b.id); put("e", b.e); b.g?.let { put("g", it) } }
             Body.Clear -> put("t", "clear")
             Body.Unknown -> put("t", "unknown")
             is Body.Call -> {
@@ -68,6 +71,11 @@ object Content {
                     "profile" -> return Body.Profile(o.optString("name").trim().take(60), avatar(o.opt("avatar")))
                     "group" -> return groupState(o) ?: Body.Unknown
                     "leave" -> return groupId(o)?.let { Body.Leave(it) } ?: Body.Unknown
+                    "react" -> {
+                        val id = msgId(o.opt("id")) ?: return Body.Unknown
+                        val e = o.optString("e").takeIf { validReaction(it) } ?: return Body.Unknown
+                        return Body.React(id, e, groupId(o))
+                    }
                     "clear" -> return Body.Clear
                     "call" -> return Body.Call(
                         o.getString("op"), o.getString("id"), o.optLong("at"),
@@ -80,6 +88,21 @@ object Content {
         if (raw.startsWith(LEGACY_HELLO)) return Body.Hello(raw.removePrefix(LEGACY_HELLO).trim())
         return Body.Text(raw)
     }
+
+    /** Емодзі для поля введення (за групами) — ті самі, що у веб-версії. */
+    val EMOJI: List<Pair<String, List<String>>> = listOf(
+        "Смайли" to "😀 😃 😄 😁 😆 😅 🤣 😂 🙂 🙃 😉 😊 😇 🥰 😍 🤩 😘 😗 😚 😙 😋 😛 😜 🤪 😝 🤑 🤗 🤭 🤫 🤔 🤐 🤨 😐 😑 😶 😏 😒 🙄 😬 😌 😔 😪 🤤 😴 😷 🤒 🤕 🤢 🤮 🥵 🥶 🥴 😵 🤯 🤠 🥳 😎 🤓 🧐 😕 😟 🙁 😮 😯 😲 😳 🥺 😦 😧 😨 😰 😥 😢 😭 😱 😖 😣 😞 😓 😩 😫 🥱 😤 😡 😠 🤬 😈 💀 💩 🤡 👻 👽 🤖".split(" "),
+        "Жести" to "👍 👎 👌 ✌️ 🤞 🤟 🤘 🤙 👈 👉 👆 👇 ☝️ ✋ 🤚 🖐 🖖 👋 🤝 🙏 👏 🙌 👐 🤲 💪 ✍️ 🤳 💅 👀 🧠".split(" "),
+        "Серця" to "❤️ 🧡 💛 💚 💙 💜 🖤 🤍 🤎 💔 ❣️ 💕 💞 💓 💗 💖 💘 💝 💯 💢 💥 💫 💦 💨 🔥 ✨ ⭐ 🌟".split(" "),
+        "Природа" to "🐶 🐱 🐭 🐹 🐰 🦊 🐻 🐼 🐨 🐯 🦁 🐮 🐷 🐸 🐵 🐔 🐧 🐦 🦆 🦉 🐴 🦄 🐝 🦋 🐌 🐞 🐢 🐍 🐙 🐬 🐳 🌸 🌻 🌹 🌷 🌱 🌲 🍀 🍁 🌈 ☀️ 🌙 ⛄ ❄️ ☔ ⚡".split(" "),
+        "Їжа" to "🍏 🍎 🍐 🍊 🍋 🍌 🍉 🍇 🍓 🍒 🍑 🥭 🍍 🥥 🥝 🍅 🥑 🥦 🥕 🌽 🥔 🍞 🧀 🥚 🍳 🥓 🍔 🍟 🍕 🌭 🥪 🌮 🍝 🍜 🍣 🍰 🎂 🍫 🍬 🍩 🍪 ☕ 🍵 🍺 🍷 🥂 🍾".split(" "),
+        "Різне" to "🎉 🎊 🎁 🎈 🏆 ⚽ 🏀 🎮 🎵 🎶 🎤 🎧 📷 📱 💻 ⌚ 💡 📌 📎 ✏️ 📚 💰 🚗 ✈️ 🚀 🏠 ⏰ ✅ ❌ ❗ ❓ ⚠️ 🇺🇦".split(" "),
+    )
+
+    val QUICK_REACTIONS = listOf("👍", "❤️", "😂", "😮", "😢", "🙏", "🔥", "👎")
+
+    /** Реакція: 1–8 символів емодзі, без латиниці, цифр і розмітки (порожня — прибрати). */
+    fun validReaction(e: String): Boolean = e.isEmpty() || (e.codePointCount(0, e.length) <= 8 && e.length <= 32 && e.none { it.code < 0x80 })
 
     private val MSG_ID = Regex("^[0-9a-f]{32}$")
 

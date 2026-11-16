@@ -69,6 +69,7 @@ class Updater(private val ctx: Context, private val db: Db) {
     fun canInstall() = ctx.packageManager.canRequestPackageInstalls()
 
     fun openInstallPermission(from: Context) {
+        (ctx.applicationContext as io.github.ya77papa.shepit.ShepitApp).lock.expectReturn()
         from.startActivity(
             Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${ctx.packageName}"))
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),

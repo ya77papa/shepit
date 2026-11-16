@@ -21,7 +21,25 @@ export type Body =
   // версія формату повідомлення, вона завжди 1).
   | { t: 'group'; g: string; name: string; avatar?: string; members: GroupMember[]; admins: string[]; ver: number }
   // Я виходжу з групи.
-  | { t: 'leave'; g: string };
+  | { t: 'leave'; g: string }
+  // Реакція на повідомлення з id (порожня e — прибрати мою реакцію). У групі — з g.
+  | { t: 'react'; id: string; e: string; g?: string };
+
+/** Реакція: 1–8 символів емодзі, без латиниці, цифр і розмітки. */
+export const validReaction = (e: unknown): e is string =>
+  typeof e === 'string' && (e === '' || ([...e].length <= 8 && e.length <= 32 && !/[\x00-\x7f]/.test(e)));
+
+export const QUICK_REACTIONS = ['👍', '❤️', '😂', '😮', '😢', '🙏', '🔥', '👎'];
+
+/** Емодзі для поля введення (за групами). */
+export const EMOJI: [string, string][] = [
+  ['Смайли', '😀 😃 😄 😁 😆 😅 🤣 😂 🙂 🙃 😉 😊 😇 🥰 😍 🤩 😘 😗 😚 😙 😋 😛 😜 🤪 😝 🤑 🤗 🤭 🤫 🤔 🤐 🤨 😐 😑 😶 😏 😒 🙄 😬 😌 😔 😪 🤤 😴 😷 🤒 🤕 🤢 🤮 🥵 🥶 🥴 😵 🤯 🤠 🥳 😎 🤓 🧐 😕 😟 🙁 😮 😯 😲 😳 🥺 😦 😧 😨 😰 😥 😢 😭 😱 😖 😣 😞 😓 😩 😫 🥱 😤 😡 😠 🤬 😈 💀 💩 🤡 👻 👽 🤖'],
+  ['Жести', '👍 👎 👌 ✌️ 🤞 🤟 🤘 🤙 👈 👉 👆 👇 ☝️ ✋ 🤚 🖐 🖖 👋 🤝 🙏 👏 🙌 👐 🤲 💪 ✍️ 🤳 💅 👀 🧠'],
+  ['Серця', '❤️ 🧡 💛 💚 💙 💜 🖤 🤍 🤎 💔 ❣️ 💕 💞 💓 💗 💖 💘 💝 💯 💢 💥 💫 💦 💨 🔥 ✨ ⭐ 🌟'],
+  ['Природа', '🐶 🐱 🐭 🐹 🐰 🦊 🐻 🐼 🐨 🐯 🦁 🐮 🐷 🐸 🐵 🐔 🐧 🐦 🦆 🦉 🐴 🦄 🐝 🦋 🐌 🐞 🐢 🐍 🐙 🐬 🐳 🌸 🌻 🌹 🌷 🌱 🌲 🍀 🍁 🌈 ☀️ 🌙 ⛄ ❄️ ☔ ⚡'],
+  ['Їжа', '🍏 🍎 🍐 🍊 🍋 🍌 🍉 🍇 🍓 🍒 🍑 🥭 🍍 🥥 🥝 🍅 🥑 🥦 🥕 🌽 🥔 🍞 🧀 🥚 🍳 🥓 🍔 🍟 🍕 🌭 🥪 🌮 🍝 🍜 🍣 🍰 🎂 🍫 🍬 🍩 🍪 ☕ 🍵 🍺 🍷 🥂 🍾'],
+  ['Різне', '🎉 🎊 🎁 🎈 🏆 ⚽ 🏀 🎮 🎵 🎶 🎤 🎧 📷 📱 💻 ⌚ 💡 📌 📎 ✏️ 📚 💰 🚗 ✈️ 🚀 🏠 ⏰ ✅ ❌ ❗ ❓ ⚠️ 🇺🇦'],
+];
 
 const HEX32 = /^[0-9a-f]{32}$/;
 export const validGroupId = (id: unknown): id is string => typeof id === 'string' && HEX32.test(id);

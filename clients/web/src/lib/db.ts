@@ -34,6 +34,8 @@ export type Message = {
   mid?: string;
   /** У групі (peer = "g:<id>"): хто надіслав. */
   from?: string;
+  /** Реакції: ідентичність → емодзі (одна на людину). */
+  reactions?: Record<string, string>;
 };
 
 const DB = 'shepit';
@@ -115,6 +117,19 @@ export const messages = {
   add: async (m: Message) => req((await store('messages', 'readwrite')).add(m)),
   all: async () => req<Message[]>((await store('messages')).getAll()),
   delete: async (id: number) => req((await store('messages', 'readwrite')).delete(id)),
+  /** Поставити/прибрати реакцію who на повідомлення з mid у бесіді peer. true — знайдено. */
+  react: async (peer: string, mid: string, who: string, e: string): Promise<boolean> => {
+    const st = await store('messages', 'readwrite');
+    const all = await req<Message[]>(st.index('peer').getAll(peer));
+    const m = all.find((x) => x.mid === mid);
+    if (!m) return false;
+    const r = { ...(m.reactions ?? {}) };
+    if (e) r[who] = e;
+    else delete r[who];
+    m.reactions = r;
+    await req(st.put(m));
+    return true;
+  },
   /** Усю бесіду з peer. */
   clear: (peer: string) => deleteWhere(peer, () => true),
   /** Повідомлення, які peer надіслав мені, з цими id (він попросив видалити «у всіх»). */

@@ -79,15 +79,17 @@ data class Message(
     val mid: String? = null,
     /** У групі (peer = "g:<id>"): хто надіслав. */
     val sender: String? = null,
+    /** Реакції: ідентичність → емодзі (одна на людину). */
+    val reactions: Map<String, String> = emptyMap(),
 )
 
 /** Контакти, історія, дрібні налаштування — локальна SQLite у приватній теці застосунку. */
-class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 3) {
+class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 4) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE contacts(identity TEXT PRIMARY KEY, name TEXT NOT NULL, fingerprint TEXT NOT NULL, avatar TEXT)")
         db.execSQL(
             "CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT, peer TEXT NOT NULL, out INTEGER NOT NULL, " +
-                "text TEXT NOT NULL, at INTEGER NOT NULL, kind TEXT NOT NULL, voice_mime TEXT, voice_dur INTEGER, voice BLOB, mid TEXT, sender TEXT)",
+                "text TEXT NOT NULL, at INTEGER NOT NULL, kind TEXT NOT NULL, voice_mime TEXT, voice_dur INTEGER, voice BLOB, mid TEXT, sender TEXT, reactions TEXT)",
         )
         db.execSQL("CREATE INDEX messages_peer ON messages(peer, id)")
         db.execSQL("CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT)")
@@ -107,6 +109,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 3) {
             db.execSQL("ALTER TABLE messages ADD COLUMN sender TEXT")
             createV3(db)
         }
+        if (oldVersion < 4) db.execSQL("ALTER TABLE messages ADD COLUMN reactions TEXT")
     }
 
     fun contacts(): List<Contact> = readableDatabase.rawQuery(
@@ -120,21 +123,37 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 3) {
     }
 
     fun messages(peer: String): List<Message> = readableDatabase.rawQuery(
-        "SELECT id, peer, out, text, at, kind, voice_mime, voice_dur, voice, mid, sender FROM messages WHERE peer = ? ORDER BY id", arrayOf(peer),
+        "SELECT id, peer, out, text, at, kind, voice_mime, voice_dur, voice, mid, sender, reactions FROM messages WHERE peer = ? ORDER BY id", arrayOf(peer),
     ).use { c -> generateSequence { if (c.moveToNext()) row(c) else null }.toList() }
 
     fun allMessages(): List<Message> = readableDatabase.rawQuery(
-        "SELECT id, peer, out, text, at, kind, voice_mime, voice_dur, voice, mid, sender FROM messages ORDER BY id", null,
+        "SELECT id, peer, out, text, at, kind, voice_mime, voice_dur, voice, mid, sender, reactions FROM messages ORDER BY id", null,
     ).use { c -> generateSequence { if (c.moveToNext()) row(c) else null }.toList() }
 
     private fun row(c: android.database.Cursor) = Message(
         c.getLong(0), c.getString(1), c.getInt(2) == 1, c.getString(3), c.getLong(4), c.getString(5),
-        c.getString(6), c.getLong(7), if (c.isNull(8)) null else c.getBlob(8), c.getString(9), c.getString(10),
+        c.getString(6), c.getLong(7), if (c.isNull(8)) null else c.getBlob(8), c.getString(9), c.getString(10), parseReactions(c.getString(11)),
     )
+
+    private fun parseReactions(s: String?): Map<String, String> = runCatching {
+        val o = org.json.JSONObject(s!!)
+        o.keys().asSequence().associateWith { o.getString(it) }
+    }.getOrDefault(emptyMap())
+
+    /** Поставити/прибрати реакцію who на повідомлення з mid у бесіді peer. true — знайдено. */
+    fun react(peer: String, mid: String, who: String, e: String): Boolean {
+        val cur = readableDatabase.rawQuery("SELECT id, reactions FROM messages WHERE peer = ? AND mid = ? LIMIT 1", arrayOf(peer, mid)).use {
+            if (it.moveToNext()) it.getLong(0) to parseReactions(it.getString(1)) else null
+        } ?: return false
+        val next = cur.second.toMutableMap().apply { if (e.isEmpty()) remove(who) else put(who, e) }
+        writableDatabase.update("messages", ContentValues().apply { put("reactions", org.json.JSONObject(next as Map<*, *>).toString()) }, "id = ?", arrayOf(cur.first.toString()))
+        return true
+    }
 
     fun addMessage(m: Message): Long = writableDatabase.insert("messages", null, ContentValues().apply {
         put("peer", m.peer); put("out", if (m.out) 1 else 0); put("text", m.text); put("at", m.at); put("kind", m.kind)
         put("voice_mime", m.voiceMime); put("voice_dur", m.voiceDur); put("voice", m.voice); put("mid", m.mid); put("sender", m.sender)
+        if (m.reactions.isNotEmpty()) put("reactions", org.json.JSONObject(m.reactions as Map<*, *>).toString())
     })
 
     fun deleteMessage(id: Long) {
@@ -187,6 +206,10 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 3) {
 
     fun get(k: String): String? = readableDatabase.rawQuery("SELECT v FROM kv WHERE k = ?", arrayOf(k)).use {
         if (it.moveToNext()) it.getString(0) else null
+    }
+
+    fun wipeKey(k: String) {
+        writableDatabase.delete("kv", "k = ?", arrayOf(k))
     }
 
     fun set(k: String, v: String) {

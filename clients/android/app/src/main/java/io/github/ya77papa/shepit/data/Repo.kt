@@ -291,6 +291,7 @@ class Repo(context: Context) {
             is Body.Text -> body.g
             is Body.Voice -> body.g
             is Body.Delete -> body.g
+            is Body.React -> body.g
             else -> null
         } ?: return
         if (gid == Content.INVALID_GROUP) return
@@ -336,6 +337,10 @@ class Repo(context: Context) {
             }
             is Body.Delete -> {
                 if (db.deleteIncoming(key, body.ids, from) > 0) _changed.emit(key)
+                return
+            }
+            is Body.React -> {
+                if (db.react(key, body.id, from, body.e)) _changed.emit(key)
                 return
             }
             is Body.Text -> Message(peer = key, out = false, text = body.text, at = now, mid = body.id, sender = from)
@@ -444,6 +449,18 @@ class Repo(context: Context) {
         _changed.emit(peer)
     }
 
+    // ---------- реакції ----------
+
+    /** Поставити реакцію (та сама ще раз — прибрати). Лише на повідомлення з id. */
+    suspend fun react(m: Message, e: String) {
+        val mid = m.mid ?: return
+        val me = core?.identity() ?: return
+        val next = if (m.reactions[me] == e) "" else e
+        sendTo(m.peer) { g -> Body.React(mid, next, g) }
+        withContext(Dispatchers.IO) { db.react(m.peer, mid, me, next) }
+        _changed.emit(m.peer)
+    }
+
     // ---------- видалення ----------
 
     /** Видалити повідомлення: лише в мене або в обох (лише свої, з id). */
@@ -506,6 +523,7 @@ class Repo(context: Context) {
             is Body.Text -> body.g != null
             is Body.Voice -> body.g != null
             is Body.Delete -> body.g != null
+            is Body.React -> body.g != null
             else -> false
         }
         if (groupish) {
@@ -514,6 +532,10 @@ class Repo(context: Context) {
         }
         if (body is Body.Profile) {
             onProfile(from, body)
+            return false
+        }
+        if (body is Body.React) {
+            if (db.contacts().any { it.identity == from } && db.react(from, body.id, from, body.e)) _changed.emit(from)
             return false
         }
         // Службові: співрозмовник видалив свої повідомлення «у всіх» або очистив бесіду.

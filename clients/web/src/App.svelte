@@ -9,7 +9,7 @@
   import AvatarEditor from './AvatarEditor.svelte';
   import { exportBackup, importBackup, MIN_PASSWORD } from './lib/backup';
   import { COMMIT, REPO, SHORT, commitUrl, compareUrl, registerServiceWorker } from './lib/pwa';
-  import { decode, encode, fromBase64, toBase64, fmtDuration, newMsgId, validAvatar, validGroupId, validMsgId, type Body } from './lib/content';
+  import { decode, encode, fromBase64, toBase64, fmtDuration, newMsgId, validAvatar, validGroupId, validMsgId, validReaction, QUICK_REACTIONS, EMOJI, type Body } from './lib/content';
   import { VoiceRecorder, MAX_VOICE_MS } from './lib/recorder';
   import { CallManager, checkRelay, type RelayCheck } from './lib/call.svelte';
   import VoiceMsg from './VoiceMsg.svelte';
@@ -365,6 +365,9 @@
       const ids = Array.isArray(b.ids) ? b.ids.filter(validMsgId).slice(0, 500) : [];
       return ids.length && (await messagesDb.deleteIncoming(key, ids, from)) ? key : null;
     }
+    if (b.t === 'react') {
+      return validMsgId(b.id) && validReaction(b.e) && (await messagesDb.react(key, b.id, from, b.e)) ? key : null;
+    }
     const mid = validMsgId((b as { id?: string }).id) ? (b as { id: string }).id : undefined;
     if (b.t === 'text') {
       await messagesDb.add({ peer: key, out: false, text: b.text, at: Date.now(), mid, from });
@@ -492,6 +495,49 @@
     } finally {
       busy = false;
     }
+  }
+
+  let emojiOpen = $state(false);
+  let draftEl: HTMLInputElement | undefined = $state();
+
+  /** Вставити емодзі в поле введення там, де курсор. */
+  function insertEmoji(e: string) {
+    const el = draftEl;
+    const at = el?.selectionStart ?? draft.length;
+    const end = el?.selectionEnd ?? at;
+    draft = draft.slice(0, at) + e + draft.slice(end);
+    tick().then(() => {
+      el?.focus();
+      el?.setSelectionRange(at + e.length, at + e.length);
+    });
+  }
+
+  /** Поставити реакцію (та сама ще раз — прибрати). Лише на повідомлення з id. */
+  async function react(m: Message, e: string) {
+    if (!me || !m.mid || (!current && !group)) return;
+    const mine = m.reactions?.[me.identity];
+    const next = mine === e ? '' : e;
+    selected = null;
+    try {
+      if (group) await sendGroup(group, { t: 'react', id: m.mid, e: next });
+      else await me.send(current!.identity, encode({ t: 'react', id: m.mid, e: next }));
+      await messagesDb.react(chatKey, m.mid, me.identity, next);
+      await reloadThread();
+    } catch (err) {
+      fail(err);
+    }
+  }
+
+  /** Реакції під повідомленням: емодзі → кількість, і чи є серед них моя. */
+  function reactionChips(m: Message): { e: string; n: number; mine: boolean }[] {
+    const out = new Map<string, { e: string; n: number; mine: boolean }>();
+    for (const [who, e] of Object.entries(m.reactions ?? {})) {
+      const c = out.get(e) ?? { e, n: 0, mine: false };
+      c.n++;
+      if (who === me?.identity) c.mine = true;
+      out.set(e, c);
+    }
+    return [...out.values()];
   }
 
   async function clearChat(everywhere: boolean) {
@@ -803,6 +849,10 @@
         if ((body as { g?: unknown }).g !== undefined || body.t === 'group' || body.t === 'leave') {
           const key = await onGroupMessage(m.from, body);
           if (key) changedPeers.add(key);
+          return;
+        }
+        if (body.t === 'react') {
+          if (known.has(m.from) && validMsgId(body.id) && validReaction(body.e) && (await messagesDb.react(m.from, body.id, m.from, body.e))) changedPeers.add(m.from);
           return;
         }
         if (body.t === 'profile') {
@@ -1247,6 +1297,13 @@
                 <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
                 <div class="bubble" onclick={() => (selected = selected?.id === m.id ? null : m)}>{m.text}</div>
               {/if}
+              {#if m.reactions && Object.keys(m.reactions).length}
+                <div class="reactions">
+                  {#each reactionChips(m) as c (c.e)}
+                    <button class="chip" class:mine={c.mine} onclick={() => react(m, c.e)} title={c.mine ? 'Прибрати мою реакцію' : 'Поставити таку саму'}>{c.e} {c.n}</button>
+                  {/each}
+                </div>
+              {/if}
               <div class="time">{new Date(m.at).toLocaleTimeString('uk', { hour: '2-digit', minute: '2-digit' })}</div>
             </div>
           {:else}
@@ -1257,7 +1314,15 @@
           <div class="composer"><span class="muted small">Ти не в цій групі — писати сюди не можна.</span></div>
         {:else if selected}
           <div class="composer msg-actions">
-            <span class="muted small">Повідомлення:</span>
+            {#if selected.mid && selected.kind !== 'call'}
+              <span class="quick-reactions">
+                {#each QUICK_REACTIONS as e (e)}
+                  <button class="ghost react-btn" class:mine={selected.reactions?.[me?.identity ?? ''] === e} onclick={() => react(selected!, e)}>{e}</button>
+                {/each}
+              </span>
+            {:else}
+              <span class="muted small">Повідомлення:</span>
+            {/if}
             <span class="spacer"></span>
             <button onclick={() => deleteMessage(selected!, false)} disabled={busy}>Видалити в мене</button>
             {#if selected.out && selected.mid}
@@ -1274,8 +1339,21 @@
             <button class="primary" onclick={() => stopRecording(false)}>Надіслати</button>
           </div>
         {:else}
-          <form class="composer" onsubmit={(e) => { e.preventDefault(); send(); }}>
-            <input placeholder="Повідомлення" bind:value={draft} disabled={busy} />
+          {#if emojiOpen}
+            <div class="emoji-panel">
+              {#each EMOJI as [title, list] (title)}
+                <div class="small muted emoji-title">{title}</div>
+                <div class="emoji-grid">
+                  {#each list.split(' ') as e (e)}
+                    <button type="button" class="ghost" onclick={() => insertEmoji(e)}>{e}</button>
+                  {/each}
+                </div>
+              {/each}
+            </div>
+          {/if}
+          <form class="composer" onsubmit={(e) => { e.preventDefault(); emojiOpen = false; send(); }}>
+            <button type="button" class="ghost emoji-toggle" class:on={emojiOpen} title="Емодзі" onclick={() => (emojiOpen = !emojiOpen)}>😊</button>
+            <input placeholder="Повідомлення" bind:value={draft} disabled={busy} bind:this={draftEl} />
             {#if draft.trim()}
               <button class="primary" type="submit" disabled={busy}>Надіслати</button>
             {:else}
