@@ -7,7 +7,8 @@ import { contacts as contactsDb, kv, messages as messagesDb, type Contact, type 
 const ITERATIONS = 600_000;
 export const MIN_PASSWORD = 10;
 
-type Payload = { account: string; contacts: Contact[]; messages: Message[]; myName: string; exportedAt: number };
+type StoredMessage = Omit<Message, 'voice'> & { voice?: { data: string; mime: string; dur: number; ptt?: boolean } };
+type Payload = { account: string; contacts: Contact[]; messages: StoredMessage[]; myName: string; exportedAt: number };
 type BackupFile = { shepit: 'backup'; v: 1; kdf: 'PBKDF2-SHA256'; iter: number; salt: string; iv: string; data: string };
 
 const b64 = (b: Uint8Array) => btoa(String.fromCharCode(...b));
@@ -38,7 +39,11 @@ export async function exportBackup(password: string): Promise<Blob> {
   const payload: Payload = {
     account: b64big(account),
     contacts: await contactsDb.all(),
-    messages: await messagesDb.all(),
+    messages: await Promise.all(
+      (await messagesDb.all()).map(async (m) =>
+        m.voice ? { ...m, voice: { ...m.voice, blob: undefined, data: b64big(new Uint8Array(await m.voice.blob.arrayBuffer())) } } : (m as StoredMessage),
+      ),
+    ),
     myName: (await kv.get<string>('myName')) ?? '',
     exportedAt: Date.now(),
   };
@@ -72,5 +77,9 @@ export async function importBackup(file: File, password: string): Promise<void> 
   await kv.set('account', unb64(p.account));
   await kv.set('myName', p.myName);
   for (const c of p.contacts) await contactsDb.put(c);
-  for (const { id: _id, ...m } of p.messages) await messagesDb.add(m);
+  for (const { id: _id, voice, ...m } of p.messages) {
+    await messagesDb.add(
+      voice ? { ...m, voice: { blob: new Blob([unb64(voice.data)], { type: voice.mime }), mime: voice.mime, dur: voice.dur, ptt: voice.ptt } } : m,
+    );
+  }
 }

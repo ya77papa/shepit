@@ -30,6 +30,19 @@ docker logs shepit
 nginx: `/etc/nginx/sites-available/shepit`, `proxy_pass http://127.0.0.1:8443`,
 сертифікат — certbot (`--nginx`, автопоновлення).
 
+## Дзвінки (TURN)
+
+Ретранслятор голосу — сервіс `turn` у тому ж `docker-compose.yml` (coturn, мережа хоста).
+У `.env` на сервері:
+
+```
+COMPOSE_PROFILES=calls
+SHEPIT_TURN_SECRET=<openssl rand -hex 32>
+SHEPIT_TURN_URLS=turn:shepit.razom.isroot.in:3478?transport=udp,turn:shepit.razom.isroot.in:3478?transport=tcp
+```
+
+Порти: 3478/udp+tcp, 49160–49400/udp. Без TURN дзвінки йдуть напряму (IP видно співрозмовнику).
+
 ## Перевірка веб-клієнта
 
 Код веб-клієнта завантажується з сервера, тож важливо, щоб сервер роздавав саме те, що зібрано

@@ -86,3 +86,20 @@ a { color: var(--accent); }
 .version { margin-top: auto; }
 .update-bar { position: sticky; top: 0; z-index: 20; display: flex; flex-wrap: wrap; gap: 8px 16px; justify-content: space-between; align-items: center; padding: 10px 16px; background: #2b2a14; border-bottom: 1px solid #6b5f1f; font-size: .9rem; }
 .update-bar.ok { background: #1f3326; border-color: #2f6b45; }
+.spacer { flex: 1; }
+button.on { color: var(--accent); background: var(--line); }
+button.danger { background: #b4464b; color: white; font-weight: 600; }
+button.big { padding: 12px 18px; }
+.center-row { justify-content: center; flex-wrap: wrap; }
+.msg.system { align-self: center; max-width: 90%; }
+.msg.system .bubble { background: transparent; color: var(--muted); font-size: .85rem; padding: 2px 8px; }
+.voice { display: flex; align-items: center; gap: 8px; }
+.voice audio { height: 34px; max-width: 220px; }
+.ptt { flex: 1; padding: 16px; font-size: 1rem; font-weight: 600; background: var(--line); user-select: none; touch-action: none; -webkit-user-select: none; }
+.ptt.recording { background: #b4464b; color: white; }
+.recording-bar { align-items: center; }
+.rec-dot { width: 10px; height: 10px; border-radius: 50%; background: #ff5a5a; animation: blink 1s infinite; }
+@keyframes blink { 50% { opacity: .2; } }
+.overlay.call { z-index: 30; }
+.call-card { text-align: center; justify-items: center; }
+.call-avatar { font-size: 48px; }

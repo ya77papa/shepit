@@ -43,6 +43,76 @@ export class Shepit {
   get identity() { return this.acc.identity(); }
   get fingerprint() { return this.acc.fingerprint(); }
 
+  /**
+   * Потік подій з сервера: викликає `onMail` щоразу, коли в скриньці нова пошта.
+   * Перепідключається сам. Повертає функцію зупинки.
+   */
+  listen(onMail: () => void, onState: (connected: boolean) => void): () => void {
+    let stopped = false;
+    let ctrl: AbortController | null = null;
+    let delay = 1000;
+    const loop = async () => {
+      while (!stopped) {
+        ctrl = new AbortController();
+        try {
+          const r = await fetch(`${API}/v0/events`, {
+            cache: 'no-store',
+            signal: ctrl.signal,
+            headers: { [AUTH]: this.acc.authHeader('GET /v0/events', new Uint8Array()) },
+          });
+          if (!r.ok || !r.body) throw new Error(`events: ${r.status}`);
+          onState(true);
+          delay = 1000;
+          const reader = r.body.pipeThrough(new TextDecoderStream()).getReader();
+          let buf = '';
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += value;
+            let i;
+            while ((i = buf.indexOf('\n\n')) >= 0) {
+              const ev = buf.slice(0, i);
+              buf = buf.slice(i + 2);
+              if (ev.split('\n').some((l) => l === 'data: mail' || l === 'data:mail')) onMail();
+            }
+          }
+        } catch (e) {
+          if (stopped) break;
+          console.warn('потік подій:', e);
+        }
+        onState(false);
+        if (stopped) break;
+        await new Promise((res) => setTimeout(res, delay));
+        delay = Math.min(delay * 2, 30_000);
+      }
+    };
+    loop();
+    return () => {
+      stopped = true;
+      ctrl?.abort();
+    };
+  }
+
+  private turnCache: { at: number; ice: RTCIceServer[] | null; ttl: number } | null = null;
+
+  /** Сервери для дзвінків. `null` — ретранслятор не налаштований на сервері. */
+  async iceServers(): Promise<RTCIceServer[] | null> {
+    const now = Date.now();
+    if (this.turnCache && now - this.turnCache.at < (this.turnCache.ttl * 1000) / 2) return this.turnCache.ice;
+    const r = await fetch(`${API}/v0/turn`, {
+      cache: 'no-store',
+      headers: { [AUTH]: this.acc.authHeader('GET /v0/turn', new Uint8Array()) },
+    });
+    if (r.status === 404) {
+      this.turnCache = { at: now, ice: null, ttl: 600 };
+      return null;
+    }
+    if (!r.ok) throw new Error(`ретранслятор: ${r.status}`);
+    const t = await r.json();
+    this.turnCache = { at: now, ice: [{ urls: t.urls, username: t.username, credential: t.credential }], ttl: t.ttl };
+    return this.turnCache.ice;
+  }
+
   /** Спільний з `peer` код безпеки (однаковий на обох пристроях). */
   safetyNumber(peer: string): string { return this.acc.safetyNumber(peer); }
 

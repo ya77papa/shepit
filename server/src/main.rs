@@ -10,6 +10,8 @@
 //! | POST  | /v0/send                | —      | покласти конверт у скриньку (sealed sender: відправник невідомий) |
 //! | GET   | /v0/mailbox/{id}        | так    | переглянути конверти (тільки власник скриньки) |
 //! | POST  | /v0/mailbox/{id}/ack    | так    | «отримав і зберіг до N» — сервер видаляє |
+//! | GET   | /v0/events              | так    | потік подій (SSE): «у скриньці нова пошта» — миттєва доставка |
+//! | GET   | /v0/turn                | так    | тимчасовий логін до ретранслятора дзвінків (TURN) |
 //!
 //! Також роздає веб-клієнт зі `$SHEPIT_WEB` (типово `./web`, якщо тека існує).
 //!
@@ -39,10 +41,35 @@ use shepit_core::{
 
 struct App {
     db: db::Db,
+    /// «Дзвіночки»: підписані на події скриньки клієнти (відкриті потоки /v0/events).
+    bells: Mutex<HashMap<MailboxId, tokio::sync::broadcast::Sender<()>>>,
+    turn: Option<Turn>,
+    /// Сигнал зупинки: відкриті потоки подій мають закритися, інакше сервер не завершиться.
+    shutdown: tokio::sync::watch::Receiver<bool>,
     /// Використані nonce → час. Захист від повторного відтворення підписаних запитів.
     /// У пам'яті: після перезапуску старі запити все одно відсіче вікно часу.
     nonces: Mutex<HashMap<String, u64>>,
     issuer: Issuer,
+}
+
+/// Ретранслятор дзвінків (coturn з `use-auth-secret`): сервер видає тимчасові логіни,
+/// пароль = HMAC-SHA1(спільний секрет, логін). Сам ретранслятор бачить лише зашифрований звук.
+struct Turn {
+    secret: String,
+    urls: Vec<String>,
+}
+
+const TURN_TTL_S: u64 = 12 * 60 * 60;
+
+fn load_turn() -> Option<Turn> {
+    let secret = std::env::var("SHEPIT_TURN_SECRET").ok().filter(|s| !s.is_empty())?;
+    let urls: Vec<String> = std::env::var("SHEPIT_TURN_URLS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|u| u.trim().to_owned())
+        .filter(|u| !u.is_empty())
+        .collect();
+    (!urls.is_empty()).then_some(Turn { secret, urls })
 }
 
 fn internal(e: rusqlite::Error) -> StatusCode {
@@ -52,7 +79,8 @@ fn internal(e: rusqlite::Error) -> StatusCode {
 
 type Shared = Arc<App>;
 
-const MAX_PAYLOAD_HEX: usize = 2 * 64 * 1024;
+/// Голосове повідомлення до ~30 с (Opus 16 кбіт/с) вміщається з запасом.
+const MAX_PAYLOAD_HEX: usize = 2 * 96 * 1024;
 const MAX_QUEUE: usize = 1000;
 const MAX_ONE_TIME: usize = 100;
 const FETCH_LIMIT: usize = 100;
@@ -122,7 +150,12 @@ async fn send(State(app): State<Shared>, Json(env): Json<Envelope>) -> StatusCod
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
     match app.db.push(&env, MAX_QUEUE, now_ms()) {
-        Ok(true) => StatusCode::ACCEPTED,
+        Ok(true) => {
+            if let Some(bell) = app.bells.lock().unwrap().get(&env.to) {
+                let _ = bell.send(());
+            }
+            StatusCode::ACCEPTED
+        }
         Ok(false) => StatusCode::TOO_MANY_REQUESTS,
         Err(e) => internal(e),
     }
@@ -161,6 +194,56 @@ fn data_dir() -> PathBuf {
     PathBuf::from(std::env::var("SHEPIT_DATA").unwrap_or_else(|_| "data".into()))
 }
 
+/// Потік подій для власника скриньки. Подія `mail` = «забери пошту» (вміст не передається).
+async fn events(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+) -> Result<impl axum::response::IntoResponse, StatusCode> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures_util::StreamExt;
+    let who = authenticate(&app, &headers, "GET /v0/events", b"")?;
+    let mailbox = MailboxId::for_identity(&hex::decode(&who).map_err(|_| StatusCode::BAD_REQUEST)?);
+    let rx = {
+        let mut bells = app.bells.lock().unwrap();
+        bells.retain(|_, tx| tx.receiver_count() > 0);
+        bells.entry(mailbox).or_insert_with(|| tokio::sync::broadcast::channel(16).0).subscribe()
+    };
+    // Одразу «mail»: клієнт перевірить пошту, яка могла прийти, поки потік перепідключався.
+    let first = futures_util::stream::once(async { Ok::<_, std::convert::Infallible>(Event::default().data("mail")) });
+    let rest = tokio_stream::wrappers::BroadcastStream::new(rx)
+        .map(|_| Ok::<_, std::convert::Infallible>(Event::default().data("mail")));
+    let mut stop = app.shutdown.clone();
+    let until = async move {
+        let _ = stop.wait_for(|s| *s).await;
+    };
+    let sse = Sse::new(first.chain(rest).take_until(until)).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(20)));
+    // nginx не повинен буферизувати потік.
+    Ok(([(header::HeaderName::from_static("x-accel-buffering"), HeaderValue::from_static("no"))], sse))
+}
+
+#[derive(serde::Serialize)]
+struct TurnCredentials {
+    urls: Vec<String>,
+    username: String,
+    credential: String,
+    ttl: u64,
+}
+
+async fn turn_credentials(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<TurnCredentials>, StatusCode> {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use rand::Rng;
+    authenticate(&app, &headers, "GET /v0/turn", b"")?;
+    let t = app.turn.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    // Логін не містить ідентичності користувача — ретранслятор не знає, хто дзвонить.
+    let expiry = now_ms() / 1000 + TURN_TTL_S;
+    let username = format!("{expiry}:{}", hex::encode(rand::rng().random::<[u8; 8]>()));
+    let mut mac = Hmac::<sha1::Sha1>::new_from_slice(t.secret.as_bytes()).expect("hmac key");
+    mac.update(username.as_bytes());
+    let credential = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    Ok(Json(TurnCredentials { urls: t.urls.clone(), username, credential, ttl: TURN_TTL_S }))
+}
+
 fn load_issuer() -> Issuer {
     let dir = data_dir();
     let path = dir.join("issuer.json");
@@ -187,7 +270,7 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 /// Жорстка політика безпеки контенту: лише власні скрипти і WASM, жодних сторонніх доменів,
 /// вбудовування у фрейми заборонене. Головний захист веб-клієнта від XSS.
 const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; \
-    img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; \
+    img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; \
     form-action 'self'; frame-ancestors 'none'";
 
 fn web_dir() -> Option<PathBuf> {
@@ -195,9 +278,11 @@ fn web_dir() -> Option<PathBuf> {
     dir.join("index.html").is_file().then_some(dir)
 }
 
-fn app(issuer: Issuer, db: db::Db) -> Router {
+fn app(issuer: Issuer, db: db::Db, shutdown: tokio::sync::watch::Receiver<bool>) -> Router {
     use tower_http::{services::{ServeDir, ServeFile}, set_header::SetResponseHeaderLayer};
-    let shared = Arc::new(App { db, nonces: Mutex::default(), issuer });
+    let turn = load_turn();
+    println!("Ретранслятор дзвінків: {}", turn.as_ref().map(|t| t.urls.join(", ")).unwrap_or_else(|| "не налаштовано".into()));
+    let shared = Arc::new(App { db, nonces: Mutex::default(), bells: Mutex::default(), turn, shutdown, issuer });
     // Раз на годину прибирати недоставлені конверти старші за 30 днів.
     let pruner = shared.clone();
     tokio::spawn(async move {
@@ -219,6 +304,8 @@ fn app(issuer: Issuer, db: db::Db) -> Router {
         .route("/v0/send", post(send))
         .route("/v0/mailbox/{id}", get(fetch))
         .route("/v0/mailbox/{id}/ack", post(ack))
+        .route("/v0/events", get(events))
+        .route("/v0/turn", get(turn_credentials))
         .with_state(shared)
         .layer(SetResponseHeaderLayer::overriding(header::CACHE_CONTROL, HeaderValue::from_static("no-store")));
 
@@ -252,7 +339,7 @@ fn app(issuer: Issuer, db: db::Db) -> Router {
 }
 
 /// Ctrl+C або SIGTERM (його надсилає `docker stop`).
-async fn shutdown_signal() {
+async fn shutdown_signal(tx: tokio::sync::watch::Sender<bool>) {
     let ctrl_c = async { tokio::signal::ctrl_c().await.ok(); };
     #[cfg(unix)]
     let term = async {
@@ -264,6 +351,7 @@ async fn shutdown_signal() {
     let term = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = term => {} }
     println!("shepit-server: зупинка");
+    let _ = tx.send(true);
 }
 
 #[tokio::main]
@@ -277,8 +365,9 @@ async fn main() {
     println!("Корінь довіри: {}", issuer.trust_root_hex());
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     println!("shepit-server listening on {addr}");
-    axum::serve(listener, app(issuer, db))
-        .with_graceful_shutdown(shutdown_signal())
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    axum::serve(listener, app(issuer, db, rx))
+        .with_graceful_shutdown(shutdown_signal(tx))
         .await
         .unwrap();
 }

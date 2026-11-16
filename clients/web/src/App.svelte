@@ -5,11 +5,15 @@
   import { contacts as contactsDb, kv, messages as messagesDb, wipe, type Contact, type Message } from './lib/db';
   import { exportBackup, importBackup, MIN_PASSWORD } from './lib/backup';
   import { COMMIT, SHORT, commitUrl, compareUrl, registerServiceWorker } from './lib/pwa';
+  import { decode, encode, fromBase64, toBase64, fmtDuration } from './lib/content';
+  import { VoiceRecorder, MAX_VOICE_MS } from './lib/recorder';
+  import { CallManager } from './lib/call.svelte';
+  import VoiceMsg from './VoiceMsg.svelte';
+  import CallOverlay from './CallOverlay.svelte';
 
   const POLL_MS = 3000;
   // Службове «привітання» після прийняття запрошення: несе ім'я, щоб той, хто запросив,
   // побачив його в контактах. Ім'я йде лише всередині зашифрованого повідомлення.
-  const HELLO = '\u0001hello ';
   const helloText = (name: string) => `👋 ${name || 'Новий контакт'} приєднується за запрошенням`;
   const KEYS_CHECK_MS = 10 * 60 * 1000;
 
@@ -40,12 +44,34 @@
   let threadEl: HTMLElement | undefined = $state();
   let applyUpdate: (() => void) | null = $state(null); // є нова версія, чекає згоди
   let updatedFrom = $state(''); // версію щойно змінено (показати, з якої)
+  let streamOk = $state(false); // відкритий потік подій — пошта приходить миттєво
+  let pttOn: Record<string, boolean> = $state({}); // режим «рація» по контактах
+  let autoplayId: number | null = $state(null);
+  const recorder = new VoiceRecorder();
+  let recording = $state(false);
+  let recStart = $state(0);
+  let recNow = $state(0);
+  let recTimer: ReturnType<typeof setInterval> | null = null;
+
+  async function logCall(peer: string, text: string) {
+    await messagesDb.add({ peer, out: false, text, at: Date.now(), kind: 'call' });
+    if (current?.identity === peer) await openThread(current);
+  }
+  const calls = new CallManager(() => me, logCall);
+  const nameOf = (identity: string) => contacts.find((c) => c.identity === identity)?.name ?? `Контакт ${short(fingerprintOf(identity))}`;
 
   const short = (fp: string) => fp.split(' ').slice(0, 2).join(' ');
   const inviteUrl = $derived(
     me ? `${location.origin}/#add=${me.identity}${myName ? `&name=${encodeURIComponent(myName)}` : ''}` : '',
   );
   const qr = $derived(inviteUrl ? renderSVG(inviteUrl, { ecc: 'M', border: 2 }) : '');
+
+  $effect(() => {
+    if (calls.error) {
+      error = calls.error;
+      calls.error = '';
+    }
+  });
 
   function fail(e: unknown) {
     error = e instanceof Error ? e.message : String(e);
@@ -97,7 +123,7 @@
     // Перше повідомлення — щоб той, хто запросив, теж побачив тебе в контактах (з іменем).
     busy = true;
     try {
-      await me.send(inv.key, HELLO + myName.trim());
+      await me.send(inv.key, encode({ t: 'hello', name: myName.trim() }));
       await messagesDb.add({ peer: inv.key, out: true, text: helloText(myName.trim()), at: Date.now() });
       if (current?.identity === inv.key) await openThread(current);
     } catch (e) {
@@ -113,6 +139,7 @@
     try {
       await kv.set('myName', myName.trim());
       me = await Shepit.register();
+      me.listen(poll, (ok) => (streamOk = ok));
       if (invite) await acceptInvite();
     } catch (e) {
       fail(e);
@@ -139,7 +166,7 @@
     busy = true;
     error = '';
     try {
-      await me.send(peer.identity, text);
+      await me.send(peer.identity, encode({ t: 'text', text }));
       await messagesDb.add({ peer: peer.identity, out: true, text, at: Date.now() });
       draft = '';
       if (current?.identity === peer.identity) await openThread(peer);
@@ -150,6 +177,42 @@
     }
   }
 
+  async function sendVoice(blob: Blob, mime: string, dur: number, ptt: boolean) {
+    if (!me || !current) return;
+    const peer = current;
+    busy = true;
+    try {
+      await me.send(peer.identity, encode({ t: 'voice', mime, dur, data: toBase64(await blob.arrayBuffer()), ptt }));
+      await messagesDb.add({ peer: peer.identity, out: true, text: ptt ? '📻 Рація' : '🎤 Голосове', at: Date.now(), kind: 'voice', voice: { blob, mime, dur, ptt } });
+      if (current?.identity === peer.identity) await openThread(peer);
+    } catch (e) {
+      fail(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function startRecording() {
+    if (recording) return;
+    error = '';
+    try {
+      await recorder.start(() => stopRecording(false));
+      recording = true;
+      recStart = recNow = Date.now();
+      recTimer = setInterval(() => (recNow = Date.now()), 200);
+    } catch (e) {
+      fail(e instanceof DOMException && e.name === 'NotAllowedError' ? 'Немає доступу до мікрофона' : e);
+    }
+  }
+
+  async function stopRecording(cancel: boolean, ptt = false) {
+    if (!recording) return;
+    recording = false;
+    if (recTimer) clearInterval(recTimer);
+    const rec = await recorder.stop(cancel);
+    if (rec) await sendVoice(rec.blob, rec.mime, rec.dur, ptt);
+  }
+
   async function poll() {
     if (!me) return;
     const known = new Set(contacts.map((c) => c.identity));
@@ -157,16 +220,34 @@
     let delivered = 0;
     try {
       await me.receive(async (m) => {
-        firstFrom ||= m.from;
-        delivered++;
-        const hello = m.text.startsWith(HELLO) ? m.text.slice(HELLO.length).trim().slice(0, 60) : null;
+        const body = decode(m.text);
+        const hello = body.t === 'hello' ? body.name.trim().slice(0, 60) : null;
         if (!known.has(m.from)) {
           const fp = fingerprintOf(m.from);
           await contactsDb.put({ identity: m.from, name: hello || `Новий ${short(fp)}`, fingerprint: fp });
           known.add(m.from);
+          delivered++;
         }
-        const text = hello !== null ? helloText(hello) : m.text;
-        await messagesDb.add({ peer: m.from, out: false, text, at: Date.now() });
+        if (body.t === 'call') {
+          await calls.onSignal(m.from, body); // службове — у стрічку не пишемо
+          return;
+        }
+        firstFrom ||= m.from;
+        delivered++;
+        if (body.t === 'voice') {
+          const blob = new Blob([fromBase64(body.data)], { type: body.mime });
+          const id = await messagesDb.add({
+            peer: m.from, out: false, text: body.ptt ? '📻 Рація' : '🎤 Голосове', at: Date.now(), kind: 'voice',
+            voice: { blob, mime: body.mime, dur: body.dur, ptt: body.ptt },
+          });
+          // Рація: якщо розмова відкрита й режим увімкнено — програти одразу.
+          if (body.ptt && pttOn[m.from] && current?.identity === m.from && document.visibilityState === 'visible') {
+            autoplayId = id as number;
+          }
+        } else {
+          const text = body.t === 'hello' ? helloText(body.name.trim()) : body.text;
+          await messagesDb.add({ peer: m.from, out: false, text, at: Date.now() });
+        }
         if (current?.identity !== m.from) unread[m.from] = (unread[m.from] ?? 0) + 1;
       });
     } catch (e) {
@@ -261,6 +342,7 @@
 
   onMount(() => {
     let pollTimer: ReturnType<typeof setInterval>;
+    let stopEvents: (() => void) | null = null;
     let keysTimer: ReturnType<typeof setInterval>;
     const onHash = async () => {
       const inv = readInviteFromUrl();
@@ -285,13 +367,20 @@
       } finally {
         loading = false;
       }
-      pollTimer = setInterval(poll, POLL_MS);
+      // Миттєва доставка через потік подій; опитування — лише запасний варіант.
+      let tickN = 0;
+      pollTimer = setInterval(() => {
+        tickN++;
+        if (!streamOk || tickN % 10 === 0) poll();
+      }, POLL_MS);
       keysTimer = setInterval(() => me?.ensureKeys().catch(fail), KEYS_CHECK_MS);
+      if (me) stopEvents = me.listen(poll, (ok) => (streamOk = ok));
       poll();
     })();
     return () => {
       clearInterval(pollTimer);
       clearInterval(keysTimer);
+      stopEvents?.();
       window.removeEventListener('hashchange', onHash);
     };
   });
@@ -395,6 +484,9 @@
         <header>
           <button class="title" onclick={rename} title="Перейменувати">{current.name} ✎</button>
           <button class="ghost small" onclick={() => (showSafety = !showSafety)}>🔒 код безпеки</button>
+          <span class="spacer"></span>
+          <button class="ghost" class:on={pttOn[current.identity]} title="Рація: затисни і говори; голос співрозмовника грає одразу" onclick={() => (pttOn[current!.identity] = !pttOn[current!.identity])}>📻 Рація</button>
+          <button class="ghost" title="Голосовий дзвінок" disabled={calls.state !== 'idle'} onclick={() => calls.start(current!.identity)}>📞</button>
         </header>
         {#if showSafety}
           <div class="safety">
@@ -404,18 +496,46 @@
         {/if}
         <div class="thread" bind:this={threadEl}>
           {#each thread as m (m.id)}
-            <div class="msg" class:out={m.out}>
-              <div class="bubble">{m.text}</div>
+            <div class="msg" class:out={m.out} class:system={m.kind === 'call'}>
+              {#if m.kind === 'voice' && m.voice}
+                <div class="bubble"><VoiceMsg voice={m.voice} autoplay={m.id === autoplayId} /></div>
+              {:else}
+                <div class="bubble">{m.text}</div>
+              {/if}
               <div class="time">{new Date(m.at).toLocaleTimeString('uk', { hour: '2-digit', minute: '2-digit' })}</div>
             </div>
           {:else}
             <p class="muted center-text">Повідомлень ще немає. Усе, що ви напишете, шифрується на пристрої — сервер бачить лише шифротекст.</p>
           {/each}
         </div>
-        <form class="composer" onsubmit={(e) => { e.preventDefault(); send(); }}>
-          <input placeholder="Повідомлення" bind:value={draft} disabled={busy} />
-          <button class="primary" type="submit" disabled={busy || !draft.trim()}>Надіслати</button>
-        </form>
+        {#if pttOn[current.identity]}
+          <div class="composer">
+            <button
+              class="ptt" class:recording
+              onpointerdown={(e) => { e.preventDefault(); startRecording(); }}
+              onpointerup={() => stopRecording(false, true)}
+              onpointerleave={() => stopRecording(false, true)}
+              oncontextmenu={(e) => e.preventDefault()}
+            >{recording ? `📻 Говори… ${fmtDuration(recNow - recStart)} — відпусти, щоб надіслати` : '📻 Затисни і говори'}</button>
+          </div>
+        {:else if recording}
+          <div class="composer recording-bar">
+            <span class="rec-dot"></span>
+            <span>Запис {fmtDuration(recNow - recStart)} / {fmtDuration(MAX_VOICE_MS)}</span>
+            <span class="spacer"></span>
+            <button class="ghost" onclick={() => stopRecording(true)}>✕ Скасувати</button>
+            <button class="primary" onclick={() => stopRecording(false)}>Надіслати</button>
+          </div>
+        {:else}
+          <form class="composer" onsubmit={(e) => { e.preventDefault(); send(); }}>
+            <input placeholder="Повідомлення" bind:value={draft} disabled={busy} />
+            {#if draft.trim()}
+              <button class="primary" type="submit" disabled={busy}>Надіслати</button>
+            {:else}
+              <button type="button" title="Голосове повідомлення" disabled={busy} onclick={startRecording}>🎤</button>
+            {/if}
+          </form>
+        {/if}
       {:else if contacts.length === 0}
         <div class="onboarding">
           <h2>Як почати спілкуватися</h2>
@@ -434,6 +554,10 @@
       {#if error}<div class="toast" role="alert">{error} <button class="ghost" onclick={() => (error = '')}>✕</button></div>{/if}
     </main>
   </div>
+
+  {#if calls.state !== 'idle'}
+    <CallOverlay {calls} name={nameOf(calls.peer)} />
+  {/if}
 
   {#if panel}
     <div class="overlay" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) panel = ''; }}>

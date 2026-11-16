@@ -16,6 +16,10 @@ services:
     ports:
       # За nginx на тій самій машині: SHEPIT_BIND=127.0.0.1 у .env (не відкривати порт назовні).
       - "${SHEPIT_BIND:-0.0.0.0}:8443:8443"
+    environment:
+      # Ретранслятор дзвінків (необов'язково). Див. сервіс turn нижче.
+      SHEPIT_TURN_SECRET: ${SHEPIT_TURN_SECRET:-}
+      SHEPIT_TURN_URLS: ${SHEPIT_TURN_URLS:-}
     volumes:
       - ./data:/data
     mem_limit: 256m
@@ -24,3 +28,50 @@ services:
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
+
+  # Ретранслятор голосових дзвінків (TURN). Вмикається, якщо в .env є:
+  #   COMPOSE_PROFILES=calls
+  #   SHEPIT_TURN_SECRET=<openssl rand -hex 32>
+  #   SHEPIT_TURN_URLS=turn:<домен>:3478?transport=udp,turn:<домен>:3478?transport=tcp
+  # Потрібні відкриті порти: 3478/udp+tcp і 49160-49400/udp.
+  # Ретранслятор пересилає лише зашифрований звук і не знає, хто дзвонить
+  # (логіни тимчасові й не містять ідентичності).
+  turn:
+    image: coturn/coturn:4.19
+    container_name: shepit-turn
+    profiles: [calls]
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 128m
+    tmpfs:
+      - /var/lib/coturn
+    command:
+      - --listening-port=3478
+      - --min-port=49160
+      - --max-port=49400
+      - --use-auth-secret
+      - --static-auth-secret=${SHEPIT_TURN_SECRET:-}
+      - --realm=shepit
+      - --fingerprint
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+      - --no-multicast-peers
+      - --no-tcp-relay
+      # Лише голос: обмеження швидкості на сесію (байт/с) — проти зловживань ретранслятором.
+      - --max-bps=16000
+      - --user-quota=4
+      - --total-quota=200
+      # Не пускати ретранслятор у внутрішні мережі сервера (захист від SSRF).
+      - --denied-peer-ip=0.0.0.0-0.255.255.255
+      - --denied-peer-ip=10.0.0.0-10.255.255.255
+      - --denied-peer-ip=100.64.0.0-100.127.255.255
+      - --denied-peer-ip=127.0.0.0-127.255.255.255
+      - --denied-peer-ip=169.254.0.0-169.254.255.255
+      - --denied-peer-ip=172.16.0.0-172.31.255.255
+      - --denied-peer-ip=192.168.0.0-192.168.255.255
+      - --denied-peer-ip=::1
+      - --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      - --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      - --log-file=stdout
+      - --simple-log

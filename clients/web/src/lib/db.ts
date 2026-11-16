@@ -2,7 +2,16 @@
 // УВАГА: стан акаунта містить секретні ключі; IndexedDB не зашифрована (етап 0).
 
 export type Contact = { identity: string; name: string; fingerprint: string };
-export type Message = { id?: number; peer: string; out: boolean; text: string; at: number };
+export type Voice = { blob: Blob; mime: string; dur: number; ptt?: boolean };
+export type Message = {
+  id?: number;
+  peer: string;
+  out: boolean;
+  text: string;
+  at: number;
+  kind?: 'text' | 'voice' | 'call';
+  voice?: Voice;
+};
 
 const DB = 'shepit';
 let dbp: Promise<IDBDatabase> | null = null;
