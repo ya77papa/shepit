@@ -326,6 +326,8 @@ private fun ContactsScreen(
     val connected by repo.connected.collectAsState()
     val groups by repo.groups.collectAsState()
     val channels by repo.channels.collectAsState()
+    var bigAvatar by remember { mutableStateOf<Pair<String, String?>?>(null) }
+    bigAvatar?.let { (n, a) -> AvatarViewer(n, a) { bigAvatar = null } }
     var menu by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize()) {
         TopAppBar(
@@ -380,7 +382,7 @@ private fun ContactsScreen(
                 if (contacts.isNotEmpty()) item { SectionLabel("Контакти") }
                 items(contacts, key = { it.identity }) { c ->
                     ListItem(
-                        leadingContent = { AvatarView(c.name, c.avatar, 44.dp) },
+                        leadingContent = { Box(Modifier.clip(CircleShape).clickable { bigAvatar = c.name to c.avatar }) { AvatarView(c.name, c.avatar, 44.dp) } },
                         headlineContent = { Text(c.name, fontWeight = FontWeight.SemiBold) },
                         supportingContent = { Text(repo.short(c.fingerprint) + "…", fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Muted) },
                         modifier = Modifier.clickable { onOpen(c.identity) },
@@ -390,7 +392,7 @@ private fun ContactsScreen(
                 if (groups.isNotEmpty()) item { SectionLabel("Групи") }
                 items(groups, key = { "g:" + it.id }) { g ->
                     ListItem(
-                        leadingContent = { AvatarView(g.name, g.avatar, 44.dp) },
+                        leadingContent = { Box(Modifier.clip(CircleShape).clickable { bigAvatar = g.name to g.avatar }) { AvatarView(g.name, g.avatar, 44.dp) } },
                         headlineContent = { Text(g.name, fontWeight = FontWeight.SemiBold) },
                         supportingContent = { Text(if (g.left) "ти не в групі" else "${g.members.size} учасн.", fontSize = 12.sp, color = Muted) },
                         modifier = Modifier.clickable { onOpen("g:${g.id}") },
@@ -511,6 +513,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
     var actionsFor by remember { mutableStateOf<Message?>(null) }
     var emojiOpen by remember { mutableStateOf(false) }
     var viewing by remember { mutableStateOf<Message?>(null) }
+    var showAvatar by remember { mutableStateOf(false) }
     val pickPhoto = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
         val caption = draft.trim().ifEmpty { null }
@@ -544,8 +547,19 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
     val resumed by lifecycle.currentStateFlow.collectAsState()
     val onScreen = resumed.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED) && !locked
     LaunchedEffect(peer, onScreen) {
-        if (onScreen) { repo.visibleChat = peer; runCatching { repo.markRead(peer) } }
-        else if (repo.visibleChat == peer) repo.visibleChat = null
+        if (onScreen) {
+            repo.visibleChat = peer
+            io.github.ya77papa.shepit.service.Notifications.cancelMessages(ctx, peer)
+            runCatching { repo.markRead(peer) }
+        } else if (repo.visibleChat == peer) repo.visibleChat = null
+    }
+    // Тихі звуки, поки бесіда на екрані.
+    val sounds = remember { ChatSounds(ctx) }
+    DisposableEffect(Unit) { onDispose { sounds.release() } }
+    LaunchedEffect(peer, onScreen) {
+        if (!onScreen) return@LaunchedEffect
+        launch { repo.sent.collect { if (it == peer && repo.chatSounds) sounds.sent() } }
+        repo.incoming.collect { if (it.peer == peer && repo.chatSounds) sounds.received() }
     }
     DisposableEffect(peer) { onDispose { if (repo.visibleChat == peer) repo.visibleChat = null } }
     val readReceipts = remember { repo.readReceipts }
@@ -580,10 +594,11 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
         TopAppBar(
             navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Назад") } },
             title = {
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { if (isGroup) onGroupInfo() else rename = true }) {
-                    AvatarView(title, group?.avatar ?: contact?.avatar, 36.dp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    // Аватар — переглянути великим; ім'я — перейменувати (у групі — учасники).
+                    Box(Modifier.clip(CircleShape).clickable { showAvatar = true }) { AvatarView(title, group?.avatar ?: contact?.avatar, 36.dp) }
                     Spacer(Modifier.width(10.dp))
-                    Column {
+                    Column(Modifier.clickable { if (isGroup) onGroupInfo() else rename = true }) {
                         Text(title, fontWeight = FontWeight.Bold, maxLines = 1)
                         if (group != null) Text("${group.members.size} учасн.", fontSize = 12.sp, color = Muted)
                     }
@@ -675,6 +690,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
         }
     }
     viewing?.let { m -> PhotoViewer(m, onClose = { viewing = null }, toast = toast) }
+    if (showAvatar) AvatarViewer(title, group?.avatar ?: contact?.avatar) { showAvatar = false }
     actionsFor?.let { m ->
         AlertDialog(
             onDismissRequest = { actionsFor = null },
@@ -990,6 +1006,14 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
                     }
                     var rr by remember { mutableStateOf(app.repo.readReceipts) }
                     Switch(checked = rr, onCheckedChange = { app.repo.readReceipts = it; rr = it })
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Звуки в бесіді")
+                        Text("Тихий сигнал «надіслано» й «отримано», коли бесіда відкрита. У беззвучному режимі мовчить.", color = Muted, fontSize = 12.sp)
+                    }
+                    var cs by remember { mutableStateOf(app.repo.chatSounds) }
+                    Switch(checked = cs, onCheckedChange = { app.repo.chatSounds = it; cs = it })
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {

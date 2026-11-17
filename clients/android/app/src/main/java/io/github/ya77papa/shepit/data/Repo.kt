@@ -466,6 +466,7 @@ class Repo(context: Context) {
             val ok = total == 0 || failed < total
             db.setStatus(id, if (ok) "sent" else "failed")
             _changed.emit(peer)
+            if (ok) _sent.tryEmit(peer)
             if (!ok) error("Не вдалося надіслати")
             return failed
         } catch (e: Exception) {
@@ -532,6 +533,15 @@ class Repo(context: Context) {
         val batch = synchronized(pendingAcks) { pendingAcks.toMap().also { pendingAcks.clear() } }
         batch.forEach { (k, mids) -> if (mids.isNotEmpty()) sendReceipt(k.first, mids.toList(), "d", k.second) }
     }
+
+    /** Вихідне в бесіді peer пішло на сервер (для звуку «надіслано»). */
+    private val _sent = MutableSharedFlow<String>(extraBufferCapacity = 16)
+    val sent = _sent.asSharedFlow()
+
+    /** Звуки в бесіді. */
+    var chatSounds: Boolean
+        get() = db.get("chatSounds") != "0"
+        set(v) = db.set("chatSounds", if (v) "1" else "0")
 
     /** Відкрита на екрані бесіда (null — жодної або застосунок не на екрані). */
     @Volatile var visibleChat: String? = null

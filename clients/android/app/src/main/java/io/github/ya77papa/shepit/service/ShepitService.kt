@@ -50,11 +50,14 @@ class ShepitService : Service() {
             jobs += repo.scope.launch {
                 repo.incoming.collect { m ->
                     if (!MainActivity.visible || MainActivity.openPeer != m.peer) {
-                        val hide = (application as ShepitApp).lock.enabled // заблоковано — без тексту й імен
-                        if (hide) Notifications.showMessage(this@ShepitService, "Шепіт", m.peer, "Нове повідомлення") else Notifications.showMessage(
-                            this@ShepitService, repo.nameOf(m.peer), m.peer,
-                            // У групі — хто написав.
-                            if (m.sender != null) "${repo.memberName(m.sender, repo.db.group(m.peer.removePrefix("g:")))}: ${m.text}" else m.text,
+                        val hide = (application as ShepitApp).lock.enabled // блокування — без тексту, імен і кнопок
+                        val group = if (m.peer.startsWith("g:")) repo.db.group(m.peer.removePrefix("g:")) else null
+                        val sender = m.sender ?: m.peer
+                        val contact = repo.contacts.value.firstOrNull { it.identity == sender }
+                        val name = if (group != null) repo.memberName(sender, group) else repo.nameOf(m.peer)
+                        Notifications.showMessage(
+                            this@ShepitService, m.peer, repo.nameOf(m.peer), group?.avatar, group != null,
+                            Notifications.Line(sender, name, contact?.avatar, m.text, m.at), hide,
                         )
                     }
                 }

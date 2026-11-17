@@ -16,6 +16,8 @@
   import ImageMsg from './ImageMsg.svelte';
   import Ticks, { type TickState } from './Ticks.svelte';
   import { prepareImage } from './lib/image';
+  import { playSent, playReceived } from './lib/sounds';
+  import { avatarSrc } from './lib/avatar';
   import CallOverlay from './CallOverlay.svelte';
 
   const POLL_MS = 3000;
@@ -186,6 +188,7 @@
   const pendingAcks = new Map<string, { to: string; g?: string; ids: Set<string> }>();
 
   function noteDelivered(to: string, mid: string | undefined, g?: string) {
+    if (chatVisible(g ? `g:${g}` : to)) heardIn = true;
     if (!mid) return;
     const k = `${to}|${g ?? ''}`;
     let e = pendingAcks.get(k);
@@ -220,6 +223,8 @@
   }
 
   async function flushAcks() {
+    if (heardIn && chatSounds) playReceived();
+    heardIn = false;
     await markRead();
     for (const { to, g, ids } of pendingAcks.values()) if (ids.size) sendReceipt(to, [...ids], 'd', g);
     pendingAcks.clear();
@@ -272,6 +277,7 @@
     if (chatKey === key) await reloadThread();
     const ok = await transmit(key, body);
     await messagesDb.patch(id, { status: ok ? 'sent' : 'failed' });
+    if (ok && chatSounds && chatVisible(key)) playSent();
     if (chatKey === key) await reloadThread();
   }
 
@@ -775,6 +781,8 @@
 
   async function refreshContacts() {
     contacts = (await contactsDb.all()).sort((a, b) => a.name.localeCompare(b.name, 'uk'));
+    // Відкрита бесіда — підхопити нове ім'я чи фото співрозмовника.
+    if (current) current = contacts.find((c) => c.identity === current!.identity) ?? current;
   }
 
   async function openThread(c: Contact) {
@@ -885,6 +893,12 @@
 
   let photoInput: HTMLInputElement | undefined = $state();
   let viewing = $state('');
+  /** Збільшений аватар (перший дотик); дотик по ньому — на весь екран. */
+  let bigAvatar = $state<{ name: string; src?: string } | null>(null);
+  /** Тихі звуки у відкритій бесіді. */
+  let chatSounds = $state(true);
+  let heardIn = false;
+  const chatVisible = (key: string) => chatKey === key && document.visibilityState === 'visible';
 
   async function sendImage(file: File) {
     if (!me || (!current && !group)) return;
@@ -1208,6 +1222,7 @@
         myName = (await kv.get<string>('myName')) ?? '';
         myAvatar = (await kv.get<string>('myAvatar')) ?? '';
         readReceipts = (await kv.get<boolean>('readReceipts')) ?? true;
+        chatSounds = (await kv.get<boolean>('chatSounds')) ?? true;
         await messagesDb.failStuck();
         if (!(await kv.get<boolean>('receiptsInit'))) {
           await messagesDb.markAllSeen();
@@ -1348,7 +1363,10 @@
           {#each contacts as c (c.identity)}
             <li>
               <button class="chat-item" class:active={current?.identity === c.identity} onclick={() => openThread(c)}>
-                <Avatar name={c.name} src={c.avatar} size={36} />
+                <!-- svelte-ignore a11y_click_events_have_key_events -->
+                <span class="avatar-btn" role="button" tabindex="-1" title="Переглянути фото" onclick={(e) => { e.stopPropagation(); bigAvatar = { name: c.name, src: c.avatar }; }}>
+                  <Avatar name={c.name} src={c.avatar} size={36} />
+                </span>
                 <span class="item-text">
                   <span class="name">{c.name}</span>
                   <span class="sub">{short(c.fingerprint)}…</span>
@@ -1369,7 +1387,10 @@
           {#each groups as g (g.id)}
             <li>
               <button class="chat-item" class:active={group?.id === g.id} onclick={() => openGroup(g)}>
-                <Avatar name={g.name} src={g.avatar} size={36} />
+                <!-- svelte-ignore a11y_click_events_have_key_events -->
+                <span class="avatar-btn" role="button" tabindex="-1" title="Переглянути фото" onclick={(e) => { e.stopPropagation(); bigAvatar = { name: g.name, src: g.avatar }; }}>
+                  <Avatar name={g.name} src={g.avatar} size={36} />
+                </span>
                 <span class="item-text">
                   <span class="name">{g.name}</span>
                   <span class="sub">{g.left ? 'ти не в групі' : `${g.members.length} учасн.`}</span>
@@ -1434,7 +1455,9 @@
       {:else if current || group}
         {#if group}
         <header>
-          <Avatar name={group.name} src={group.avatar} size={36} />
+          <button class="avatar-btn" title="Переглянути фото" onclick={() => (bigAvatar = { name: group!.name, src: group!.avatar })}>
+            <Avatar name={group.name} src={group.avatar} size={36} />
+          </button>
           <button class="title" onclick={() => (panel = 'group')} title="Учасники й налаштування">{group.name}</button>
           <span class="small muted">{group.members.length} учасн.</span>
           <span class="spacer"></span>
@@ -1442,7 +1465,9 @@
         </header>
         {:else if current}
         <header>
-          <Avatar name={current.name} src={current.avatar} size={36} />
+          <button class="avatar-btn" title="Переглянути фото" onclick={() => (bigAvatar = { name: current!.name, src: current!.avatar })}>
+            <Avatar name={current.name} src={current.avatar} size={36} />
+          </button>
           <button class="title" onclick={rename} title="Перейменувати">{current.name} </button>
           <button class="ghost small" onclick={() => (showSafety = !showSafety)}>код безпеки</button>
           <span class="spacer"></span>
@@ -1577,6 +1602,19 @@
     />
   {/if}
 
+  {#if bigAvatar}
+    <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+    <div class="avatar-viewer" onclick={() => (bigAvatar = null)}>
+      <button
+        class="big" disabled={!bigAvatar.src} title={bigAvatar.src ? 'Збільшити' : ''}
+        onclick={(e) => { e.stopPropagation(); if (bigAvatar?.src) { viewing = avatarSrc(bigAvatar.src); bigAvatar = null; } }}
+      >
+        <Avatar name={bigAvatar.name} src={bigAvatar.src} size={260} />
+      </button>
+      <div class="name">{bigAvatar.name}</div>
+      {#if bigAvatar.src}<div class="small muted">Натисни фото, щоб збільшити</div>{/if}
+    </div>
+  {/if}
   {#if viewing}
     <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
     <div class="photo-viewer" onclick={() => (viewing = '')}>
@@ -1743,6 +1781,13 @@
               Повідомляти, що я переглянув повідомлення
             </span>
             <span class="small muted">Якщо вимкнути, ти теж не бачитимеш, чи переглянули твої. «Доставлено» працює завжди.</span>
+          </label>
+          <label class="field check">
+            <span class="label">Звуки в бесіді</span>
+            <span class="row">
+              <input type="checkbox" checked={chatSounds} onchange={(e) => { chatSounds = e.currentTarget.checked; kv.set('chatSounds', chatSounds); }} />
+              Тихий сигнал «надіслано» й «отримано», коли бесіда відкрита
+            </span>
           </label>
           <div class="field">
             <span class="label">Дзвінки</span>

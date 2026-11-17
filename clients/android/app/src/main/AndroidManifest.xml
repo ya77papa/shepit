@@ -89,6 +89,10 @@
             android:exported="false" />
 
         <receiver
+            android:name=".service.MessageReceiver"
+            android:exported="false" />
+
+        <receiver
             android:name=".update.InstallReceiver"
             android:exported="false" />
     </application>

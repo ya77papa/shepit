@@ -36,8 +36,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -104,9 +106,13 @@ suspend fun loadForEdit(ctx: Context, uri: Uri): Bitmap = withContext(Dispatcher
 /** Стан редактора: масштаб (1 = фото повністю закриває коло), поворот (°), зсув (px екрана). */
 private data class Framing(val scale: Float = 1f, val rotation: Float = 0f, val dx: Float = 0f, val dy: Float = 0f)
 
-/** Відрендерити те, що в колі, у квадрат 192×192 JPEG ≤ ~48 КБ (base64) — як у веб-версії. */
+/** Відрендерити те, що в колі, у квадрат до 512×512 JPEG ≤ 48 КБ — як у веб-версії. */
 private fun renderAvatar(bmp: Bitmap, side: Float, f: Framing): String {
-    val out = 192
+    for (out in intArrayOf(512, 384, 256, 192)) renderAvatar(bmp, side, f, out)?.let { return it }
+    error("Не вдалося стиснути фото")
+}
+
+private fun renderAvatar(bmp: Bitmap, side: Float, f: Framing, out: Int): String? {
     val k = out / side
     val base = side / minOf(bmp.width, bmp.height)
     val result = Bitmap.createBitmap(out, out, Bitmap.Config.ARGB_8888)
@@ -118,12 +124,16 @@ private fun renderAvatar(bmp: Bitmap, side: Float, f: Framing): String {
         scale(s, s)
         drawBitmap(bmp, -bmp.width / 2f, -bmp.height / 2f, android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG or android.graphics.Paint.ANTI_ALIAS_FLAG))
     }
-    for (q in listOf(85, 72, 58)) {
-        val o = ByteArrayOutputStream()
-        result.compress(Bitmap.CompressFormat.JPEG, q, o)
-        if (o.size() <= 48_000) return Base64.encodeToString(o.toByteArray(), Base64.NO_WRAP)
+    try {
+        for (q in listOf(85, 72, 60)) {
+            val o = ByteArrayOutputStream()
+            result.compress(Bitmap.CompressFormat.JPEG, q, o)
+            if (o.size() <= 48_000) return Base64.encodeToString(o.toByteArray(), Base64.NO_WRAP)
+        }
+        return null
+    } finally {
+        result.recycle()
     }
-    error("Не вдалося стиснути фото")
 }
 
 /** Редактор фото: посунути пальцем, збільшити/зменшити й повернути двома пальцями або повзунками. */
@@ -673,5 +683,63 @@ fun ChannelScreen(
             },
             dismissButton = { TextButton(onClick = { confirm = null }) { Text("Скасувати") } },
         )
+    }
+}
+
+/**
+ * Перегляд аватара: торкнувся аватара — велике коло з ім'ям; торкнувся кола — фото на весь екран
+ * з масштабом пальцями (два пальці — збільшити, подвійний дотик — збільшити/повернути).
+ */
+@Composable
+fun AvatarViewer(name: String, b64: String?, onClose: () -> Unit) {
+    var full by remember { mutableStateOf(false) }
+    val bmp = remember(b64) {
+        b64?.let { runCatching { Base64.decode(it, Base64.DEFAULT).let { b -> BitmapFactory.decodeByteArray(b, 0, b.size)?.asImageBitmap() } }.getOrNull() }
+    }
+    androidx.compose.ui.window.Dialog(
+        onDismissRequest = { if (full) full = false else onClose() },
+        properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        if (full && bmp != null) {
+            var scale by remember { mutableStateOf(1f) }
+            var offset by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
+            Box(Modifier.fillMaxSize().background(Color.Black)) {
+                Image(
+                    bmp, name,
+                    Modifier.fillMaxSize()
+                        .pointerInput(Unit) {
+                            detectTapGestures(onDoubleTap = {
+                                if (scale > 1f) { scale = 1f; offset = androidx.compose.ui.geometry.Offset.Zero } else scale = 2.5f
+                            })
+                        }
+                        .pointerInput(Unit) {
+                            detectTransformGestures { _, pan, zoom, _ ->
+                                scale = (scale * zoom).coerceIn(1f, 6f)
+                                offset = if (scale == 1f) androidx.compose.ui.geometry.Offset.Zero else offset + pan
+                            }
+                        }
+                        .graphicsLayer(scaleX = scale, scaleY = scale, translationX = offset.x, translationY = offset.y),
+                    contentScale = ContentScale.Fit,
+                )
+                androidx.compose.material3.OutlinedButton(
+                    onClick = { full = false },
+                    modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(16.dp),
+                ) { Text("Закрити") }
+            }
+        } else {
+            Box(
+                Modifier.fillMaxSize().clickable(interactionSource = null, indication = null, onClick = onClose),
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Box(Modifier.clip(CircleShape).clickable(enabled = bmp != null) { full = true }) {
+                        AvatarView(name, b64, 260.dp)
+                    }
+                    Spacer(Modifier.height(16.dp))
+                    Text(name, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 20.sp)
+                    if (bmp != null) Text("Торкнись фото, щоб збільшити", color = Color.White.copy(alpha = 0.6f), fontSize = 13.sp)
+                }
+            }
+        }
     }
 }

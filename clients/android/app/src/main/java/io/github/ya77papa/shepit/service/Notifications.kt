@@ -9,6 +9,7 @@ import android.content.Intent
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.Person
+import androidx.core.graphics.drawable.IconCompat
 import io.github.ya77papa.shepit.R
 import io.github.ya77papa.shepit.ui.CallActivity
 import io.github.ya77papa.shepit.ui.MainActivity
@@ -124,12 +125,43 @@ object Notifications {
         ctx.getSystemService(NotificationManager::class.java).cancel(ID_CALL)
     }
 
-    fun showMessage(ctx: Context, name: String, peer: String, text: String) {
-        val open = pi(ctx, 30, Intent(ctx, MainActivity::class.java).putExtra(MainActivity.EXTRA_PEER, peer).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP))
-        val n = NotificationCompat.Builder(ctx, CH_MESSAGES)
+    // ---------- повідомлення ----------
+
+    /** Рядок у сповіщенні бесіди. sender = null — це я (відповідь зі сповіщення). */
+    class Line(val sender: String?, val name: String, val avatar: String?, val text: String, val at: Long)
+
+    /** Непрочитане в сповіщеннях: бесіда → рядки (лише в пам'яті, на диск не пишеться). */
+    private val history = mutableMapOf<String, MutableList<Line>>()
+
+    const val ACTION_REPLY = "io.github.ya77papa.shepit.REPLY"
+    const val ACTION_READ = "io.github.ya77papa.shepit.READ"
+    const val KEY_REPLY = "reply"
+
+    private fun messageId(peer: String) = 2000 + (peer.hashCode() and 0x7fff)
+
+    private fun circle(b64: String?): IconCompat? = runCatching {
+        val bytes = android.util.Base64.decode(b64 ?: return null, android.util.Base64.DEFAULT)
+        val src = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        val side = minOf(src.width, src.height, 256)
+        val out = android.graphics.Bitmap.createBitmap(side, side, android.graphics.Bitmap.Config.ARGB_8888)
+        val c = android.graphics.Canvas(out)
+        val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG or android.graphics.Paint.FILTER_BITMAP_FLAG)
+        c.drawCircle(side / 2f, side / 2f, side / 2f, p)
+        p.xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.SRC_IN)
+        c.drawBitmap(src, null, android.graphics.Rect(0, 0, side, side), p)
+        IconCompat.createWithBitmap(out)
+    }.getOrNull()
+
+    /**
+     * Нове повідомлення: дописати рядок у сповіщення бесіди й показати.
+     * [hidden] — увімкнено блокування: без імен, тексту й кнопок.
+     */
+    fun showMessage(ctx: Context, peer: String, title: String, titleAvatar: String?, isGroup: Boolean, line: Line?, hidden: Boolean) {
+        val nm = ctx.getSystemService(NotificationManager::class.java)
+        val id = messageId(peer)
+        val open = pi(ctx, id, Intent(ctx, MainActivity::class.java).putExtra(MainActivity.EXTRA_PEER, peer).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP))
+        val b = NotificationCompat.Builder(ctx, CH_MESSAGES)
             .setSmallIcon(R.drawable.ic_stat)
-            .setContentTitle(name)
-            .setContentText(text)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
             .setPublicVersion(
@@ -137,9 +169,61 @@ object Notifications {
             )
             .setAutoCancel(true)
             .setContentIntent(open)
-            .build()
-        runCatching { ctx.getSystemService(NotificationManager::class.java).notify(ID_MESSAGE, n) }
+            .setDeleteIntent(pi(ctx, id + 1, Intent(ctx, MessageReceiver::class.java).setAction(ACTION_DISMISS).putExtra(MainActivity.EXTRA_PEER, peer), activity = false))
+        val lines = synchronized(history) {
+            val l = history.getOrPut(if (hidden) "" else peer) { mutableListOf() }
+            if (line != null) { l += line; while (l.size > 12) l.removeAt(0) }
+            l.toList()
+        }
+        if (hidden) {
+            b.setContentTitle("Шепіт").setContentText(if (lines.size > 1) "Нових повідомлень: ${lines.size}" else "Нове повідомлення")
+            runCatching { nm.notify(ID_MESSAGE, b.build()) }
+            return
+        }
+        if (lines.isEmpty()) return
+        val me = Person.Builder().setName("Я").setKey("me").build()
+        val style = NotificationCompat.MessagingStyle(me).setGroupConversation(isGroup)
+        if (isGroup) style.setConversationTitle(title)
+        val people = mutableMapOf<String, Person>()
+        for (l in lines) {
+            val who = l.sender?.let { s -> people.getOrPut(s) { Person.Builder().setKey(s).setName(l.name).setIcon(circle(l.avatar)).build() } }
+            style.addMessage(l.text, l.at, who)
+        }
+        b.setStyle(style)
+        if (isGroup) circle(titleAvatar)?.let { b.setLargeIcon(it.toIcon(ctx)) }
+        // Відповісти прямо зі сповіщення; «Прочитано» — позначити переглянутим і прибрати.
+        val replyPi = PendingIntent.getBroadcast(
+            ctx, id + 2, Intent(ctx, MessageReceiver::class.java).setAction(ACTION_REPLY).putExtra(MainActivity.EXTRA_PEER, peer),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
+        )
+        b.addAction(
+            NotificationCompat.Action.Builder(0, "Відповісти", replyPi)
+                .addRemoteInput(androidx.core.app.RemoteInput.Builder(KEY_REPLY).setLabel("Повідомлення").build())
+                .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_REPLY)
+                .setShowsUserInterface(false)
+                .build(),
+        )
+        b.addAction(
+            NotificationCompat.Action.Builder(0, "Прочитано", pi(ctx, id + 3, Intent(ctx, MessageReceiver::class.java).setAction(ACTION_READ).putExtra(MainActivity.EXTRA_PEER, peer), activity = false))
+                .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_MARK_AS_READ)
+                .setShowsUserInterface(false)
+                .build(),
+        )
+        // Моя відповідь зі сповіщення — без звуку.
+        if (line?.sender == null && line != null) b.setOnlyAlertOnce(true).setSilent(true)
+        runCatching { nm.notify(id, b.build()) }
     }
+
+    const val ACTION_DISMISS = "io.github.ya77papa.shepit.DISMISS"
+
+    /** Бесіду відкрито / прочитано / сповіщення змахнуто — забути рядки й прибрати. */
+    fun cancelMessages(ctx: Context, peer: String) {
+        synchronized(history) { history.remove(peer); history.remove("") }
+        val nm = ctx.getSystemService(NotificationManager::class.java)
+        runCatching { nm.cancel(messageId(peer)); nm.cancel(ID_MESSAGE) }
+    }
+
+    fun hasMessages(peer: String) = synchronized(history) { history[peer]?.isNotEmpty() == true }
 
     fun canFullScreen(ctx: Context): Boolean =
         Build.VERSION.SDK_INT < 34 || ctx.getSystemService(NotificationManager::class.java).canUseFullScreenIntent()

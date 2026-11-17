@@ -6,7 +6,8 @@
   let { file, onDone, onCancel }: { file: File; onDone: (b64: string) => void; onCancel: () => void } = $props();
 
   const VIEW = 300; // розмір області в CSS-пікселях
-  const OUT = 192;
+  // Якомога чіткіше (для перегляду на весь екран), але файл ≤ 48 КБ — так вміщується і в опис каналу.
+  const SIZES = [512, 384, 256, 192];
   let canvas: HTMLCanvasElement | undefined = $state();
   let img: ImageBitmap | null = $state(null);
   let scale = $state(1);
@@ -108,15 +109,17 @@
     if (!img) return;
     busy = true;
     try {
-      const out = new OffscreenCanvas(OUT, OUT);
-      paint(out.getContext('2d')!, OUT);
-      for (const q of [0.85, 0.72, 0.58]) {
-        const blob = await out.convertToBlob({ type: 'image/jpeg', quality: q });
-        if (blob.size <= 48_000) {
-          const b = new Uint8Array(await blob.arrayBuffer());
-          let s = '';
-          for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode(...b.subarray(i, i + 0x8000));
-          return onDone(btoa(s));
+      for (const size of SIZES) {
+        const out = new OffscreenCanvas(size, size);
+        paint(out.getContext('2d')!, size);
+        for (const q of [0.85, 0.72, 0.6]) {
+          const blob = await out.convertToBlob({ type: 'image/jpeg', quality: q });
+          if (blob.size <= 48_000) {
+            const b = new Uint8Array(await blob.arrayBuffer());
+            let s = '';
+            for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode(...b.subarray(i, i + 0x8000));
+            return onDone(btoa(s));
+          }
         }
       }
       error = 'Не вдалося стиснути фото';
