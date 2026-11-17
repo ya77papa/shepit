@@ -98,6 +98,19 @@ class CallManager(private val ctx: Context, private val repo: Repo) {
     }
 
     init {
+        // Поки дзвінок триває — сповіщення: повернутися до розмови або завершити її
+        // (навіть якщо екран дзвінка згорнуто).
+        scope.launch {
+            kotlinx.coroutines.flow.combine(state, startedAt) { st, at -> st to at }.collect { (st, at) ->
+                when (st) {
+                    State.OUTGOING, State.CONNECTING, State.ACTIVE -> Notifications.showOngoingCall(
+                        ctx, repo.nameOf(peer.value), if (st == State.ACTIVE) at else null,
+                        when (st) { State.OUTGOING -> "Виклик…"; State.CONNECTING -> "З'єднання…"; else -> "Триває розмова — торкнись, щоб повернутися" },
+                    )
+                    else -> Notifications.cancelOngoingCall(ctx)
+                }
+            }
+        }
         scope.launch {
             repo.callSignals.collect { (from, b) ->
                 runCatching { onSignal(from, b) }.onFailure { trace("✗ обробка ${b.op}: ${it.javaClass.simpleName}: ${it.message}") }

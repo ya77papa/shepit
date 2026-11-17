@@ -74,13 +74,16 @@ fun AppUi(
     LaunchedEffect(Unit) { app.calls.error.collect { if (it.isNotEmpty()) { snack.showSnackbar(it); app.calls.error.value = "" } } }
 
     Scaffold(snackbarHost = { SnackbarHost(snack) }, containerColor = MaterialTheme.colorScheme.background) { pad ->
-        Box(Modifier.padding(pad).fillMaxSize()) {
+        Column(Modifier.padding(pad).fillMaxSize()) {
+        CallBanner(app, act)
+        Box(Modifier.weight(1f).fillMaxWidth()) {
             if (showUpdate.value) UpdateDialog(app, act) { showUpdate.value = false }
             if (!hasAccount) {
                 Welcome(app, pendingInvite.value, inviteCode.value, onDone = { hasAccount = true }, onError = { scope.launch { snack.showSnackbar(it) } })
             } else if (loaded) {
                 Main(app, act, pendingInvite, openRequest, channelLink, shared, onUpdate = { showUpdate.value = true }, onLogout = { hasAccount = false; loaded = false }, toast = { scope.launch { snack.showSnackbar(it) } })
             }
+        }
         }
     }
 }
@@ -196,6 +199,7 @@ private fun Main(
     var channelSub by remember { mutableStateOf(true) }
     var showInvite by remember { mutableStateOf(false) }
     var showAdd by remember { mutableStateOf(false) }
+    var showLink by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     /** Чернетка для відкритої бесіди/каналу (текст, яким поділились). */
     var draftFor by remember { mutableStateOf<Pair<String, String>?>(null) }
@@ -261,6 +265,18 @@ private fun Main(
         )
     }
     if (showInvite) InviteDialog(app) { showInvite = false }
+    if (showLink) OpenLinkDialog(
+        onClose = { showLink = false },
+        onLink = { text ->
+            val ch = io.github.ya77papa.shepit.data.Channels.parseLink(text)
+            val inv = repo.parseInvite(text)
+            when {
+                ch != null -> { showLink = false; openChannel(ch.first, ch.second) }
+                inv != null -> { showLink = false; pendingInvite.value = inv }
+                else -> toast("Це не посилання Шепоту на канал чи запрошення")
+            }
+        },
+    )
     if (showAdd) AddDialog(app, onDone = { c -> showAdd = false; if (c != null) openChat(c.identity) }, toast)
 
     when (screen) {
@@ -268,6 +284,7 @@ private fun Main(
             app, contacts, onUpdate, onOpen = { openChat(it) }, onChannel = { channel = it; channelSub = true; screen = Screen.CHANNEL },
             onInvite = { showInvite = true }, onAdd = { showAdd = true }, onSettings = { screen = Screen.SETTINGS },
             onNewGroup = { screen = Screen.NEW_GROUP }, onNewChannel = { screen = Screen.NEW_CHANNEL }, onFindChannel = { screen = Screen.FIND_CHANNEL }, act,
+            onOpenLink = { showLink = true },
         )
         Screen.CHAT -> peer?.let { p ->
             val initial = draftFor?.takeIf { it.first == p }?.second
@@ -299,7 +316,7 @@ private fun Main(
 private fun ContactsScreen(
     app: ShepitApp, contacts: List<Contact>, onUpdate: () -> Unit, onOpen: (String) -> Unit, onChannel: (ChannelRec) -> Unit,
     onInvite: () -> Unit, onAdd: () -> Unit, onSettings: () -> Unit,
-    onNewGroup: () -> Unit, onNewChannel: () -> Unit, onFindChannel: () -> Unit, act: MainActivity,
+    onNewGroup: () -> Unit, onNewChannel: () -> Unit, onFindChannel: () -> Unit, act: MainActivity, onOpenLink: () -> Unit = {},
 ) {
     val repo = app.repo
     val connected by repo.connected.collectAsState()
@@ -327,6 +344,7 @@ private fun ContactsScreen(
                         DropdownMenuItem(text = { Text("Нова група") }, enabled = contacts.isNotEmpty(), onClick = { menu = false; onNewGroup() })
                         DropdownMenuItem(text = { Text("Новий канал") }, onClick = { menu = false; onNewChannel() })
                         DropdownMenuItem(text = { Text("Знайти канал") }, onClick = { menu = false; onFindChannel() })
+                        DropdownMenuItem(text = { Text("Відкрити посилання") }, onClick = { menu = false; onOpenLink() })
                     }
                 }
                 IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, "Налаштування") }
@@ -1072,6 +1090,52 @@ private fun ShareScreen(app: ShepitApp, text: String, onBack: () -> Unit, onChat
                 )
             }
             if (contacts.isEmpty() && active.isEmpty() && mine.isEmpty()) item { Text("Немає кому надіслати — спершу додай контакт.", Modifier.padding(16.dp), color = Muted) }
+        }
+    }
+}
+
+
+/** Вставити посилання Шепоту (канал чи запрошення), отримане будь-яким способом. */
+@Composable
+private fun OpenLinkDialog(onClose: () -> Unit, onLink: (String) -> Unit) {
+    val ctx = LocalContext.current
+    var text by remember {
+        val clip = ctx.getSystemService(ClipboardManager::class.java).primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(ctx)?.toString().orEmpty()
+        mutableStateOf(if ("#c=" in clip || "#add=" in clip) clip.trim() else "")
+    }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Відкрити посилання") },
+        text = {
+            Column {
+                Text("Встав посилання на канал або запрошення, яке тобі надіслали.", color = Muted, fontSize = 13.sp)
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(text, { text = it }, placeholder = { Text("https://…/#c=…") }, minLines = 2, modifier = Modifier.fillMaxWidth())
+            }
+        },
+        confirmButton = { TextButton(enabled = text.isNotBlank(), onClick = { onLink(text.trim()) }) { Text("Відкрити") } },
+        dismissButton = { TextButton(onClick = onClose) { Text("Скасувати") } },
+    )
+}
+
+/** Дзвінок триває, а екран дзвінка згорнуто: повернутися або завершити. */
+@Composable
+private fun CallBanner(app: ShepitApp, act: MainActivity) {
+    val st by app.calls.state.collectAsState()
+    val peer by app.calls.peer.collectAsState()
+    if (st == io.github.ya77papa.shepit.call.CallManager.State.IDLE) return
+    val name = remember(peer) { if (peer.isEmpty()) "" else app.repo.nameOf(peer) }
+    Surface(color = Color(0xFF1B5E3A), modifier = Modifier.fillMaxWidth().clickable {
+        act.startActivity(android.content.Intent(act, CallActivity::class.java).addFlags(android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP))
+    }) {
+        Row(Modifier.padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                if (st == io.github.ya77papa.shepit.call.CallManager.State.INCOMING) "Вхідний дзвінок: $name — торкнись" else "Дзвінок з $name — торкнись, щоб повернутися",
+                Modifier.weight(1f), color = Color.White, maxLines = 1,
+            )
+            TextButton(onClick = {
+                if (st == io.github.ya77papa.shepit.call.CallManager.State.INCOMING) app.calls.reject() else app.calls.hangup()
+            }) { Text("Завершити", color = Color.White, fontWeight = FontWeight.SemiBold) }
         }
     }
 }

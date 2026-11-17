@@ -52,7 +52,8 @@
                 <data android:mimeType="text/plain" />
             </intent-filter>
             <!-- Посилання-запрошення https://shepit.razom.isroot.in/#add=… -->
-            <intent-filter android:autoVerify="false">
+            <!-- autoVerify: домен підтверджено файлом /.well-known/assetlinks.json — посилання відкриваються одразу в застосунку. -->
+            <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />

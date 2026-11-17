@@ -1,0 +1,10 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "io.github.ya77papa.shepit",
+      "sha256_cert_fingerprints": ["7E:E1:40:BE:36:A1:96:FC:83:B6:80:D1:28:EE:B1:73:23:3F:52:B1:8A:9E:32:B0:48:BB:A1:B5:9A:7A:73:9A"]
+    }
+  }
+]

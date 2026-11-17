@@ -20,6 +20,8 @@ object Notifications {
     const val ID_SERVICE = 1
     const val ID_CALL = 2
     const val CH_UPDATES = "updates"
+    const val CH_ONGOING = "ongoing_call"
+    private const val ID_ONGOING = 5
     private const val ID_UPDATE = 4
     private const val ID_MESSAGE = 3
 
@@ -34,6 +36,10 @@ object Notifications {
         nm.createNotificationChannel(NotificationChannel(CH_MESSAGES, "Повідомлення", NotificationManager.IMPORTANCE_HIGH).apply {
             description = "Нові повідомлення"
             lockscreenVisibility = Notification.VISIBILITY_PRIVATE
+        })
+        nm.createNotificationChannel(NotificationChannel(CH_ONGOING, "Поточний дзвінок", NotificationManager.IMPORTANCE_LOW).apply {
+            description = "Повернутися до розмови або завершити її"
+            setSound(null, null)
         })
         nm.createNotificationChannel(NotificationChannel(CH_UPDATES, "Оновлення", NotificationManager.IMPORTANCE_DEFAULT).apply {
             description = "Нова версія Шепоту"
@@ -91,6 +97,27 @@ object Notifications {
             .setStyle(NotificationCompat.CallStyle.forIncomingCall(person, decline, answer))
             .build()
         ctx.getSystemService(NotificationManager::class.java).notify(ID_CALL, n)
+    }
+
+    /** Дзвінок триває: сповіщення, з якого можна повернутися до розмови або завершити її. */
+    fun showOngoingCall(ctx: Context, name: String, startedAt: Long?, status: String) {
+        val open = pi(ctx, 50, Intent(ctx, CallActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP))
+        val hangup = pi(ctx, 51, Intent(ctx, CallReceiver::class.java).setAction(CallReceiver.HANGUP), activity = false)
+        val b = NotificationCompat.Builder(ctx, CH_ONGOING)
+            .setSmallIcon(R.drawable.ic_stat)
+            .setContentTitle(name)
+            .setContentText(status)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setOngoing(true)
+            .setSilent(true)
+            .setContentIntent(open)
+            .addAction(0, "Завершити", hangup)
+        if (startedAt != null) b.setUsesChronometer(true).setWhen(startedAt).setShowWhen(true)
+        runCatching { ctx.getSystemService(NotificationManager::class.java).notify(ID_ONGOING, b.build()) }
+    }
+
+    fun cancelOngoingCall(ctx: Context) {
+        ctx.getSystemService(NotificationManager::class.java).cancel(ID_ONGOING)
     }
 
     fun cancelIncomingCall(ctx: Context) {

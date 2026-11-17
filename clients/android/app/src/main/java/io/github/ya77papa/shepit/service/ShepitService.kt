@@ -104,10 +104,15 @@ class BootReceiver : BroadcastReceiver() {
 /** Кнопка «Відхилити» у сповіщенні про дзвінок. */
 class CallReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
-        if (intent.action == DECLINE) (ctx.applicationContext as ShepitApp).calls.reject()
+        val calls = (ctx.applicationContext as ShepitApp).calls
+        when (intent.action) {
+            DECLINE -> calls.reject()
+            HANGUP -> calls.hangup()
+        }
     }
 
     companion object {
         const val DECLINE = "io.github.ya77papa.shepit.DECLINE"
+        const val HANGUP = "io.github.ya77papa.shepit.HANGUP"
     }
 }
