@@ -49,7 +49,12 @@ object Backup {
                         if (m.mid != null) put("mid", m.mid)
                         if (m.sender != null) put("from", m.sender)
                         if (m.reactions.isNotEmpty()) put("reactions", JSONObject(m.reactions as Map<*, *>))
-                        if (m.voice != null) put("voice", JSONObject().put("data", b64(m.voice)).put("mime", m.voiceMime).put("dur", m.voiceDur))
+                        if (m.voice != null && m.kind == "image") {
+                            // Той самий формат, що у веб-версії: image {data, mime, w, h}.
+                            val b = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                            android.graphics.BitmapFactory.decodeByteArray(m.voice, 0, m.voice.size, b)
+                            put("image", JSONObject().put("data", b64(m.voice)).put("mime", m.voiceMime ?: "image/jpeg").put("w", b.outWidth).put("h", b.outHeight))
+                        } else if (m.voice != null) put("voice", JSONObject().put("data", b64(m.voice)).put("mime", m.voiceMime).put("dur", m.voiceDur))
                     })
                 }
             })
@@ -84,11 +89,12 @@ object Backup {
         }
         val messages = p.getJSONArray("messages").let { a ->
             (0 until a.length()).map { a.getJSONObject(it) }.map { o ->
-                val v = o.optJSONObject("voice")
+                val img = o.optJSONObject("image")
+                val v = o.optJSONObject("voice") ?: img
                 Message(
                     peer = o.getString("peer"), out = o.getBoolean("out"), text = o.getString("text"), at = o.getLong("at"),
-                    kind = o.optString("kind", if (v != null) "voice" else "text"),
-                    voiceMime = v?.optString("mime"), voiceDur = v?.optLong("dur") ?: 0, voice = v?.let { unb64(it.getString("data")) },
+                    kind = o.optString("kind", if (img != null) "image" else if (v != null) "voice" else "text"),
+                    voiceMime = v?.optString("mime"), voiceDur = if (img != null) 0 else v?.optLong("dur") ?: 0, voice = v?.let { unb64(it.getString("data")) },
                     mid = o.optString("mid").takeIf { it.length == 32 },
                     sender = o.optString("from").ifEmpty { null },
                     reactions = o.optJSONObject("reactions")?.let { r -> r.keys().asSequence().associateWith { r.getString(it) } } ?: emptyMap(),

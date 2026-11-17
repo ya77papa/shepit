@@ -9,6 +9,10 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
@@ -506,6 +510,20 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
     val callState by app.calls.state.collectAsState()
     var actionsFor by remember { mutableStateOf<Message?>(null) }
     var emojiOpen by remember { mutableStateOf(false) }
+    var viewing by remember { mutableStateOf<Message?>(null) }
+    val pickPhoto = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val caption = draft.trim().ifEmpty { null }
+        busy = true
+        scope.launch {
+            runCatching {
+                val p = io.github.ya77papa.shepit.data.Photo.prepare(ctx, uri)
+                repo.sendImage(peer, p.jpeg, p.w, p.h, caption)
+            }.onSuccess { failed -> draft = ""; emojiOpen = false; if (failed > 0) toast("Не вдалося доставити $failed учасникам — спробуй пізніше") }
+                .onFailure { toast(it.message ?: "Помилка") }
+            busy = false
+        }
+    }
     val myId = remember { repo.core?.identity() }
     fun react(m: Message, e: String) = scope.launch { runCatching { repo.react(m, e) }.onFailure { toast(it.message ?: "Помилка") } }
     var menu by remember { mutableStateOf(false) }
@@ -577,7 +595,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
         }
         LazyColumn(Modifier.weight(1f).padding(horizontal = 12.dp), state = list) {
             items(messages, key = { it.id }) { m ->
-                Bubble(m, playing == m.id, sender = if (group != null && !m.out && m.kind != "call") displayName(app, contacts, group, m.sender) else null, myId = myId, onReact = { e -> react(m, e) }, onLongPress = { actionsFor = m }) {
+                Bubble(m, playing == m.id, sender = if (group != null && !m.out && m.kind != "call") displayName(app, contacts, group, m.sender) else null, myId = myId, onReact = { e -> react(m, e) }, onLongPress = { actionsFor = m }, onOpen = { viewing = m }) {
                     VoicePlayer.toggle(ctx, m.id, m.voice ?: return@Bubble, m.voiceMime) { playing = VoicePlayer.playingId }
                     playing = VoicePlayer.playingId
                 }
@@ -600,6 +618,10 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
                     IconButton(onClick = { emojiOpen = !emojiOpen }) {
                         Icon(if (emojiOpen) Icons.Default.Keyboard else Icons.Default.EmojiEmotions, "Емодзі", tint = if (emojiOpen) Accent else Muted)
                     }
+                    IconButton(enabled = !busy, onClick = {
+                        app.lock.expectReturn()
+                        pickPhoto.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                    }) { Icon(Icons.Default.AddPhotoAlternate, "Надіслати фото", tint = Muted) }
                     OutlinedTextField(draft, { draft = it }, placeholder = { Text("Повідомлення") }, modifier = Modifier.weight(1f), maxLines = 5)
                     if (draft.isNotBlank()) {
                         IconButton(enabled = !busy, onClick = {
@@ -620,6 +642,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
             }
         }
     }
+    viewing?.let { m -> PhotoViewer(m, onClose = { viewing = null }, toast = toast) }
     actionsFor?.let { m ->
         AlertDialog(
             onDismissRequest = { actionsFor = null },
@@ -637,7 +660,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
                             }
                         }
                     }
-                    if (m.kind != "voice" && m.kind != "call") Text(m.text, maxLines = 4, color = Muted)
+                    if (m.kind != "voice" && m.kind != "call" && m.kind != "image") Text(m.text, maxLines = 4, color = Muted)
                     if (m.out && m.mid == null && m.kind != "call") Text("Це повідомлення надіслане старою версією — видалити його можна лише в себе.", fontSize = 12.sp, color = Muted)
                 }
             },
@@ -698,7 +721,7 @@ private val timeFmt = SimpleDateFormat("HH:mm", Locale("uk"))
 @Composable
 private fun Bubble(
     m: Message, playing: Boolean, sender: String? = null, myId: String? = null,
-    onReact: (String) -> Unit = {}, onLongPress: () -> Unit, onPlay: () -> Unit,
+    onReact: (String) -> Unit = {}, onLongPress: () -> Unit, onOpen: () -> Unit = {}, onPlay: () -> Unit,
 ) {
     val system = m.kind == "call"
     Column(
@@ -713,9 +736,20 @@ private fun Bubble(
         Surface(
             color = if (m.out) OutBubble else InBubble, shape = RoundedCornerShape(14.dp),
             modifier = Modifier.widthIn(max = 300.dp).clip(RoundedCornerShape(14.dp))
-                .combinedClickable(onClick = { if (m.kind == "voice") onPlay() }, onLongClick = onLongPress),
+                .combinedClickable(onClick = { if (m.kind == "voice") onPlay() else if (m.kind == "image") onOpen() }, onLongClick = onLongPress),
         ) {
-            if (m.kind == "voice") {
+            if (m.kind == "image") {
+                val bytes = m.voice
+                val bmp = remember(m.id) { bytes?.let { io.github.ya77papa.shepit.data.Photo.decode(it, 720) } }
+                Column(Modifier.padding(4.dp)) {
+                    if (bmp != null) Image(
+                        bmp.asImageBitmap(), "Фото",
+                        Modifier.widthIn(max = 280.dp).heightIn(max = 380.dp).clip(RoundedCornerShape(11.dp)),
+                        contentScale = androidx.compose.ui.layout.ContentScale.Fit,
+                    ) else Text("Фото пошкоджене", Modifier.padding(8.dp), color = Muted)
+                    if (m.text != "Фото") Text(m.text, Modifier.padding(horizontal = 8.dp, vertical = 6.dp))
+                }
+            } else if (m.kind == "voice") {
                 Row(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(if (playing) Icons.Default.Stop else Icons.Default.PlayArrow, null)
                     Spacer(Modifier.width(8.dp))
@@ -739,6 +773,48 @@ private fun Bubble(
             }
         }
         Text(timeFmt.format(Date(m.at)), color = Muted, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 6.dp))
+    }
+}
+
+/** Фото на весь екран: масштаб пальцями, «Зберегти» — у файл, який обере користувач. */
+@Composable
+private fun PhotoViewer(m: Message, onClose: () -> Unit, toast: (String) -> Unit) {
+    val ctx = LocalContext.current
+    val app = ctx.applicationContext as ShepitApp
+    val bytes = m.voice ?: return
+    val bmp = remember(m.id) { io.github.ya77papa.shepit.data.Photo.decode(bytes, 2048) }
+    var scale by remember { mutableStateOf(1f) }
+    var offset by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
+    val save = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/jpeg")) { uri ->
+        if (uri != null) runCatching {
+            ctx.contentResolver.openOutputStream(uri)?.use { it.write(bytes) } ?: error("Не вдалося зберегти")
+        }.onSuccess { toast("Збережено") }.onFailure { toast(it.message ?: "Не вдалося зберегти") }
+    }
+    androidx.compose.ui.window.Dialog(onDismissRequest = onClose, properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)) {
+        Box(Modifier.fillMaxSize().background(Color.Black)) {
+            if (bmp != null) Image(
+                bmp.asImageBitmap(), "Фото",
+                Modifier.fillMaxSize()
+                    .pointerInput(Unit) {
+                        detectTransformGestures { _, pan, zoom, _ ->
+                            scale = (scale * zoom).coerceIn(1f, 6f)
+                            offset = if (scale == 1f) androidx.compose.ui.geometry.Offset.Zero else offset + pan
+                        }
+                    }
+                    .graphicsLayer(scaleX = scale, scaleY = scale, translationX = offset.x, translationY = offset.y),
+                contentScale = androidx.compose.ui.layout.ContentScale.Fit,
+            )
+            Row(
+                Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(16.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Button(onClick = {
+                    app.lock.expectReturn()
+                    save.launch("shepit-${SimpleDateFormat("yyyy-MM-dd-HHmmss", Locale.US).format(Date(m.at))}.jpg")
+                }) { Text("Зберегти") }
+                OutlinedButton(onClick = onClose) { Text("Закрити") }
+            }
+        }
     }
 }
 

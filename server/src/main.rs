@@ -150,8 +150,10 @@ fn internal(e: rusqlite::Error) -> StatusCode {
 
 type Shared = Arc<App>;
 
-/// Голосове повідомлення до ~30 с (Opus 16 кбіт/с) вміщається з запасом.
-const MAX_PAYLOAD_HEX: usize = 2 * 96 * 1024;
+/// Фото (клієнт стискає до ~600 КБ) або голосове — з запасом на шифрування й base64.
+const MAX_PAYLOAD_HEX: usize = 2 * 1200 * 1024;
+/// Межа тіла запиту /v0/send (JSON з hex-вмістом).
+const MAX_SEND_BODY: usize = MAX_PAYLOAD_HEX + 64 * 1024;
 const MAX_QUEUE: usize = 1000;
 const MAX_ONE_TIME: usize = 100;
 const FETCH_LIMIT: usize = 100;
@@ -502,7 +504,7 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 /// Жорстка політика безпеки контенту: лише власні скрипти і WASM, жодних сторонніх доменів,
 /// вбудовування у фрейми заборонене. Головний захист веб-клієнта від XSS.
 const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; \
-    img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; \
+    img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; \
     form-action 'self'; frame-ancestors 'none'";
 
 fn web_dir() -> Option<PathBuf> {
@@ -535,7 +537,7 @@ fn app(issuer: Issuer, db: db::Db, shutdown: tokio::sync::watch::Receiver<bool>)
         started: now_ms(),
         seen: Mutex::default(),
     });
-    // Раз на годину прибирати недоставлені конверти старші за 30 днів.
+    // Раз на годину прибирати недоставлені конверти (медіа — старші за 3 дні, решту — за 30).
     let pruner = shared.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -553,7 +555,7 @@ fn app(issuer: Issuer, db: db::Db, shutdown: tokio::sync::watch::Receiver<bool>)
         .route("/v0/keys/status", get(key_status))
         .route("/v0/keys/{identity}", get(get_keys))
         .route("/v0/certificate", get(certificate))
-        .route("/v0/send", post(send))
+        .route("/v0/send", post(send).layer(axum::extract::DefaultBodyLimit::max(MAX_SEND_BODY)))
         .route("/v0/mailbox/{id}", get(fetch))
         .route("/v0/mailbox/{id}/ack", post(ack))
         .route("/v0/events", get(events))

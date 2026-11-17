@@ -110,6 +110,14 @@ fn channel_row(r: &rusqlite::Row) -> rusqlite::Result<Channel> {
 
 /// Скільки зберігати недоставлені конверти.
 const RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// Великі конверти (фото, голосові) — лише транзит: максимум 3 дні, потім зникають.
+const MEDIA_RETENTION_MS: u64 = 3 * 24 * 60 * 60 * 1000;
+/// Розмір збереженого конверта (JSON), після якого він вважається медіа.
+pub const MEDIA_BYTES: i64 = 32 * 1024;
+/// Скільки байтів конвертів може одночасно чекати в одній скриньці.
+const MAX_MAILBOX_BYTES: i64 = 64 * 1024 * 1024;
+/// Скільки байтів віддавати за один запит скриньки.
+const MAX_LIST_BYTES: usize = 6 * 1024 * 1024;
 
 impl Db {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
@@ -117,6 +125,8 @@ impl Db {
         c.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
+             PRAGMA secure_delete = ON;
+             PRAGMA journal_size_limit = 1048576;
              CREATE TABLE IF NOT EXISTS keys (
                  identity TEXT PRIMARY KEY,
                  upload   TEXT NOT NULL
@@ -505,13 +515,18 @@ impl Db {
     pub fn push(&self, env: &Envelope, max_queue: usize, now_ms: u64) -> rusqlite::Result<bool> {
         let c = self.0.lock().unwrap();
         let mb = env.to.to_hex();
-        let n: usize = c.query_row("SELECT COUNT(*) FROM envelopes WHERE mailbox = ?1", [&mb], |r| r.get(0))?;
-        if n >= max_queue {
+        let (n, bytes): (usize, i64) = c.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(envelope)), 0) FROM envelopes WHERE mailbox = ?1",
+            [&mb],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let json = serde_json::to_string(env).expect("serialize");
+        if n >= max_queue || bytes + json.len() as i64 > MAX_MAILBOX_BYTES {
             return Ok(false);
         }
         c.execute(
             "INSERT INTO envelopes(mailbox, envelope, created) VALUES (?1, ?2, ?3)",
-            params![mb, serde_json::to_string(env).expect("serialize"), now_ms as i64],
+            params![mb, json, now_ms as i64],
         )?;
         Ok(true)
     }
@@ -523,18 +538,36 @@ impl Db {
         let rows = st.query_map(params![mailbox.to_hex(), limit as i64], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
         })?;
-        Ok(rows
-            .filter_map(|r| r.ok())
-            .filter_map(|(id, j)| Some(MailboxItem { id, envelope: serde_json::from_str(&j).ok()? }))
-            .collect())
+        // Не більше MAX_LIST_BYTES за раз (але хоча б один конверт), решту — наступним запитом.
+        let mut total = 0usize;
+        let mut out = Vec::new();
+        for (id, j) in rows.filter_map(|r| r.ok()) {
+            total += j.len();
+            if total > MAX_LIST_BYTES && !out.is_empty() {
+                break;
+            }
+            if let Ok(envelope) = serde_json::from_str(&j) {
+                out.push(MailboxItem { id, envelope });
+            }
+        }
+        Ok(out)
     }
 
     /// Клієнт отримав і зберіг усе до `upto` — видалити.
     pub fn ack(&self, mailbox: &MailboxId, upto: i64) -> rusqlite::Result<usize> {
-        self.0
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM envelopes WHERE mailbox = ?1 AND id <= ?2", params![mailbox.to_hex(), upto])
+        let c = self.0.lock().unwrap();
+        let mb = mailbox.to_hex();
+        let media: i64 = c.query_row(
+            "SELECT COUNT(*) FROM envelopes WHERE mailbox = ?1 AND id <= ?2 AND LENGTH(envelope) > ?3",
+            params![mb, upto, MEDIA_BYTES],
+            |r| r.get(0),
+        )?;
+        let n = c.execute("DELETE FROM envelopes WHERE mailbox = ?1 AND id <= ?2", params![mb, upto])?;
+        if media > 0 {
+            // Фото доставлене: secure_delete вже затер його сторінки; скинути й журнал.
+            let _ = c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+        Ok(n)
     }
 
     /// Підписка браузера на сповіщення (Web Push) для скриньки.
@@ -559,10 +592,20 @@ impl Db {
         rows.collect()
     }
 
-    /// Видалити недоставлені конверти, старші за 30 днів.
+    /// Видалити недоставлені конверти: звичайні — старші за 30 днів, медіа — за 3 дні.
     pub fn prune(&self, now_ms: u64) -> rusqlite::Result<usize> {
         let cutoff = now_ms.saturating_sub(RETENTION_MS) as i64;
-        self.0.lock().unwrap().execute("DELETE FROM envelopes WHERE created < ?1", [cutoff])
+        let media = now_ms.saturating_sub(MEDIA_RETENTION_MS) as i64;
+        let c = self.0.lock().unwrap();
+        let n = c.execute(
+            "DELETE FROM envelopes WHERE created < ?1 OR (created < ?2 AND LENGTH(envelope) > ?3)",
+            params![cutoff, media, MEDIA_BYTES],
+        )?;
+        if n > 0 {
+            // Перенести видалене з журналу в основний файл і обнулити журнал.
+            let _ = c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+        Ok(n)
     }
 }
 
@@ -578,6 +621,34 @@ mod tests {
             kyber_prekey_id: 1, kyber_prekey: "cc".into(), kyber_prekey_sig: "dd".into(),
             one_time: (1..=n).map(|i| OneTimeKey { id: i, key: format!("{i:02x}") }).collect(),
         }
+    }
+
+    #[test]
+    fn media_is_transit_only() {
+        let dir = std::env::temp_dir().join(format!("shepit-media-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.db");
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        let mb = MailboxId([9; 32]);
+        let day = 24 * 60 * 60 * 1000;
+        let big = vec![0x5a_u8; 40 * 1024];
+        assert!(db.push(&Envelope::new(mb, b"text"), 10, 0).unwrap());
+        assert!(db.push(&Envelope::new(mb, &big), 10, 0).unwrap());
+        // Через 2 дні все ще чекає.
+        assert_eq!(db.prune(2 * day).unwrap(), 0);
+        // Через 3+ дні велике зникло, текст лишився.
+        assert_eq!(db.prune(3 * day + 1).unwrap(), 1);
+        assert_eq!(db.list(&mb, 100).unwrap().len(), 1);
+        // Після доставки на диску не лишається вмісту.
+        assert!(db.push(&Envelope::new(mb, &big), 10, 3 * day).unwrap());
+        let last = db.list(&mb, 100).unwrap().last().unwrap().id;
+        db.ack(&mb, last).unwrap();
+        drop(db);
+        let mut raw = std::fs::read(&path).unwrap();
+        if let Ok(w) = std::fs::read(dir.join("m.db-wal")) { raw.extend(w); }
+        let needle = hex::encode(&big[..64]);
+        assert!(!raw.windows(needle.len()).any(|w| w == needle.as_bytes()), "фото лишилось на диску");
     }
 
     #[test]

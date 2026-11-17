@@ -12,6 +12,8 @@ sealed interface Body {
     data class Text(val text: String, val id: String? = null, val g: String? = null) : Body
     data class Hello(val name: String) : Body
     data class Voice(val mime: String, val dur: Long, val data: String, val id: String? = null, val g: String? = null) : Body
+    /** Фото (JPEG base64, без EXIF). Сервер тримає його лише до доставки (максимум 3 дні). */
+    data class Image(val mime: String, val w: Int, val h: Int, val data: String, val caption: String? = null, val id: String? = null, val g: String? = null) : Body
     data class Call(val op: String, val id: String, val at: Long, val sdp: String? = null) : Body
     /** Видалити мої повідомлення з цими id у співрозмовника (або в групі g). */
     data class Delete(val ids: List<String>, val g: String? = null) : Body
@@ -38,6 +40,10 @@ object Content {
             is Body.Text -> { put("t", "text"); put("text", b.text); b.id?.let { put("id", it) }; b.g?.let { put("g", it) } }
             is Body.Hello -> { put("t", "hello"); put("name", b.name) }
             is Body.Voice -> { put("t", "voice"); put("mime", b.mime); put("dur", b.dur); put("data", b.data); b.id?.let { put("id", it) }; b.g?.let { put("g", it) } }
+            is Body.Image -> {
+                put("t", "image"); put("mime", b.mime); put("w", b.w); put("h", b.h); put("data", b.data)
+                b.caption?.let { put("caption", it) }; b.id?.let { put("id", it) }; b.g?.let { put("g", it) }
+            }
             is Body.Delete -> { put("t", "delete"); put("ids", org.json.JSONArray(b.ids)); b.g?.let { put("g", it) } }
             is Body.Profile -> { put("t", "profile"); put("name", b.name); b.avatar?.let { put("avatar", it) } }
             is Body.GroupState -> {
@@ -64,6 +70,7 @@ object Content {
                     "text" -> return Body.Text(o.getString("text"), msgId(o.opt("id")), groupId(o))
                     "hello" -> return Body.Hello(o.optString("name"))
                     "voice" -> return Body.Voice(o.getString("mime"), o.optLong("dur"), o.getString("data"), msgId(o.opt("id")), groupId(o))
+                    "image" -> return image(o) ?: Body.Unknown
                     "delete" -> {
                         val a = o.optJSONArray("ids") ?: org.json.JSONArray()
                         return Body.Delete((0 until minOf(a.length(), 500)).mapNotNull { msgId(a.opt(it)) }, groupId(o))
@@ -103,6 +110,20 @@ object Content {
 
     /** Реакція: 1–8 символів емодзі, без латиниці, цифр і розмітки (порожня — прибрати). */
     fun validReaction(e: String): Boolean = e.isEmpty() || (e.codePointCount(0, e.length) <= 8 && e.length <= 32 && e.none { it.code < 0x80 })
+
+    private val B64 = Regex("^[A-Za-z0-9+/=]+$")
+
+    /** Фото — ті самі перевірки, що у веб-версії (validImage). */
+    private fun image(o: JSONObject): Body.Image? {
+        val w = o.opt("w") as? Int ?: return null
+        val h = o.opt("h") as? Int ?: return null
+        val data = o.opt("data") as? String ?: return null
+        val caption = if (o.has("caption")) (o.opt("caption") as? String ?: return null) else null
+        if (o.optString("mime") != "image/jpeg" || w !in 1..4096 || h !in 1..4096) return null
+        if (data.isEmpty() || data.length >= 900_000 || !B64.matches(data)) return null
+        if (caption != null && caption.length > 2000) return null
+        return Body.Image("image/jpeg", w, h, data, caption?.ifEmpty { null }, msgId(o.opt("id")), groupId(o))
+    }
 
     private val MSG_ID = Regex("^[0-9a-f]{32}$")
 

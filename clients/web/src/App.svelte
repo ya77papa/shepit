@@ -9,10 +9,12 @@
   import AvatarEditor from './AvatarEditor.svelte';
   import { exportBackup, importBackup, MIN_PASSWORD } from './lib/backup';
   import { COMMIT, REPO, SHORT, commitUrl, compareUrl, registerServiceWorker } from './lib/pwa';
-  import { decode, encode, fromBase64, toBase64, fmtDuration, newMsgId, validAvatar, validGroupId, validMsgId, validReaction, QUICK_REACTIONS, EMOJI, type Body } from './lib/content';
+  import { decode, encode, fromBase64, toBase64, fmtDuration, newMsgId, validAvatar, validImage, validGroupId, validMsgId, validReaction, QUICK_REACTIONS, EMOJI, type Body } from './lib/content';
   import { VoiceRecorder, MAX_VOICE_MS } from './lib/recorder';
   import { CallManager, checkRelay, type RelayCheck } from './lib/call.svelte';
   import VoiceMsg from './VoiceMsg.svelte';
+  import ImageMsg from './ImageMsg.svelte';
+  import { prepareImage } from './lib/image';
   import CallOverlay from './CallOverlay.svelte';
 
   const POLL_MS = 3000;
@@ -374,6 +376,8 @@
     } else if (b.t === 'voice') {
       const blob = new Blob([fromBase64(b.data)], { type: b.mime });
       await messagesDb.add({ peer: key, out: false, text: '🎤 Голосове', at: Date.now(), kind: 'voice', voice: { blob, mime: b.mime, dur: b.dur }, mid, from });
+    } else if (b.t === 'image' && validImage(b)) {
+      await messagesDb.add({ peer: key, out: false, text: b.caption || 'Фото', at: Date.now(), kind: 'image', image: photoOf(b), mid, from });
     } else return null;
     if (!group || group.id !== gid) unread[key] = (unread[key] ?? 0) + 1;
     return key;
@@ -753,6 +757,34 @@
     }
   }
 
+  const photoOf = (b: { mime: string; w: number; h: number; data: string }) =>
+    ({ blob: new Blob([fromBase64(b.data)], { type: b.mime }), mime: b.mime, w: b.w, h: b.h });
+
+  let photoInput: HTMLInputElement | undefined = $state();
+  let viewing = $state('');
+
+  async function sendImage(file: File) {
+    if (!me || (!current && !group)) return;
+    const key = chatKey;
+    busy = true;
+    error = '';
+    try {
+      const { blob, w, h } = await prepareImage(file);
+      const caption = draft.trim() || undefined;
+      const mid = newMsgId();
+      const body: Body = { t: 'image', mime: 'image/jpeg', w, h, data: toBase64(await blob.arrayBuffer()), caption, id: mid };
+      if (group) await sendGroup(group, body);
+      else await me.send(current!.identity, encode(body));
+      await messagesDb.add({ peer: key, out: true, text: caption || 'Фото', at: Date.now(), kind: 'image', image: { blob, mime: 'image/jpeg', w, h }, mid });
+      draft = '';
+      if (chatKey === key) await reloadThread();
+    } catch (e) {
+      fail(e);
+    } finally {
+      busy = false;
+    }
+  }
+
   async function startRecording() {
     if (recording) return;
     error = '';
@@ -893,6 +925,12 @@
           await messagesDb.add({
             peer: m.from, out: false, text: '🎤 Голосове', at: Date.now(), kind: 'voice',
             voice: { blob, mime: body.mime, dur: body.dur }, mid: validMsgId(body.id) ? body.id : undefined,
+          });
+        } else if (body.t === 'image') {
+          if (!validImage(body)) return;
+          await messagesDb.add({
+            peer: m.from, out: false, text: body.caption || 'Фото', at: Date.now(), kind: 'image',
+            image: photoOf(body), mid: validMsgId(body.id) ? body.id : undefined,
           });
         } else if (body.t === 'hello') {
           await messagesDb.add({ peer: m.from, out: false, text: helloText(body.name.trim()), at: Date.now() });
@@ -1293,6 +1331,11 @@
               {#if group && !m.out && m.from && m.kind !== 'call'}<div class="from small">{senderName(m.from)}</div>{/if}
               {#if m.kind === 'voice' && m.voice}
                 <div class="bubble"><VoiceMsg voice={m.voice} /></div>
+              {:else if m.kind === 'image' && m.image}
+                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <div class="bubble image-bubble" oncontextmenu={(e) => { e.preventDefault(); selected = m; }}>
+                  <ImageMsg image={m.image} caption={m.text !== 'Фото' ? m.text : ''} onopen={(u) => (viewing = u)} />
+                </div>
               {:else}
                 <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
                 <div class="bubble" onclick={() => (selected = selected?.id === m.id ? null : m)}>{m.text}</div>
@@ -1353,6 +1396,11 @@
           {/if}
           <form class="composer" onsubmit={(e) => { e.preventDefault(); emojiOpen = false; send(); }}>
             <button type="button" class="ghost emoji-toggle" class:on={emojiOpen} title="Емодзі" onclick={() => (emojiOpen = !emojiOpen)}>😊</button>
+            <button type="button" class="ghost attach" title="Надіслати фото" disabled={busy} onclick={() => photoInput?.click()}>Фото</button>
+            <input
+              type="file" accept="image/*" hidden bind:this={photoInput}
+              onchange={(e) => { const f = e.currentTarget.files?.[0]; e.currentTarget.value = ''; if (f) { emojiOpen = false; sendImage(f); } }}
+            />
             <input placeholder="Повідомлення" bind:value={draft} disabled={busy} bind:this={draftEl} />
             {#if draft.trim()}
               <button class="primary" type="submit" disabled={busy}>Надіслати</button>
@@ -1388,6 +1436,16 @@
     />
   {/if}
 
+  {#if viewing}
+    <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+    <div class="photo-viewer" onclick={() => (viewing = '')}>
+      <img src={viewing} alt="Фото" />
+      <div class="photo-bar">
+        <a class="button" href={viewing} download={`shepit-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.jpg`} onclick={(e) => e.stopPropagation()}>Зберегти</a>
+        <button onclick={() => (viewing = '')}>Закрити</button>
+      </div>
+    </div>
+  {/if}
   {#if calls.state !== 'idle'}
     <CallOverlay {calls} name={nameOf(calls.peer)} avatar={contacts.find((c) => c.identity === calls.peer)?.avatar} />
   {/if}

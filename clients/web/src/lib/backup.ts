@@ -7,7 +7,10 @@ import { channels as channelsDb, contacts as contactsDb, groups as groupsDb, kv,
 const ITERATIONS = 600_000;
 export const MIN_PASSWORD = 10;
 
-type StoredMessage = Omit<Message, 'voice'> & { voice?: { data: string; mime: string; dur: number; ptt?: boolean } };
+type StoredMessage = Omit<Message, 'voice' | 'image'> & {
+  voice?: { data: string; mime: string; dur: number; ptt?: boolean };
+  image?: { data: string; mime: string; w: number; h: number };
+};
 // groups, channels, myAvatar — з'явились пізніше; старі копії їх не мають.
 type Payload = {
   account: string; contacts: Contact[]; messages: StoredMessage[]; myName: string; exportedAt: number;
@@ -44,9 +47,13 @@ export async function exportBackup(password: string): Promise<Blob> {
     account: b64big(account),
     contacts: await contactsDb.all(),
     messages: await Promise.all(
-      (await messagesDb.all()).map(async (m) =>
-        m.voice ? { ...m, voice: { ...m.voice, blob: undefined, data: b64big(new Uint8Array(await m.voice.blob.arrayBuffer())) } } : (m as StoredMessage),
-      ),
+      (await messagesDb.all()).map(async (m) => {
+        const bytes = async (b: Blob) => b64big(new Uint8Array(await b.arrayBuffer()));
+        const out = { ...m } as unknown as StoredMessage;
+        if (m.voice) out.voice = { mime: m.voice.mime, dur: m.voice.dur, ptt: m.voice.ptt, data: await bytes(m.voice.blob) };
+        if (m.image) out.image = { mime: m.image.mime, w: m.image.w, h: m.image.h, data: await bytes(m.image.blob) };
+        return out;
+      }),
     ),
     myName: (await kv.get<string>('myName')) ?? '',
     exportedAt: Date.now(),
@@ -88,9 +95,10 @@ export async function importBackup(file: File, password: string): Promise<void> 
   for (const g of p.groups ?? []) await groupsDb.put(g);
   for (const c of p.channels ?? []) await channelsDb.put(c);
   for (const c of p.contacts) await contactsDb.put(c);
-  for (const { id: _id, voice, ...m } of p.messages) {
-    await messagesDb.add(
-      voice ? { ...m, voice: { blob: new Blob([unb64(voice.data)], { type: voice.mime }), mime: voice.mime, dur: voice.dur, ptt: voice.ptt } } : m,
-    );
+  for (const { id: _id, voice, image, ...m } of p.messages) {
+    const msg: Message = { ...m };
+    if (voice) msg.voice = { blob: new Blob([unb64(voice.data)], { type: voice.mime }), mime: voice.mime, dur: voice.dur, ptt: voice.ptt };
+    if (image) msg.image = { blob: new Blob([unb64(image.data)], { type: image.mime }), mime: image.mime, w: image.w, h: image.h };
+    await messagesDb.add(msg);
   }
 }

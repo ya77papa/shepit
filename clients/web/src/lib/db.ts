@@ -22,14 +22,17 @@ export type Channel = {
   lastSeq: number; readSeq: number; joined: number;
 };
 export type Voice = { blob: Blob; mime: string; dur: number; ptt?: boolean };
+export type Photo = { blob: Blob; mime: string; w: number; h: number };
 export type Message = {
   id?: number;
   peer: string;
   out: boolean;
   text: string;
   at: number;
-  kind?: 'text' | 'voice' | 'call';
+  kind?: 'text' | 'voice' | 'call' | 'image';
   voice?: Voice;
+  /** Фото (kind = 'image'); text — підпис або «Фото». */
+  image?: Photo;
   /** Спільний з співрозмовником id (для «видалити у всіх»); у старих повідомлень немає. */
   mid?: string;
   /** У групі (peer = "g:<id>"): хто надіслав. */

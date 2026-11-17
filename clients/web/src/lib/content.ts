@@ -10,6 +10,9 @@ export type Body =
   | { t: 'text'; text: string; id?: string; g?: string }
   | { t: 'hello'; name: string }
   | { t: 'voice'; mime: string; dur: number; data: string; ptt?: boolean; id?: string; g?: string }
+  // Фото: JPEG, стиснений і очищений від EXIF/геолокації на пристрої. Сервер тримає його
+  // лише до доставки (максимум 3 дні). caption — підпис (необов'язково).
+  | { t: 'image'; mime: string; w: number; h: number; data: string; caption?: string; id?: string; g?: string }
   | { t: 'call'; op: CallOp; id: string; at: number; sdp?: string }
   // Видалити мої повідомлення з цими id у співрозмовника (або в групі g).
   | { t: 'delete'; ids: string[]; g?: string }
@@ -40,6 +43,16 @@ export const EMOJI: [string, string][] = [
   ['Їжа', '🍏 🍎 🍐 🍊 🍋 🍌 🍉 🍇 🍓 🍒 🍑 🥭 🍍 🥥 🥝 🍅 🥑 🥦 🥕 🌽 🥔 🍞 🧀 🥚 🍳 🥓 🍔 🍟 🍕 🌭 🥪 🌮 🍝 🍜 🍣 🍰 🎂 🍫 🍬 🍩 🍪 ☕ 🍵 🍺 🍷 🥂 🍾'],
   ['Різне', '🎉 🎊 🎁 🎈 🏆 ⚽ 🏀 🎮 🎵 🎶 🎤 🎧 📷 📱 💻 ⌚ 💡 📌 📎 ✏️ 📚 💰 🚗 ✈️ 🚀 🏠 ⏰ ✅ ❌ ❗ ❓ ⚠️ 🇺🇦'],
 ];
+
+/** Фото в повідомленні: JPEG base64 до ~900 КБ, розумні розміри. */
+export function validImage(b: { mime?: unknown; w?: unknown; h?: unknown; data?: unknown; caption?: unknown }): boolean {
+  const dim = (n: unknown) => typeof n === 'number' && Number.isInteger(n) && n > 0 && n <= 4096;
+  return (
+    b.mime === 'image/jpeg' && dim(b.w) && dim(b.h) &&
+    typeof b.data === 'string' && b.data.length > 0 && b.data.length < 900_000 && /^[A-Za-z0-9+/=]+$/.test(b.data) &&
+    (b.caption === undefined || (typeof b.caption === 'string' && b.caption.length <= 2000))
+  );
+}
 
 const HEX32 = /^[0-9a-f]{32}$/;
 export const validGroupId = (id: unknown): id is string => typeof id === 'string' && HEX32.test(id);

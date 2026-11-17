@@ -42,6 +42,21 @@ class ContentTest {
     }
 
     @Test
+    fun imagesFromWeb() {
+        // Рівно так кодує веб-клієнт: {...b, v: 1}.
+        val web = """{"t":"image","mime":"image/jpeg","w":1600,"h":1200,"data":"/9j/AAAA","caption":"з моря","id":"$id","g":"$id","v":1}"""
+        assertEquals(Body.Image("image/jpeg", 1600, 1200, "/9j/AAAA", "з моря", id, id), Content.decode(web))
+        assertEquals(Body.Image("image/jpeg", 10, 10, "AAAA"), Content.decode("""{"t":"image","mime":"image/jpeg","w":10,"h":10,"data":"AAAA","v":1}"""))
+        // Не JPEG, дивні розміри, сміття в даних — пропускаємо.
+        assertEquals(Body.Unknown, Content.decode("""{"t":"image","mime":"image/svg+xml","w":10,"h":10,"data":"AAAA","v":1}"""))
+        assertEquals(Body.Unknown, Content.decode("""{"t":"image","mime":"image/jpeg","w":0,"h":10,"data":"AAAA","v":1}"""))
+        assertEquals(Body.Unknown, Content.decode("""{"t":"image","mime":"image/jpeg","w":10,"h":99999,"data":"AAAA","v":1}"""))
+        assertEquals(Body.Unknown, Content.decode("""{"t":"image","mime":"image/jpeg","w":10,"h":10,"data":"<script>","v":1}"""))
+        val back = Content.encode(Body.Image("image/jpeg", 3, 4, "AAAA", null, id))
+        assertEquals(Body.Image("image/jpeg", 3, 4, "AAAA", null, id), Content.decode(back))
+    }
+
+    @Test
     fun reactionsFromWeb() {
         assertEquals(Body.React(id, "👍"), Content.decode("""{"t":"react","id":"$id","e":"👍","v":1}"""))
         assertEquals(Body.React(id, "❤️", id), Content.decode("""{"t":"react","id":"$id","e":"❤️","g":"$id","v":1}"""))

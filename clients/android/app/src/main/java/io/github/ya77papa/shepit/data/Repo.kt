@@ -290,6 +290,7 @@ class Repo(context: Context) {
             is Body.Leave -> body.g
             is Body.Text -> body.g
             is Body.Voice -> body.g
+            is Body.Image -> body.g
             is Body.Delete -> body.g
             is Body.React -> body.g
             else -> null
@@ -348,6 +349,7 @@ class Repo(context: Context) {
                 peer = key, out = false, text = "🎤 Голосове", at = now, kind = "voice",
                 voiceMime = body.mime, voiceDur = body.dur, voice = Base64.decode(body.data, Base64.DEFAULT), mid = body.id, sender = from,
             )
+            is Body.Image -> imageMessage(key, body).copy(sender = from)
             else -> return
         }
         val id = db.addMessage(m)
@@ -442,6 +444,22 @@ class Repo(context: Context) {
         return failed
     }
 
+    /** Фото зберігається лише в базі застосунку (поле voice — байти JPEG, voiceMime — його тип). */
+    private fun imageMessage(peer: String, b: Body.Image) = Message(
+        peer = peer, out = false, text = b.caption ?: "Фото", at = System.currentTimeMillis(), kind = "image",
+        voiceMime = b.mime, voice = Base64.decode(b.data, Base64.DEFAULT), mid = b.id,
+    )
+
+    /** Надіслати фото: [jpeg] уже стиснений і без EXIF (див. Photo.prepare). */
+    suspend fun sendImage(peer: String, jpeg: ByteArray, w: Int, h: Int, caption: String?): Int {
+        val mid = Content.newMsgId()
+        val data = Base64.encodeToString(jpeg, Base64.NO_WRAP)
+        val failed = sendTo(peer) { g -> Body.Image("image/jpeg", w, h, data, caption, mid, g) }
+        db.addMessage(Message(peer = peer, out = true, text = caption ?: "Фото", at = System.currentTimeMillis(), kind = "image", voiceMime = "image/jpeg", voice = jpeg, mid = mid))
+        _changed.emit(peer)
+        return failed
+    }
+
     suspend fun sendVoice(peer: String, mime: String, dur: Long, data: ByteArray) {
         val mid = Content.newMsgId()
         sendTo(peer) { g -> Body.Voice(mime, dur, Base64.encodeToString(data, Base64.NO_WRAP), mid, g) }
@@ -522,6 +540,7 @@ class Repo(context: Context) {
             is Body.GroupState, is Body.Leave -> true
             is Body.Text -> body.g != null
             is Body.Voice -> body.g != null
+            is Body.Image -> body.g != null
             is Body.Delete -> body.g != null
             is Body.React -> body.g != null
             else -> false
@@ -575,6 +594,7 @@ class Repo(context: Context) {
                 peer = from, out = false, text = "🎤 Голосове", at = now, kind = "voice",
                 voiceMime = body.mime, voiceDur = body.dur, voice = Base64.decode(body.data, Base64.DEFAULT), mid = body.id,
             )
+            is Body.Image -> imageMessage(from, body)
             else -> return false
         }
         val id = db.addMessage(m)
