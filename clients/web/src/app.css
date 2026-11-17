@@ -180,3 +180,18 @@ input[type=range] { accent-color: var(--accent); border: 0; background: transpar
 .avatar-viewer .big:disabled { cursor: default; opacity: 1; }
 .avatar-viewer .name { color: #fff; font-size: 20px; font-weight: 600; margin-top: 6px; }
 .avatar-btn { display: inline-flex; }
+
+/* Відповідь з цитатою */
+.quote {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 1px; text-align: left;
+  max-width: min(320px, 75vw); margin: 0 0 3px; padding: 4px 10px; min-height: 0;
+  border: 0; border-left: 3px solid var(--accent); border-radius: 0 8px 8px 0;
+  background: rgba(255, 255, 255, 0.06); color: inherit; cursor: pointer; font-size: 13px;
+}
+.msg.out .quote { align-self: flex-end; }
+.quote.static { cursor: default; flex: 1; min-width: 0; max-width: none; margin: 0; }
+.quote-who { color: var(--accent); font-weight: 600; font-size: 12px; }
+.quote-text { opacity: 0.8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.reply-bar { display: flex; align-items: center; gap: 8px; padding: 6px 10px 0; }
+.msg.flash .bubble { animation: flash 1.2s ease-out; }
+@keyframes flash { 0%, 30% { box-shadow: 0 0 0 3px var(--accent); } 100% { box-shadow: 0 0 0 0 transparent; } }

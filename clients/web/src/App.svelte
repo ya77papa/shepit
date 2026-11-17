@@ -9,7 +9,7 @@
   import AvatarEditor from './AvatarEditor.svelte';
   import { exportBackup, importBackup, MIN_PASSWORD } from './lib/backup';
   import { COMMIT, REPO, SHORT, commitUrl, compareUrl, registerServiceWorker } from './lib/pwa';
-  import { decode, encode, fromBase64, toBase64, fmtDuration, newMsgId, validAvatar, validImage, validGroupId, validMsgId, validReaction, QUICK_REACTIONS, EMOJI, type Body } from './lib/content';
+  import { decode, encode, fromBase64, toBase64, fmtDuration, newMsgId, validAvatar, validImage, validReply, type Reply, validGroupId, validMsgId, validReaction, QUICK_REACTIONS, EMOJI, type Body } from './lib/content';
   import { VoiceRecorder, MAX_VOICE_MS } from './lib/recorder';
   import { CallManager, checkRelay, type RelayCheck } from './lib/call.svelte';
   import VoiceMsg from './VoiceMsg.svelte';
@@ -95,6 +95,7 @@
     group = null;
     channel = null;
     selected = null;
+    replyTo = null;
   }
 
   /** Як показувати учасника групи: ім'я з моїх контактів, інакше як його назвав адмін. */
@@ -283,10 +284,10 @@
 
   /** Тіло для повторної спроби — з того, що збережено в бесіді. */
   async function bodyOf(m: Message): Promise<Body | null> {
-    if (m.kind === 'voice' && m.voice) return { t: 'voice', mime: m.voice.mime, dur: m.voice.dur, data: toBase64(await m.voice.blob.arrayBuffer()), id: m.mid };
+    if (m.kind === 'voice' && m.voice) return { t: 'voice', mime: m.voice.mime, dur: m.voice.dur, data: toBase64(await m.voice.blob.arrayBuffer()), id: m.mid, re: m.re };
     if (m.kind === 'image' && m.image)
-      return { t: 'image', mime: m.image.mime, w: m.image.w, h: m.image.h, data: toBase64(await m.image.blob.arrayBuffer()), caption: m.text !== 'Фото' ? m.text : undefined, id: m.mid };
-    if (!m.kind || m.kind === 'text') return { t: 'text', text: m.text, id: m.mid };
+      return { t: 'image', mime: m.image.mime, w: m.image.w, h: m.image.h, data: toBase64(await m.image.blob.arrayBuffer()), caption: m.text !== 'Фото' ? m.text : undefined, id: m.mid, re: m.re };
+    if (!m.kind || m.kind === 'text') return { t: 'text', text: m.text, id: m.mid, re: m.re };
     return null;
   }
 
@@ -504,13 +505,14 @@
       return validMsgId(b.id) && validReaction(b.e) && (await messagesDb.react(key, b.id, from, b.e)) ? key : null;
     }
     const mid = validMsgId((b as { id?: string }).id) ? (b as { id: string }).id : undefined;
+    const re = validReply((b as { re?: unknown }).re);
     if (b.t === 'text') {
-      await messagesDb.add({ peer: key, out: false, text: b.text, at: Date.now(), mid, from });
+      await messagesDb.add({ peer: key, out: false, text: b.text, at: Date.now(), mid, from, re });
     } else if (b.t === 'voice') {
       const blob = new Blob([fromBase64(b.data)], { type: b.mime });
-      await messagesDb.add({ peer: key, out: false, text: '🎤 Голосове', at: Date.now(), kind: 'voice', voice: { blob, mime: b.mime, dur: b.dur }, mid, from });
+      await messagesDb.add({ peer: key, out: false, text: '🎤 Голосове', at: Date.now(), kind: 'voice', voice: { blob, mime: b.mime, dur: b.dur }, mid, from, re });
     } else if (b.t === 'image' && validImage(b)) {
-      await messagesDb.add({ peer: key, out: false, text: b.caption || 'Фото', at: Date.now(), kind: 'image', image: photoOf(b), mid, from });
+      await messagesDb.add({ peer: key, out: false, text: b.caption || 'Фото', at: Date.now(), kind: 'image', image: photoOf(b), mid, from, re });
     } else return null;
     noteDelivered(from, mid, gid);
     if (!group || group.id !== gid) unread[key] = (unread[key] ?? 0) + 1;
@@ -864,8 +866,9 @@
     error = '';
     try {
       const mid = newMsgId();
+      const re = takeReply();
       draft = '';
-      await sendOut({ peer: key, out: true, text, at: Date.now(), mid }, { t: 'text', text, id: mid });
+      await sendOut({ peer: key, out: true, text, at: Date.now(), mid, re }, { t: 'text', text, id: mid, re });
     } catch (e) {
       fail(e);
     } finally {
@@ -879,8 +882,9 @@
     busy = true;
     try {
       const mid = newMsgId();
-      const body: Body = { t: 'voice', mime, dur, data: toBase64(await blob.arrayBuffer()), id: mid };
-      await sendOut({ peer: key, out: true, text: '🎤 Голосове', at: Date.now(), kind: 'voice', voice: { blob, mime, dur }, mid }, body);
+      const re = takeReply();
+      const body: Body = { t: 'voice', mime, dur, data: toBase64(await blob.arrayBuffer()), id: mid, re };
+      await sendOut({ peer: key, out: true, text: '🎤 Голосове', at: Date.now(), kind: 'voice', voice: { blob, mime, dur }, mid, re }, body);
     } catch (e) {
       fail(e);
     } finally {
@@ -895,6 +899,38 @@
   let viewing = $state('');
   /** Збільшений аватар (перший дотик); дотик по ньому — на весь екран. */
   let bigAvatar = $state<{ name: string; src?: string } | null>(null);
+  /** На яке повідомлення відповідаю (цитата над полем введення). */
+  let replyTo = $state<Message | null>(null);
+
+  const previewOf = (m: Message) =>
+    m.kind === 'voice' ? 'Голосове повідомлення' : m.kind === 'image' ? (m.text !== 'Фото' ? `Фото: ${m.text}` : 'Фото') : m.text;
+
+  function startReply(m: Message) {
+    replyTo = m;
+    selected = null;
+    tick().then(() => draftEl?.focus());
+  }
+
+  /** Забрати цитату для повідомлення, що надсилається. */
+  function takeReply(): Reply | undefined {
+    const m = replyTo;
+    replyTo = null;
+    if (!m?.mid || !me) return undefined;
+    const by = m.out ? me.identity : group ? m.from : current?.identity;
+    if (!by) return undefined;
+    return { id: m.mid, by, t: previewOf(m).slice(0, 200) };
+  }
+
+  /** Дотик по цитаті — прокрутити до оригіналу й підсвітити. */
+  function jumpTo(mid: string) {
+    const el = threadEl?.querySelector<HTMLElement>(`[data-mid="${mid}"]`);
+    if (!el) { error = 'Оригінал уже видалено'; return; }
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.remove('flash');
+    void el.offsetWidth;
+    el.classList.add('flash');
+  }
+
   /** Тихі звуки у відкритій бесіді. */
   let chatSounds = $state(true);
   let heardIn = false;
@@ -909,9 +945,10 @@
       const { blob, w, h } = await prepareImage(file);
       const caption = draft.trim() || undefined;
       const mid = newMsgId();
-      const body: Body = { t: 'image', mime: 'image/jpeg', w, h, data: toBase64(await blob.arrayBuffer()), caption, id: mid };
+      const re = takeReply();
+      const body: Body = { t: 'image', mime: 'image/jpeg', w, h, data: toBase64(await blob.arrayBuffer()), caption, id: mid, re };
       draft = '';
-      await sendOut({ peer: key, out: true, text: caption || 'Фото', at: Date.now(), kind: 'image', image: { blob, mime: 'image/jpeg', w, h }, mid }, body);
+      await sendOut({ peer: key, out: true, text: caption || 'Фото', at: Date.now(), kind: 'image', image: { blob, mime: 'image/jpeg', w, h }, mid, re }, body);
     } catch (e) {
       fail(e);
     } finally {
@@ -1064,18 +1101,18 @@
           const blob = new Blob([fromBase64(body.data)], { type: body.mime });
           await messagesDb.add({
             peer: m.from, out: false, text: '🎤 Голосове', at: Date.now(), kind: 'voice',
-            voice: { blob, mime: body.mime, dur: body.dur }, mid: validMsgId(body.id) ? body.id : undefined,
+            voice: { blob, mime: body.mime, dur: body.dur }, mid: validMsgId(body.id) ? body.id : undefined, re: validReply(body.re),
           });
         } else if (body.t === 'image') {
           if (!validImage(body)) return;
           await messagesDb.add({
             peer: m.from, out: false, text: body.caption || 'Фото', at: Date.now(), kind: 'image',
-            image: photoOf(body), mid: validMsgId(body.id) ? body.id : undefined,
+            image: photoOf(body), mid: validMsgId(body.id) ? body.id : undefined, re: validReply(body.re),
           });
         } else if (body.t === 'hello') {
           await messagesDb.add({ peer: m.from, out: false, text: helloText(body.name.trim()), at: Date.now() });
         } else if (body.t === 'text') {
-          await messagesDb.add({ peer: m.from, out: false, text: body.text, at: Date.now(), mid: validMsgId(body.id) ? body.id : undefined });
+          await messagesDb.add({ peer: m.from, out: false, text: body.text, at: Date.now(), mid: validMsgId(body.id) ? body.id : undefined, re: validReply(body.re) });
         } else {
           return; // невідомий тип (новіша версія) — пропустити
         }
@@ -1485,10 +1522,17 @@
           {#each thread as m (m.id)}
             <div
               class="msg" class:out={m.out} class:system={m.kind === 'call'} class:selected={selected?.id === m.id}
+              data-mid={m.mid}
               role="listitem"
               oncontextmenu={(e) => { e.preventDefault(); selected = selected?.id === m.id ? null : m; }}
             >
               {#if group && !m.out && m.from && m.kind !== 'call'}<div class="from small">{senderName(m.from)}</div>{/if}
+              {#if m.re}
+                <button class="quote" onclick={() => jumpTo(m.re!.id)} title="Перейти до повідомлення">
+                  <span class="quote-who">{m.re.by === me?.identity ? 'Ти' : senderName(m.re.by)}</span>
+                  <span class="quote-text">{m.re.t}</span>
+                </button>
+              {/if}
               {#if m.kind === 'voice' && m.voice}
                 <div class="bubble"><VoiceMsg voice={m.voice} /></div>
               {:else if m.kind === 'image' && m.image}
@@ -1530,6 +1574,9 @@
               <span class="muted small">Повідомлення:</span>
             {/if}
             <span class="spacer"></span>
+            {#if selected.mid && selected.kind !== 'call' && !group?.left}
+              <button class="primary" onclick={() => startReply(selected!)}>Відповісти</button>
+            {/if}
             {#if selected.status === 'failed'}
               <button class="primary" onclick={() => retry(selected!)}>Надіслати ще раз</button>
             {/if}
@@ -1558,6 +1605,15 @@
                   {/each}
                 </div>
               {/each}
+            </div>
+          {/if}
+          {#if replyTo}
+            <div class="reply-bar">
+              <span class="quote static">
+                <span class="quote-who">Відповідь: {replyTo.out ? 'Ти' : (group ? senderName(replyTo.from) : current?.name)}</span>
+                <span class="quote-text">{previewOf(replyTo)}</span>
+              </span>
+              <button class="ghost" title="Скасувати відповідь" onclick={() => (replyTo = null)}>✕</button>
             </div>
           {/if}
           <form class="composer" onsubmit={(e) => { e.preventDefault(); emojiOpen = false; send(); }}>

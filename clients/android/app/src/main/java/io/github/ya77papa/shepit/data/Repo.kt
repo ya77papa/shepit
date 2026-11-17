@@ -355,10 +355,10 @@ class Repo(context: Context) {
                 if (db.react(key, body.id, from, body.e)) _changed.emit(key)
                 return
             }
-            is Body.Text -> Message(peer = key, out = false, text = body.text, at = now, mid = body.id, sender = from)
+            is Body.Text -> Message(peer = key, out = false, text = body.text, at = now, mid = body.id, sender = from, re = body.re)
             is Body.Voice -> Message(
                 peer = key, out = false, text = "🎤 Голосове", at = now, kind = "voice",
-                voiceMime = body.mime, voiceDur = body.dur, voice = Base64.decode(body.data, Base64.DEFAULT), mid = body.id, sender = from,
+                voiceMime = body.mime, voiceDur = body.dur, voice = Base64.decode(body.data, Base64.DEFAULT), mid = body.id, sender = from, re = body.re,
             )
             is Body.Image -> imageMessage(key, body).copy(sender = from)
             else -> return
@@ -480,16 +480,16 @@ class Repo(context: Context) {
     suspend fun retry(m: Message): Int {
         val mid = m.mid
         val make: (String?) -> Body = when (m.kind) {
-            "voice" -> { g -> Body.Voice(m.voiceMime ?: "audio/ogg", m.voiceDur, Base64.encodeToString(m.voice ?: ByteArray(0), Base64.NO_WRAP), mid, g) }
+            "voice" -> { g -> Body.Voice(m.voiceMime ?: "audio/ogg", m.voiceDur, Base64.encodeToString(m.voice ?: ByteArray(0), Base64.NO_WRAP), mid, g, m.re) }
             "image" -> {
                 val bytes = m.voice ?: error("Фото пошкоджене")
                 val b = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
                 android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, b)
                 val data = Base64.encodeToString(bytes, Base64.NO_WRAP)
                 val caption = m.text.takeIf { it != "Фото" }
-                ({ g -> Body.Image("image/jpeg", b.outWidth, b.outHeight, data, caption, mid, g) })
+                ({ g -> Body.Image("image/jpeg", b.outWidth, b.outHeight, data, caption, mid, g, m.re) })
             }
-            "text" -> { g -> Body.Text(m.text, mid, g) }
+            "text" -> { g -> Body.Text(m.text, mid, g, m.re) }
             else -> return 0
         }
         db.setStatus(m.id, "sending")
@@ -497,9 +497,21 @@ class Repo(context: Context) {
         return transmit(m.id, m.peer, make)
     }
 
-    suspend fun sendText(peer: String, text: String): Int {
+    suspend fun sendText(peer: String, text: String, re: Reply? = null): Int {
         val mid = Content.newMsgId()
-        return sendOut(Message(peer = peer, out = true, text = text, at = System.currentTimeMillis(), mid = mid)) { g -> Body.Text(text, mid, g) }
+        return sendOut(Message(peer = peer, out = true, text = text, at = System.currentTimeMillis(), mid = mid, re = re)) { g -> Body.Text(text, mid, g, re) }
+    }
+
+    /** Цитата для відповіді на [m] у бесіді [peer]. */
+    fun replyTo(peer: String, m: Message): Reply? {
+        val mid = m.mid ?: return null
+        val by = if (m.out) core?.identity() else if (peer.startsWith("g:")) m.sender else peer
+        val t = when (m.kind) {
+            "voice" -> "Голосове повідомлення"
+            "image" -> if (m.text != "Фото") "Фото: ${m.text}" else "Фото"
+            else -> m.text
+        }
+        return Reply(mid, by ?: return null, t.take(200))
     }
 
     // ---------- доставлено / переглянуто ----------
@@ -549,23 +561,23 @@ class Repo(context: Context) {
     /** Фото зберігається лише в базі застосунку (поле voice — байти JPEG, voiceMime — його тип). */
     private fun imageMessage(peer: String, b: Body.Image) = Message(
         peer = peer, out = false, text = b.caption ?: "Фото", at = System.currentTimeMillis(), kind = "image",
-        voiceMime = b.mime, voice = Base64.decode(b.data, Base64.DEFAULT), mid = b.id,
+        voiceMime = b.mime, voice = Base64.decode(b.data, Base64.DEFAULT), mid = b.id, re = b.re,
     )
 
     /** Надіслати фото: [jpeg] уже стиснений і без EXIF (див. Photo.prepare). */
-    suspend fun sendImage(peer: String, jpeg: ByteArray, w: Int, h: Int, caption: String?): Int {
+    suspend fun sendImage(peer: String, jpeg: ByteArray, w: Int, h: Int, caption: String?, re: Reply? = null): Int {
         val mid = Content.newMsgId()
         val data = Base64.encodeToString(jpeg, Base64.NO_WRAP)
-        return sendOut(Message(peer = peer, out = true, text = caption ?: "Фото", at = System.currentTimeMillis(), kind = "image", voiceMime = "image/jpeg", voice = jpeg, mid = mid)) { g ->
-            Body.Image("image/jpeg", w, h, data, caption, mid, g)
+        return sendOut(Message(peer = peer, out = true, text = caption ?: "Фото", at = System.currentTimeMillis(), kind = "image", voiceMime = "image/jpeg", voice = jpeg, mid = mid, re = re)) { g ->
+            Body.Image("image/jpeg", w, h, data, caption, mid, g, re)
         }
     }
 
-    suspend fun sendVoice(peer: String, mime: String, dur: Long, data: ByteArray) {
+    suspend fun sendVoice(peer: String, mime: String, dur: Long, data: ByteArray, re: Reply? = null) {
         val mid = Content.newMsgId()
         val b64 = Base64.encodeToString(data, Base64.NO_WRAP)
-        sendOut(Message(peer = peer, out = true, text = "🎤 Голосове", at = System.currentTimeMillis(), kind = "voice", voiceMime = mime, voiceDur = dur, voice = data, mid = mid)) { g ->
-            Body.Voice(mime, dur, b64, mid, g)
+        sendOut(Message(peer = peer, out = true, text = "🎤 Голосове", at = System.currentTimeMillis(), kind = "voice", voiceMime = mime, voiceDur = dur, voice = data, mid = mid, re = re)) { g ->
+            Body.Voice(mime, dur, b64, mid, g, re)
         }
     }
 
@@ -704,10 +716,10 @@ class Repo(context: Context) {
                 return false
             }
             is Body.Hello -> Message(peer = from, out = false, text = "👋 ${body.name.ifEmpty { "Новий контакт" }} приєднується за запрошенням", at = now)
-            is Body.Text -> Message(peer = from, out = false, text = body.text, at = now, mid = body.id)
+            is Body.Text -> Message(peer = from, out = false, text = body.text, at = now, mid = body.id, re = body.re)
             is Body.Voice -> Message(
                 peer = from, out = false, text = "🎤 Голосове", at = now, kind = "voice",
-                voiceMime = body.mime, voiceDur = body.dur, voice = Base64.decode(body.data, Base64.DEFAULT), mid = body.id,
+                voiceMime = body.mime, voiceDur = body.dur, voice = Base64.decode(body.data, Base64.DEFAULT), mid = body.id, re = body.re,
             )
             is Body.Image -> imageMessage(from, body)
             else -> return false

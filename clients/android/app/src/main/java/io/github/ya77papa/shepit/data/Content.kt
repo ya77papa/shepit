@@ -6,14 +6,36 @@ import org.json.JSONObject
  * Вміст зашифрованого повідомлення. Формат той самий, що у веб-клієнта:
  * `{"v":1,"t":"text"|"hello"|"voice"|"call", ...}`; старі повідомлення — звичайний текст.
  */
+/**
+ * Відповідь на повідомлення: id оригіналу, хто його написав, уривок (≤ 200 символів).
+ * Уривок їде з відповіддю — цитату видно, навіть якщо оригіналу в отримувача вже немає.
+ */
+data class Reply(val id: String, val by: String, val t: String) {
+    fun json(): JSONObject = JSONObject().put("id", id).put("by", by).put("t", t)
+    override fun toString() = json().toString()
+
+    companion object {
+        private val MSG_ID = Regex("^[0-9a-f]{32}$")
+        private val IDENTITY = Regex("^05[0-9a-f]{64}$")
+        fun parse(v: Any?): Reply? {
+            val o = when (v) { is JSONObject -> v; is String -> runCatching { JSONObject(v) }.getOrNull(); else -> null } ?: return null
+            val id = o.opt("id") as? String ?: return null
+            val by = o.opt("by") as? String ?: return null
+            val t = o.opt("t") as? String ?: return null
+            if (!MSG_ID.matches(id) || !IDENTITY.matches(by)) return null
+            return Reply(id, by, t.take(200))
+        }
+    }
+}
+
 sealed interface Body {
     /** [id] — спільний ідентифікатор повідомлення, за ним відправник видаляє його «у всіх». */
     /** [g] — ідентифікатор групи: повідомлення адресоване групі (кожному учаснику окремо). */
-    data class Text(val text: String, val id: String? = null, val g: String? = null) : Body
+    data class Text(val text: String, val id: String? = null, val g: String? = null, val re: Reply? = null) : Body
     data class Hello(val name: String) : Body
-    data class Voice(val mime: String, val dur: Long, val data: String, val id: String? = null, val g: String? = null) : Body
+    data class Voice(val mime: String, val dur: Long, val data: String, val id: String? = null, val g: String? = null, val re: Reply? = null) : Body
     /** Фото (JPEG base64, без EXIF). Сервер тримає його лише до доставки (максимум 3 дні). */
-    data class Image(val mime: String, val w: Int, val h: Int, val data: String, val caption: String? = null, val id: String? = null, val g: String? = null) : Body
+    data class Image(val mime: String, val w: Int, val h: Int, val data: String, val caption: String? = null, val id: String? = null, val g: String? = null, val re: Reply? = null) : Body
     data class Call(val op: String, val id: String, val at: Long, val sdp: String? = null) : Body
     /** Видалити мої повідомлення з цими id у співрозмовника (або в групі g). */
     data class Delete(val ids: List<String>, val g: String? = null) : Body
@@ -39,12 +61,12 @@ object Content {
     fun encode(b: Body): String = JSONObject().apply {
         put("v", 1)
         when (b) {
-            is Body.Text -> { put("t", "text"); put("text", b.text); b.id?.let { put("id", it) }; b.g?.let { put("g", it) } }
+            is Body.Text -> { put("t", "text"); put("text", b.text); b.id?.let { put("id", it) }; b.g?.let { put("g", it) }; b.re?.let { put("re", it.json()) } }
             is Body.Hello -> { put("t", "hello"); put("name", b.name) }
-            is Body.Voice -> { put("t", "voice"); put("mime", b.mime); put("dur", b.dur); put("data", b.data); b.id?.let { put("id", it) }; b.g?.let { put("g", it) } }
+            is Body.Voice -> { put("t", "voice"); put("mime", b.mime); put("dur", b.dur); put("data", b.data); b.id?.let { put("id", it) }; b.g?.let { put("g", it) }; b.re?.let { put("re", it.json()) } }
             is Body.Image -> {
                 put("t", "image"); put("mime", b.mime); put("w", b.w); put("h", b.h); put("data", b.data)
-                b.caption?.let { put("caption", it) }; b.id?.let { put("id", it) }; b.g?.let { put("g", it) }
+                b.caption?.let { put("caption", it) }; b.id?.let { put("id", it) }; b.g?.let { put("g", it) }; b.re?.let { put("re", it.json()) }
             }
             is Body.Delete -> { put("t", "delete"); put("ids", org.json.JSONArray(b.ids)); b.g?.let { put("g", it) } }
             is Body.Profile -> { put("t", "profile"); put("name", b.name); b.avatar?.let { put("avatar", it) } }
@@ -70,9 +92,9 @@ object Content {
             runCatching {
                 val o = JSONObject(raw)
                 if (o.optInt("v") == 1) when (o.optString("t")) {
-                    "text" -> return Body.Text(o.getString("text"), msgId(o.opt("id")), groupId(o))
+                    "text" -> return Body.Text(o.getString("text"), msgId(o.opt("id")), groupId(o), Reply.parse(o.opt("re")))
                     "hello" -> return Body.Hello(o.optString("name"))
-                    "voice" -> return Body.Voice(o.getString("mime"), o.optLong("dur"), o.getString("data"), msgId(o.opt("id")), groupId(o))
+                    "voice" -> return Body.Voice(o.getString("mime"), o.optLong("dur"), o.getString("data"), msgId(o.opt("id")), groupId(o), Reply.parse(o.opt("re")))
                     "image" -> return image(o) ?: Body.Unknown
                     "delete" -> {
                         val a = o.optJSONArray("ids") ?: org.json.JSONArray()
@@ -131,7 +153,7 @@ object Content {
         if (o.optString("mime") != "image/jpeg" || w !in 1..4096 || h !in 1..4096) return null
         if (data.isEmpty() || data.length >= 900_000 || !B64.matches(data)) return null
         if (caption != null && caption.length > 2000) return null
-        return Body.Image("image/jpeg", w, h, data, caption?.ifEmpty { null }, msgId(o.opt("id")), groupId(o))
+        return Body.Image("image/jpeg", w, h, data, caption?.ifEmpty { null }, msgId(o.opt("id")), groupId(o), Reply.parse(o.opt("re")))
     }
 
     private val MSG_ID = Regex("^[0-9a-f]{32}$")

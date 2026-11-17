@@ -45,6 +45,7 @@ object Backup {
                 db.allMessages().forEach { m ->
                     put(JSONObject().apply {
                         put("peer", m.peer); put("out", m.out); put("text", m.text); put("at", m.at)
+                        m.re?.let { put("re", it.json()) }
                         if (m.kind != "text") put("kind", m.kind)
                         if (m.mid != null) put("mid", m.mid)
                         if (m.sender != null) put("from", m.sender)
@@ -100,6 +101,7 @@ object Backup {
                     reactions = o.optJSONObject("reactions")?.let { r -> r.keys().asSequence().associateWith { r.getString(it) } } ?: emptyMap(),
                     // Відновлена історія — вже переглянута: підтвердження за минуле не розсилаємо.
                     seen = true,
+                    re = Reply.parse(o.opt("re")),
                 )
             }
         }

@@ -1,6 +1,7 @@
 package io.github.ya77papa.shepit
 
 import io.github.ya77papa.shepit.data.Body
+import io.github.ya77papa.shepit.data.Reply
 import io.github.ya77papa.shepit.data.Content
 import io.github.ya77papa.shepit.data.Member
 import org.junit.Assert.assertEquals
@@ -54,6 +55,19 @@ class ContentTest {
         assertEquals(Body.Unknown, Content.decode("""{"t":"image","mime":"image/jpeg","w":10,"h":10,"data":"<script>","v":1}"""))
         val back = Content.encode(Body.Image("image/jpeg", 3, 4, "AAAA", null, id))
         assertEquals(Body.Image("image/jpeg", 3, 4, "AAAA", null, id), Content.decode(back))
+    }
+
+    @Test
+    fun repliesFromWeb() {
+        val who = "05" + "ab".repeat(32)
+        val web = """{"t":"text","text":"О сьомій","id":"$id","re":{"id":"$id","by":"$who","t":"Коли?"},"v":1}"""
+        assertEquals(Body.Text("О сьомій", id, null, Reply(id, who, "Коли?")), Content.decode(web))
+        // Зіпсована цитата — саме повідомлення лишається, цитата відкидається.
+        assertEquals(Body.Text("x", id), Content.decode("""{"t":"text","text":"x","id":"$id","re":{"id":"bad","by":"$who","t":"?"},"v":1}"""))
+        val long = "я".repeat(500)
+        assertEquals(200, (Content.decode("""{"t":"text","text":"x","re":{"id":"$id","by":"$who","t":"$long"},"v":1}""") as Body.Text).re!!.t.length)
+        val img = Body.Image("image/jpeg", 2, 2, "AAAA", null, id, null, Reply(id, who, "Фото"))
+        assertEquals(img, Content.decode(Content.encode(img)))
     }
 
     @Test

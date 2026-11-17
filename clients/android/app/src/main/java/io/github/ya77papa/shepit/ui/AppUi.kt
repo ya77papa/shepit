@@ -514,6 +514,19 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
     var emojiOpen by remember { mutableStateOf(false) }
     var viewing by remember { mutableStateOf<Message?>(null) }
     var showAvatar by remember { mutableStateOf(false) }
+    /** На яке повідомлення відповідаю (цитата над полем введення). */
+    var replyTo by remember(peer) { mutableStateOf<Message?>(null) }
+    var flashId by remember { mutableLongStateOf(-1L) }
+    fun takeReply() = replyTo?.let { repo.replyTo(peer, it) }.also { replyTo = null }
+    fun who(id: String) = if (id == repo.core?.identity()) "Ти" else if (group != null) displayName(app, contacts, group, id) else title
+    fun jumpTo(mid: String) = scope.launch {
+        val i = messages.indexOfFirst { it.mid == mid }
+        if (i < 0) { toast("Оригінал уже видалено"); return@launch }
+        list.animateScrollToItem(i)
+        flashId = messages[i].id
+        delay(1200)
+        flashId = -1L
+    }
     val pickPhoto = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
         val caption = draft.trim().ifEmpty { null }
@@ -521,7 +534,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
         scope.launch {
             runCatching {
                 val p = io.github.ya77papa.shepit.data.Photo.prepare(ctx, uri)
-                repo.sendImage(peer, p.jpeg, p.w, p.h, caption)
+                repo.sendImage(peer, p.jpeg, p.w, p.h, caption, takeReply())
             }.onSuccess { failed -> draft = ""; emojiOpen = false; if (failed > 0) toast("Не вдалося доставити $failed учасникам — спробуй пізніше") }
                 .onFailure { toast(it.message ?: "Помилка") }
             busy = false
@@ -587,7 +600,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
         reload()
         repo.changed.collect { if (it == peer) reload() }
     }
-    LaunchedEffect(recording) { while (recording) { recMs = recorder.elapsed(); if (recMs >= VoiceRecorder.MAX_MS) { recording = false; recorder.stop()?.let { (d, dur) -> scope.launch { runCatching { repo.sendVoice(peer, recorder.mime, dur, d) }.onFailure { toast(it.message ?: "Помилка") } } } }; delay(200) } }
+    LaunchedEffect(recording) { while (recording) { recMs = recorder.elapsed(); if (recMs >= VoiceRecorder.MAX_MS) { recording = false; recorder.stop()?.let { (d, dur) -> val re = takeReply(); scope.launch { runCatching { repo.sendVoice(peer, recorder.mime, dur, d, re) }.onFailure { toast(it.message ?: "Помилка") } } } }; delay(200) } }
     DisposableEffect(Unit) { onDispose { VoicePlayer.stop(); recorder.stop(cancel = true) } }
 
     Column(Modifier.fillMaxSize().imePadding()) {
@@ -642,7 +655,8 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
         }
         LazyColumn(Modifier.weight(1f).padding(horizontal = 12.dp), state = list) {
             items(messages, key = { it.id }) { m ->
-                Bubble(m, playing == m.id, sender = if (group != null && !m.out && m.kind != "call") displayName(app, contacts, group, m.sender) else null, myId = myId, onReact = { e -> react(m, e) }, onLongPress = { actionsFor = m }, onOpen = { viewing = m }, tick = tickOf(m), onRetry = { retry(m) }) {
+                Bubble(m, playing == m.id, sender = if (group != null && !m.out && m.kind != "call") displayName(app, contacts, group, m.sender) else null, myId = myId, onReact = { e -> react(m, e) }, onLongPress = { actionsFor = m }, onOpen = { viewing = m }, tick = tickOf(m), onRetry = { retry(m) },
+                    quoteWho = m.re?.let { who(it.by) }, onQuote = { m.re?.let { jumpTo(it.id) } }, flash = flashId == m.id) {
                     VoicePlayer.toggle(ctx, m.id, m.voice ?: return@Bubble, m.voiceMime) { playing = VoicePlayer.playingId }
                     playing = VoicePlayer.playingId
                 }
@@ -652,6 +666,12 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
             Text("Ти не в цій групі — писати сюди не можна.", Modifier.fillMaxWidth().padding(16.dp).navigationBarsPadding(), color = Muted)
         } else Surface(color = MaterialTheme.colorScheme.surface) {
             Column {
+            replyTo?.let { r ->
+                Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Quote("Відповідь: ${if (r.out) "Ти" else if (group != null) displayName(app, contacts, group, r.sender) else title}", repo.replyTo(peer, r)?.t ?: r.text, Modifier.weight(1f))
+                    IconButton(onClick = { replyTo = null }) { Icon(Icons.Default.Close, "Скасувати відповідь", tint = Muted) }
+                }
+            }
             if (emojiOpen && !recording) EmojiPanel { e -> draft += e }
             Row(Modifier.fillMaxWidth().padding(8.dp).navigationBarsPadding(), verticalAlignment = Alignment.CenterVertically) {
                 if (recording) {
@@ -659,7 +679,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
                     TextButton(onClick = { recording = false; recorder.stop(cancel = true) }) { Text("Скасувати") }
                     Button(onClick = {
                         recording = false
-                        recorder.stop()?.let { (d, dur) -> scope.launch { runCatching { repo.sendVoice(peer, recorder.mime, dur, d) }.onFailure { toast(it.message ?: "Помилка") } } }
+                        recorder.stop()?.let { (d, dur) -> val re = takeReply(); scope.launch { runCatching { repo.sendVoice(peer, recorder.mime, dur, d, re) }.onFailure { toast(it.message ?: "Помилка") } } }
                     }) { Text("Надіслати") }
                 } else {
                     IconButton(onClick = { emojiOpen = !emojiOpen }) {
@@ -674,7 +694,8 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
                         IconButton(enabled = !busy, onClick = {
                             val t = draft.trim(); busy = true
                             scope.launch {
-                                runCatching { repo.sendText(peer, t) }.onSuccess { failed -> draft = ""; if (failed > 0) toast("Не вдалося доставити $failed учасникам — спробуй пізніше") }.onFailure { toast(it.message ?: "Помилка") }
+                                val re = takeReply()
+                                runCatching { repo.sendText(peer, t, re) }.onSuccess { failed -> draft = ""; if (failed > 0) toast("Не вдалося доставити $failed учасникам — спробуй пізніше") }.onFailure { toast(it.message ?: "Помилка") }
                                 busy = false
                             }
                         }) { Icon(Icons.AutoMirrored.Filled.Send, "Надіслати", tint = Accent) }
@@ -714,6 +735,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
             },
             confirmButton = {
                 Column(horizontalAlignment = Alignment.End) {
+                    if (m.mid != null && m.kind != "call" && group?.left != true) TextButton(onClick = { actionsFor = null; replyTo = m }) { Text("Відповісти") }
                     if (m.out && m.status == "failed") TextButton(onClick = { actionsFor = null; retry(m) }) { Text("Надіслати ще раз") }
                     if (m.out && m.mid != null) TextButton(onClick = { actionsFor = null; runOp { repo.deleteMessage(m, everywhere = true) } }) { Text("Видалити у всіх", color = Danger) }
                     TextButton(onClick = { actionsFor = null; runOp { repo.deleteMessage(m, everywhere = false) } }) { Text("Видалити в мене") }
@@ -771,7 +793,8 @@ private val timeFmt = SimpleDateFormat("HH:mm", Locale("uk"))
 private fun Bubble(
     m: Message, playing: Boolean, sender: String? = null, myId: String? = null,
     onReact: (String) -> Unit = {}, onLongPress: () -> Unit, onOpen: () -> Unit = {},
-    tick: Pair<String, String>? = null, onRetry: () -> Unit = {}, onPlay: () -> Unit,
+    tick: Pair<String, String>? = null, onRetry: () -> Unit = {},
+    quoteWho: String? = null, onQuote: () -> Unit = {}, flash: Boolean = false, onPlay: () -> Unit,
 ) {
     val system = m.kind == "call"
     Column(
@@ -783,8 +806,10 @@ private fun Bubble(
             return@Column
         }
         if (sender != null) Text(sender, color = Accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp))
+        if (m.re != null && quoteWho != null) Quote(quoteWho, m.re.t, Modifier.widthIn(max = 300.dp).padding(bottom = 3.dp).clickable(onClick = onQuote))
         Surface(
             color = if (m.out) OutBubble else InBubble, shape = RoundedCornerShape(14.dp),
+            border = if (flash) androidx.compose.foundation.BorderStroke(2.dp, Accent) else null,
             modifier = Modifier.widthIn(max = 300.dp).clip(RoundedCornerShape(14.dp))
                 .combinedClickable(onClick = { if (m.kind == "voice") onPlay() else if (m.kind == "image") onOpen() }, onLongClick = onLongPress),
         ) {
@@ -825,6 +850,18 @@ private fun Bubble(
         Row(Modifier.padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(timeFmt.format(Date(m.at)), color = Muted, fontSize = 11.sp)
             if (tick != null) Ticks(tick.first, tick.second, onRetry)
+        }
+    }
+}
+
+/** Цитата: смужка зліва, хто написав, уривок в один рядок. */
+@Composable
+private fun Quote(who: String, text: String, modifier: Modifier = Modifier) {
+    Row(modifier.clip(RoundedCornerShape(topEnd = 8.dp, bottomEnd = 8.dp)).background(Color.White.copy(alpha = 0.06f)).height(IntrinsicSize.Min)) {
+        Box(Modifier.width(3.dp).fillMaxHeight().background(Accent))
+        Column(Modifier.padding(horizontal = 10.dp, vertical = 4.dp)) {
+            Text(who, color = Accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            Text(text, color = Muted, fontSize = 13.sp, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
         }
     }
 }

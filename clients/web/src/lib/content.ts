@@ -7,12 +7,12 @@ export type CallOp = 'offer' | 'answer' | 'end' | 'reject' | 'busy';
 // g — ідентифікатор групи: повідомлення адресоване групі (кожному учаснику окремо).
 export type GroupMember = { id: string; name: string };
 export type Body =
-  | { t: 'text'; text: string; id?: string; g?: string }
+  | { t: 'text'; text: string; id?: string; g?: string; re?: Reply }
   | { t: 'hello'; name: string }
-  | { t: 'voice'; mime: string; dur: number; data: string; ptt?: boolean; id?: string; g?: string }
+  | { t: 'voice'; mime: string; dur: number; data: string; ptt?: boolean; id?: string; g?: string; re?: Reply }
   // Фото: JPEG, стиснений і очищений від EXIF/геолокації на пристрої. Сервер тримає його
   // лише до доставки (максимум 3 дні). caption — підпис (необов'язково).
-  | { t: 'image'; mime: string; w: number; h: number; data: string; caption?: string; id?: string; g?: string }
+  | { t: 'image'; mime: string; w: number; h: number; data: string; caption?: string; id?: string; g?: string; re?: Reply }
   | { t: 'call'; op: CallOp; id: string; at: number; sdp?: string }
   // Видалити мої повідомлення з цими id у співрозмовника (або в групі g).
   | { t: 'delete'; ids: string[]; g?: string }
@@ -68,6 +68,19 @@ export function newMsgId(): string {
 
 const MSG_ID = /^[0-9a-f]{32}$/;
 export const validMsgId = (id: unknown): id is string => typeof id === 'string' && MSG_ID.test(id);
+
+/**
+ * Відповідь на повідомлення: id оригіналу, хто його написав, короткий уривок (≤ 200 символів).
+ * Уривок їде разом із відповіддю — цитату видно, навіть якщо оригіналу в отримувача вже немає.
+ */
+export type Reply = { id: string; by: string; t: string };
+const IDENTITY = /^05[0-9a-f]{64}$/;
+export function validReply(r: unknown): Reply | undefined {
+  if (!r || typeof r !== 'object') return undefined;
+  const { id, by, t } = r as Record<string, unknown>;
+  if (!validMsgId(id) || typeof by !== 'string' || !IDENTITY.test(by) || typeof t !== 'string') return undefined;
+  return { id, by, t: t.slice(0, 200) };
+}
 
 const LEGACY_HELLO = '\u0001hello ';
 

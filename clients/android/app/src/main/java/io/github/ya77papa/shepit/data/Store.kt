@@ -88,18 +88,20 @@ data class Message(
     val rd: Set<String> = emptySet(),
     /** Вхідне: я вже переглянув. */
     val seen: Boolean = false,
+    /** Відповідь на інше повідомлення (цитата). */
+    val re: Reply? = null,
 )
 
-private const val COLS = "id, peer, out, text, at, kind, voice_mime, voice_dur, voice, mid, sender, reactions, status, dlv, rd, seen"
+private const val COLS = "id, peer, out, text, at, kind, voice_mime, voice_dur, voice, mid, sender, reactions, status, dlv, rd, seen, re"
 
 /** Контакти, історія, дрібні налаштування — локальна SQLite у приватній теці застосунку. */
-class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 5) {
+class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 6) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE contacts(identity TEXT PRIMARY KEY, name TEXT NOT NULL, fingerprint TEXT NOT NULL, avatar TEXT)")
         db.execSQL(
             "CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT, peer TEXT NOT NULL, out INTEGER NOT NULL, " +
                 "text TEXT NOT NULL, at INTEGER NOT NULL, kind TEXT NOT NULL, voice_mime TEXT, voice_dur INTEGER, voice BLOB, mid TEXT, sender TEXT, reactions TEXT, " +
-                "status TEXT, dlv TEXT, rd TEXT, seen INTEGER NOT NULL DEFAULT 0)",
+                "status TEXT, dlv TEXT, rd TEXT, seen INTEGER NOT NULL DEFAULT 0, re TEXT)",
         )
         db.execSQL("CREATE INDEX messages_peer ON messages(peer, id)")
         db.execSQL("CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT)")
@@ -127,6 +129,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 5) {
             // Стара історія вважається переглянутою — не розсилати підтвердження за минуле.
             db.execSQL("ALTER TABLE messages ADD COLUMN seen INTEGER NOT NULL DEFAULT 1")
         }
+        if (oldVersion < 6) db.execSQL("ALTER TABLE messages ADD COLUMN re TEXT")
     }
 
     fun contacts(): List<Contact> = readableDatabase.rawQuery(
@@ -150,7 +153,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 5) {
     private fun row(c: android.database.Cursor) = Message(
         c.getLong(0), c.getString(1), c.getInt(2) == 1, c.getString(3), c.getLong(4), c.getString(5),
         c.getString(6), c.getLong(7), if (c.isNull(8)) null else c.getBlob(8), c.getString(9), c.getString(10), parseReactions(c.getString(11)),
-        c.getString(12), ids(c.getString(13)), ids(c.getString(14)), c.getInt(15) != 0,
+        c.getString(12), ids(c.getString(13)), ids(c.getString(14)), c.getInt(15) != 0, Reply.parse(c.getString(16)),
     )
 
     private fun ids(s: String?): Set<String> = s?.split(' ')?.filter { it.isNotEmpty() }?.toSet() ?: emptySet()
@@ -214,7 +217,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 5) {
         put("peer", m.peer); put("out", if (m.out) 1 else 0); put("text", m.text); put("at", m.at); put("kind", m.kind)
         put("voice_mime", m.voiceMime); put("voice_dur", m.voiceDur); put("voice", m.voice); put("mid", m.mid); put("sender", m.sender)
         if (m.reactions.isNotEmpty()) put("reactions", org.json.JSONObject(m.reactions as Map<*, *>).toString())
-        put("status", m.status); put("dlv", m.dlv.joinToString(" ")); put("rd", m.rd.joinToString(" ")); put("seen", if (m.seen) 1 else 0)
+        put("status", m.status); put("dlv", m.dlv.joinToString(" ")); put("rd", m.rd.joinToString(" ")); put("seen", if (m.seen) 1 else 0); put("re", m.re?.toString())
     })
 
     fun deleteMessage(id: Long) {
