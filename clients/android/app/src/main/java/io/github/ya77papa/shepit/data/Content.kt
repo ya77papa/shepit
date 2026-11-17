@@ -25,6 +25,8 @@ sealed interface Body {
     data class Leave(val g: String) : Body
     /** Реакція на повідомлення з id (порожня e — прибрати мою). У групі — з g. */
     data class React(val id: String, val e: String, val g: String? = null) : Body
+    /** Підтвердження: мої повідомлення з ids доставлено (s = "d") або переглянуто ("r"). У групі — з g. */
+    data class Receipt(val ids: List<String>, val s: String, val g: String? = null) : Body
     /** Очистити всю бесіду у співрозмовника. */
     data object Clear : Body
     /** Тип з новішої версії — пропустити. */
@@ -52,6 +54,7 @@ object Content {
                 put("admins", org.json.JSONArray(b.admins)); put("ver", b.ver)
             }
             is Body.Leave -> { put("t", "leave"); put("g", b.g) }
+            is Body.Receipt -> { put("t", "receipt"); put("ids", org.json.JSONArray(b.ids)); put("s", b.s); b.g?.let { put("g", it) } }
             is Body.React -> { put("t", "react"); put("id", b.id); put("e", b.e); b.g?.let { put("g", it) } }
             Body.Clear -> put("t", "clear")
             Body.Unknown -> put("t", "unknown")
@@ -82,6 +85,12 @@ object Content {
                         val id = msgId(o.opt("id")) ?: return Body.Unknown
                         val e = o.optString("e").takeIf { validReaction(it) } ?: return Body.Unknown
                         return Body.React(id, e, groupId(o))
+                    }
+                    "receipt" -> {
+                        val s = o.optString("s").takeIf { it == "d" || it == "r" } ?: return Body.Unknown
+                        val a = o.optJSONArray("ids") ?: return Body.Unknown
+                        val ids = (0 until minOf(a.length(), 500)).mapNotNull { msgId(a.opt(it)) }
+                        return if (ids.isEmpty()) Body.Unknown else Body.Receipt(ids, s, groupId(o))
                     }
                     "clear" -> return Body.Clear
                     "call" -> return Body.Call(

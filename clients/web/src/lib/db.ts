@@ -39,6 +39,13 @@ export type Message = {
   from?: string;
   /** Реакції: ідентичність → емодзі (одна на людину). */
   reactions?: Record<string, string>;
+  /** Вихідне: надсилається / на сервері / не вдалося (старі — без статусу, вважаємо «на сервері»). */
+  status?: 'sending' | 'sent' | 'failed';
+  /** Вихідне: хто підтвердив доставку і хто переглянув. */
+  dlv?: string[];
+  rd?: string[];
+  /** Вхідне: я вже переглянув (підтвердження перегляду надіслано або вимкнене). */
+  seen?: boolean;
 };
 
 const DB = 'shepit';
@@ -132,6 +139,54 @@ export const messages = {
     m.reactions = r;
     await req(st.put(m));
     return true;
+  },
+  /** Оновити поля повідомлення. */
+  patch: async (id: number, p: Partial<Message>) => {
+    const st = await store('messages', 'readwrite');
+    const m = await req<Message | undefined>(st.get(id));
+    if (m) await req(st.put({ ...m, ...plain(p) }));
+  },
+  /** who підтвердив доставку (і перегляд, якщо read) моїх повідомлень з mids у бесіді peer. */
+  receipt: async (peer: string, mids: string[], who: string, read: boolean): Promise<boolean> => {
+    const set = new Set(mids);
+    const st = await store('messages', 'readwrite');
+    const all = await req<Message[]>(st.index('peer').getAll(peer));
+    let changed = false;
+    for (const m of all) {
+      if (!m.out || !m.mid || !set.has(m.mid)) continue;
+      const dlv = new Set(m.dlv ?? []);
+      const rd = new Set(m.rd ?? []);
+      const before = dlv.size + rd.size;
+      dlv.add(who);
+      if (read) rd.add(who);
+      if (dlv.size + rd.size === before && m.status === 'sent') continue;
+      m.dlv = [...dlv];
+      m.rd = [...rd];
+      m.status = 'sent';
+      await req(st.put(m));
+      changed = true;
+    }
+    return changed;
+  },
+  /** Вхідні з id, які я ще не переглянув, — і позначити переглянутими. */
+  takeUnseen: async (peer: string): Promise<Message[]> => {
+    const st = await store('messages', 'readwrite');
+    const all = await req<Message[]>(st.index('peer').getAll(peer));
+    const fresh = all.filter((m) => !m.out && m.mid && !m.seen && m.kind !== 'call');
+    for (const m of fresh) await req(st.put({ ...m, seen: true }));
+    return fresh;
+  },
+  /** Перший запуск версії з «переглянуто»: стара історія вважається переглянутою. */
+  markAllSeen: async () => {
+    const st = await store('messages', 'readwrite');
+    const all = await req<Message[]>(st.getAll());
+    for (const m of all) if (!m.out && !m.seen) await req(st.put({ ...m, seen: true }));
+  },
+  /** Після перезапуску: те, що «надсилалось», не надіслалось. */
+  failStuck: async () => {
+    const st = await store('messages', 'readwrite');
+    const all = await req<Message[]>(st.getAll());
+    for (const m of all) if (m.status === 'sending') await req(st.put({ ...m, status: 'failed' }));
   },
   /** Усю бесіду з peer. */
   clear: (peer: string) => deleteWhere(peer, () => true),

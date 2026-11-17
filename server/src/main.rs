@@ -295,8 +295,11 @@ async fn send(State(app): State<Shared>, Json(env): Json<Envelope>) -> StatusCod
                 Some(bell) => bell.send(()).is_ok(),
                 None => false,
             };
+            // «quiet» — службове (підтвердження доставки/перегляду): сповіщенням не будити.
             #[cfg(feature = "push")]
-            wake_up(&app, env.to, env.wake.as_deref() == Some("call"), listening);
+            if env.wake.as_deref() != Some("quiet") {
+                wake_up(&app, env.to, env.wake.as_deref() == Some("call"), listening);
+            }
             #[cfg(not(feature = "push"))]
             let _ = listening;
             StatusCode::ACCEPTED

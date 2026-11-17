@@ -98,6 +98,8 @@ object Backup {
                     mid = o.optString("mid").takeIf { it.length == 32 },
                     sender = o.optString("from").ifEmpty { null },
                     reactions = o.optJSONObject("reactions")?.let { r -> r.keys().asSequence().associateWith { r.getString(it) } } ?: emptyMap(),
+                    // Відновлена історія — вже переглянута: підтвердження за минуле не розсилаємо.
+                    seen = true,
                 )
             }
         }

@@ -120,7 +120,7 @@ impl Core {
         let to = MailboxId::for_identity(&identity_bytes(&peer)?);
         let payload = self.acc().encrypt(&peer, &text).map_err(fail)?;
         let mut env = Envelope::new(to, &payload);
-        env.wake = wake.filter(|w| w == "call");
+        env.wake = wake.filter(|w| w == "call" || w == "quiet");
         serde_json::to_string(&env).map_err(fail)
     }
 

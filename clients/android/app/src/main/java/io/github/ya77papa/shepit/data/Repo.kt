@@ -62,6 +62,11 @@ class Repo(context: Context) {
         get() = db.get("myAvatar") ?: ""
         set(v) = db.set("myAvatar", v)
 
+    /** Повідомляти, що я переглянув (як у Signal: вимкнеш — сам теж не бачиш чужих «переглянуто»). */
+    var readReceipts: Boolean
+        get() = db.get("readReceipts") != "0"
+        set(v) = db.set("readReceipts", if (v) "1" else "0")
+
     private val _groups = MutableStateFlow<List<Group>>(emptyList())
     val groups = _groups.asStateFlow()
     private val _channels = MutableStateFlow<List<ChannelRec>>(emptyList())
@@ -76,6 +81,7 @@ class Repo(context: Context) {
         if (core != null) return@withContext true
         val st = secure.read() ?: return@withContext false
         core = Core.load(st)
+        db.failStuck()
         refreshContacts()
         refreshGroups()
         refreshChannels()
@@ -293,6 +299,7 @@ class Repo(context: Context) {
             is Body.Image -> body.g
             is Body.Delete -> body.g
             is Body.React -> body.g
+            is Body.Receipt -> body.g
             else -> null
         } ?: return
         if (gid == Content.INVALID_GROUP) return
@@ -340,6 +347,10 @@ class Repo(context: Context) {
                 if (db.deleteIncoming(key, body.ids, from) > 0) _changed.emit(key)
                 return
             }
+            is Body.Receipt -> {
+                if (db.receipt(key, body.ids, from, body.s == "r")) _changed.emit(key)
+                return
+            }
             is Body.React -> {
                 if (db.react(key, body.id, from, body.e)) _changed.emit(key)
                 return
@@ -352,6 +363,7 @@ class Repo(context: Context) {
             is Body.Image -> imageMessage(key, body).copy(sender = from)
             else -> return
         }
+        noteDelivered(from, m.mid, gid)
         val id = db.addMessage(m)
         _changed.emit(key)
         _incoming.emit(m.copy(id = id))
@@ -436,13 +448,93 @@ class Repo(context: Context) {
         return sendGroup(g, body(g.id))
     }
 
+    /**
+     * Записати вихідне («надсилається»), передати, оновити стан. Повертає, скільком учасникам групи
+     * не доставлено. Якщо не пішло нікому — стан «не надіслано» і виняток (для підказки в інтерфейсі).
+     */
+    private suspend fun sendOut(m: Message, body: (String?) -> Body): Int {
+        val id = withContext(Dispatchers.IO) { db.addMessage(m.copy(status = "sending")) }
+        _changed.emit(m.peer)
+        return transmit(id, m.peer, body)
+    }
+
+    private suspend fun transmit(id: Long, peer: String, body: (String?) -> Body): Int {
+        val me = core?.identity()
+        val total = if (peer.startsWith("g:")) db.group(peer.removePrefix("g:"))?.members?.count { it.id != me } ?: 0 else 1
+        try {
+            val failed = sendTo(peer, body)
+            val ok = total == 0 || failed < total
+            db.setStatus(id, if (ok) "sent" else "failed")
+            _changed.emit(peer)
+            if (!ok) error("Не вдалося надіслати")
+            return failed
+        } catch (e: Exception) {
+            db.setStatus(id, "failed")
+            _changed.emit(peer)
+            throw e
+        }
+    }
+
+    /** Повторити невдале: тіло відновлюється з того, що збережено в бесіді. */
+    suspend fun retry(m: Message): Int {
+        val mid = m.mid
+        val make: (String?) -> Body = when (m.kind) {
+            "voice" -> { g -> Body.Voice(m.voiceMime ?: "audio/ogg", m.voiceDur, Base64.encodeToString(m.voice ?: ByteArray(0), Base64.NO_WRAP), mid, g) }
+            "image" -> {
+                val bytes = m.voice ?: error("Фото пошкоджене")
+                val b = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, b)
+                val data = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                val caption = m.text.takeIf { it != "Фото" }
+                ({ g -> Body.Image("image/jpeg", b.outWidth, b.outHeight, data, caption, mid, g) })
+            }
+            "text" -> { g -> Body.Text(m.text, mid, g) }
+            else -> return 0
+        }
+        db.setStatus(m.id, "sending")
+        _changed.emit(m.peer)
+        return transmit(m.id, m.peer, make)
+    }
+
     suspend fun sendText(peer: String, text: String): Int {
         val mid = Content.newMsgId()
-        val failed = sendTo(peer) { g -> Body.Text(text, mid, g) }
-        db.addMessage(Message(peer = peer, out = true, text = text, at = System.currentTimeMillis(), mid = mid))
-        _changed.emit(peer)
-        return failed
+        return sendOut(Message(peer = peer, out = true, text = text, at = System.currentTimeMillis(), mid = mid)) { g -> Body.Text(text, mid, g) }
     }
+
+    // ---------- доставлено / переглянуто ----------
+
+    /** Кому ще підтвердити доставку: (кому, група) → id повідомлень. */
+    private val pendingAcks = mutableMapOf<Pair<String, String?>, MutableSet<String>>()
+
+    private fun noteDelivered(to: String, mid: String?, g: String?) {
+        if (mid == null) return
+        synchronized(pendingAcks) { pendingAcks.getOrPut(to to g) { mutableSetOf() } += mid }
+    }
+
+    private suspend fun sendReceipt(to: String, ids: List<String>, s: String, g: String?) {
+        if (to == core?.identity()) return
+        // «quiet» — сервер не будить отримувача сповіщенням заради службового.
+        ids.chunked(200).forEach { part -> runCatching { send(to, Body.Receipt(part, s, g), wake = "quiet") } }
+    }
+
+    /** Бесіда на екрані — позначити вхідні переглянутими і (якщо дозволено) повідомити відправників. */
+    suspend fun markRead(peer: String) {
+        val fresh = withContext(Dispatchers.IO) { db.takeUnseen(peer) }
+        if (fresh.isEmpty() || !readReceipts) return
+        val gid = peer.removePrefix("g:").takeIf { peer.startsWith("g:") }
+        val bySender = fresh.mapNotNull { (sender, mid) -> (if (gid != null) sender else peer)?.let { it to mid } }.groupBy({ it.first }, { it.second })
+        synchronized(pendingAcks) { bySender.forEach { (to, mids) -> pendingAcks[to to gid]?.removeAll(mids.toSet()) } }
+        bySender.forEach { (to, mids) -> sendReceipt(to, mids, "r", gid) }
+    }
+
+    /** Після отримання пошти: «доставлено» всім відправникам. */
+    private suspend fun flushAcks() {
+        val batch = synchronized(pendingAcks) { pendingAcks.toMap().also { pendingAcks.clear() } }
+        batch.forEach { (k, mids) -> if (mids.isNotEmpty()) sendReceipt(k.first, mids.toList(), "d", k.second) }
+    }
+
+    /** Відкрита на екрані бесіда (null — жодної або застосунок не на екрані). */
+    @Volatile var visibleChat: String? = null
 
     /** Фото зберігається лише в базі застосунку (поле voice — байти JPEG, voiceMime — його тип). */
     private fun imageMessage(peer: String, b: Body.Image) = Message(
@@ -454,17 +546,17 @@ class Repo(context: Context) {
     suspend fun sendImage(peer: String, jpeg: ByteArray, w: Int, h: Int, caption: String?): Int {
         val mid = Content.newMsgId()
         val data = Base64.encodeToString(jpeg, Base64.NO_WRAP)
-        val failed = sendTo(peer) { g -> Body.Image("image/jpeg", w, h, data, caption, mid, g) }
-        db.addMessage(Message(peer = peer, out = true, text = caption ?: "Фото", at = System.currentTimeMillis(), kind = "image", voiceMime = "image/jpeg", voice = jpeg, mid = mid))
-        _changed.emit(peer)
-        return failed
+        return sendOut(Message(peer = peer, out = true, text = caption ?: "Фото", at = System.currentTimeMillis(), kind = "image", voiceMime = "image/jpeg", voice = jpeg, mid = mid)) { g ->
+            Body.Image("image/jpeg", w, h, data, caption, mid, g)
+        }
     }
 
     suspend fun sendVoice(peer: String, mime: String, dur: Long, data: ByteArray) {
         val mid = Content.newMsgId()
-        sendTo(peer) { g -> Body.Voice(mime, dur, Base64.encodeToString(data, Base64.NO_WRAP), mid, g) }
-        db.addMessage(Message(peer = peer, out = true, text = "🎤 Голосове", at = System.currentTimeMillis(), kind = "voice", voiceMime = mime, voiceDur = dur, voice = data, mid = mid))
-        _changed.emit(peer)
+        val b64 = Base64.encodeToString(data, Base64.NO_WRAP)
+        sendOut(Message(peer = peer, out = true, text = "🎤 Голосове", at = System.currentTimeMillis(), kind = "voice", voiceMime = mime, voiceDur = dur, voice = data, mid = mid)) { g ->
+            Body.Voice(mime, dur, b64, mid, g)
+        }
     }
 
     // ---------- реакції ----------
@@ -513,7 +605,15 @@ class Repo(context: Context) {
      * Повертає кількість нових повідомлень.
      */
     suspend fun receive(): Int = withContext(Dispatchers.IO) {
-        lock.withLock {
+        val n = receiveLocked()
+        // Підтвердження — вже поза м'ютексом (send його бере).
+        visibleChat?.let { markRead(it) }
+        flushAcks()
+        n
+    }
+
+    private suspend fun receiveLocked(): Int {
+        return lock.withLock {
             val c = core ?: return@withLock 0
             val mb = c.mailbox()
             val items = JSONArray(api.get("/v0/mailbox/$mb", c.authHeader("GET /v0/mailbox/$mb", ByteArray(0))))
@@ -543,6 +643,7 @@ class Repo(context: Context) {
             is Body.Image -> body.g != null
             is Body.Delete -> body.g != null
             is Body.React -> body.g != null
+            is Body.Receipt -> body.g != null
             else -> false
         }
         if (groupish) {
@@ -555,6 +656,10 @@ class Repo(context: Context) {
         }
         if (body is Body.React) {
             if (db.contacts().any { it.identity == from } && db.react(from, body.id, from, body.e)) _changed.emit(from)
+            return false
+        }
+        if (body is Body.Receipt) {
+            if (db.contacts().any { it.identity == from } && db.receipt(from, body.ids, from, body.s == "r")) _changed.emit(from)
             return false
         }
         // Службові: співрозмовник видалив свої повідомлення «у всіх» або очистив бесіду.
@@ -597,6 +702,7 @@ class Repo(context: Context) {
             is Body.Image -> imageMessage(from, body)
             else -> return false
         }
+        noteDelivered(from, m.mid, null)
         val id = db.addMessage(m)
         _changed.emit(from)
         _incoming.emit(m.copy(id = id))

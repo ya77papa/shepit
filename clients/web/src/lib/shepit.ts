@@ -256,7 +256,7 @@ export class Shepit {
     this.acc.setCertificate(await r.text());
   }
 
-  send(peer: string, text: string, wake?: 'call'): Promise<void> {
+  send(peer: string, text: string, wake?: 'call' | 'quiet'): Promise<void> {
     return serial(async () => {
       await this.ensureCertificate();
       if (!this.acc.hasSession(peer)) {

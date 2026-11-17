@@ -57,6 +57,15 @@ class ContentTest {
     }
 
     @Test
+    fun receiptsFromWeb() {
+        assertEquals(Body.Receipt(listOf(id), "d"), Content.decode("""{"t":"receipt","ids":["$id","bad"],"s":"d","v":1}"""))
+        assertEquals(Body.Receipt(listOf(id), "r", id), Content.decode("""{"t":"receipt","ids":["$id"],"s":"r","g":"$id","v":1}"""))
+        assertEquals(Body.Unknown, Content.decode("""{"t":"receipt","ids":["$id"],"s":"x","v":1}"""))
+        assertEquals(Body.Unknown, Content.decode("""{"t":"receipt","ids":["bad"],"s":"d","v":1}"""))
+        assertEquals(Body.Receipt(listOf(id), "r", id), Content.decode(Content.encode(Body.Receipt(listOf(id), "r", id))))
+    }
+
+    @Test
     fun reactionsFromWeb() {
         assertEquals(Body.React(id, "👍"), Content.decode("""{"t":"react","id":"$id","e":"👍","v":1}"""))
         assertEquals(Body.React(id, "❤️", id), Content.decode("""{"t":"react","id":"$id","e":"❤️","g":"$id","v":1}"""))

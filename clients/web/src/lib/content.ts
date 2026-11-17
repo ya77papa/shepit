@@ -26,7 +26,9 @@ export type Body =
   // Я виходжу з групи.
   | { t: 'leave'; g: string }
   // Реакція на повідомлення з id (порожня e — прибрати мою реакцію). У групі — з g.
-  | { t: 'react'; id: string; e: string; g?: string };
+  | { t: 'react'; id: string; e: string; g?: string }
+  // Підтвердження: мої повідомлення з цими id доставлено (s:'d') або переглянуто (s:'r'). У групі — з g.
+  | { t: 'receipt'; ids: string[]; s: 'd' | 'r'; g?: string };
 
 /** Реакція: 1–8 символів емодзі, без латиниці, цифр і розмітки. */
 export const validReaction = (e: unknown): e is string =>

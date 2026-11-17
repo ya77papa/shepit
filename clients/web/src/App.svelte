@@ -14,6 +14,7 @@
   import { CallManager, checkRelay, type RelayCheck } from './lib/call.svelte';
   import VoiceMsg from './VoiceMsg.svelte';
   import ImageMsg from './ImageMsg.svelte';
+  import Ticks, { type TickState } from './Ticks.svelte';
   import { prepareImage } from './lib/image';
   import CallOverlay from './CallOverlay.svelte';
 
@@ -160,6 +161,7 @@
     thread = await messagesDb.forPeer(`g:${g.id}`);
     await tick();
     threadEl?.scrollTo({ top: threadEl.scrollHeight });
+    markRead();
   }
 
   async function reloadThread() {
@@ -173,11 +175,130 @@
     if (selected && !thread.some((t) => t.id === selected!.id)) selected = null;
     await tick();
     threadEl?.scrollTo({ top: threadEl.scrollHeight });
+    markRead();
+  }
+
+  // ---------- доставлено / переглянуто ----------
+
+  /** Повідомляти співрозмовникам, що я переглянув (як у Signal: вимкнеш — сам теж не бачиш). */
+  let readReceipts = $state(true);
+  /** Кому ще треба підтвердити доставку: "кому|група" → id повідомлень. */
+  const pendingAcks = new Map<string, { to: string; g?: string; ids: Set<string> }>();
+
+  function noteDelivered(to: string, mid: string | undefined, g?: string) {
+    if (!mid) return;
+    const k = `${to}|${g ?? ''}`;
+    let e = pendingAcks.get(k);
+    if (!e) pendingAcks.set(k, (e = { to, g, ids: new Set() }));
+    e.ids.add(mid);
+  }
+
+  function sendReceipt(to: string, ids: string[], s: 'd' | 'r', g?: string) {
+    if (!me || to === me.identity) return;
+    for (let i = 0; i < ids.length; i += 200) {
+      const body: Body = { t: 'receipt', ids: ids.slice(i, i + 200), s, ...(g ? { g } : {}) };
+      me.send(to, encode(body), 'quiet').catch(() => {}); // не критично
+    }
+  }
+
+  /** Відкрита бесіда на екрані — позначити вхідні переглянутими і (якщо дозволено) повідомити. */
+  async function markRead() {
+    if (!me || !chatKey || document.visibilityState !== 'visible') return;
+    const key = chatKey;
+    const fresh = await messagesDb.takeUnseen(key);
+    if (!fresh.length || !readReceipts) return;
+    const gid = key.startsWith('g:') ? key.slice(2) : undefined;
+    const bySender = new Map<string, string[]>();
+    for (const m of fresh) {
+      const to = gid ? m.from : key;
+      if (!to || !m.mid) continue;
+      if (!bySender.has(to)) bySender.set(to, []);
+      bySender.get(to)!.push(m.mid);
+      pendingAcks.get(`${to}|${gid ?? ''}`)?.ids.delete(m.mid); // «переглянуто» включає «доставлено»
+    }
+    for (const [to, ids] of bySender) sendReceipt(to, ids, 'r', gid);
+  }
+
+  async function flushAcks() {
+    await markRead();
+    for (const { to, g, ids } of pendingAcks.values()) if (ids.size) sendReceipt(to, [...ids], 'd', g);
+    pendingAcks.clear();
+  }
+
+  async function setReadReceipts(on: boolean) {
+    readReceipts = on;
+    await kv.set('readReceipts', on);
+  }
+
+  /** Стан галочок вихідного повідомлення. */
+  function tickOf(m: Message): { state: TickState; title: string } | null {
+    if (!m.out || m.kind === 'call' || !me) return null;
+    if (m.status === 'sending') return { state: 'sending', title: 'Надсилається' };
+    if (m.status === 'failed') return { state: 'failed', title: 'Не надіслано. Натисни, щоб повторити' };
+    const others = group ? group.members.map((x) => x.id).filter((id) => id !== me!.identity) : current ? [current.identity] : [];
+    if (!others.length) return { state: 'sent', title: 'Надіслано' };
+    const rd = new Set(m.rd ?? []);
+    const dlv = new Set([...(m.dlv ?? []), ...rd]);
+    const nd = others.filter((o) => dlv.has(o)).length;
+    const nr = others.filter((o) => rd.has(o)).length;
+    const detail = group ? ` (доставлено ${nd} з ${others.length}${readReceipts ? `, переглянуто ${nr}` : ''})` : '';
+    if (readReceipts && nr === others.length) return { state: 'read', title: 'Переглянуто' + detail };
+    if (nd === others.length) return { state: 'delivered', title: 'Доставлено' + detail };
+    return { state: 'sent', title: (group ? 'Надіслано' : 'На сервері, ще не доставлено') + detail };
+  }
+
+  /** Передати вихідне повідомлення. true — пішло (у групі — хоча б комусь). */
+  async function transmit(key: string, body: Body): Promise<boolean> {
+    if (!me) return false;
+    if (key.startsWith('g:')) {
+      const g = groups.find((x) => x.id === key.slice(2));
+      if (!g || g.left) return false;
+      const { failed, total } = await sendGroup(g, body);
+      return total === 0 || failed < total;
+    }
+    try {
+      await me.send(key, encode(body));
+      return true;
+    } catch (e) {
+      fail(e);
+      return false;
+    }
+  }
+
+  /** Записати вихідне в бесіду («надсилається»), передати, оновити стан. */
+  async function sendOut(msg: Message, body: Body) {
+    const key = msg.peer;
+    const id = (await messagesDb.add({ ...msg, status: 'sending' })) as number;
+    if (chatKey === key) await reloadThread();
+    const ok = await transmit(key, body);
+    await messagesDb.patch(id, { status: ok ? 'sent' : 'failed' });
+    if (chatKey === key) await reloadThread();
+  }
+
+  /** Тіло для повторної спроби — з того, що збережено в бесіді. */
+  async function bodyOf(m: Message): Promise<Body | null> {
+    if (m.kind === 'voice' && m.voice) return { t: 'voice', mime: m.voice.mime, dur: m.voice.dur, data: toBase64(await m.voice.blob.arrayBuffer()), id: m.mid };
+    if (m.kind === 'image' && m.image)
+      return { t: 'image', mime: m.image.mime, w: m.image.w, h: m.image.h, data: toBase64(await m.image.blob.arrayBuffer()), caption: m.text !== 'Фото' ? m.text : undefined, id: m.mid };
+    if (!m.kind || m.kind === 'text') return { t: 'text', text: m.text, id: m.mid };
+    return null;
+  }
+
+  async function retry(m: Message) {
+    const body = await bodyOf(m);
+    if (!body || m.id === undefined) return;
+    error = '';
+    selected = null;
+    await messagesDb.patch(m.id, { status: 'sending' });
+    await reloadThread();
+    const ok = await transmit(m.peer, body);
+    await messagesDb.patch(m.id, { status: ok ? 'sent' : 'failed' });
+    if (chatKey === m.peer) await reloadThread();
   }
 
   /** Надіслати в групу: кожному учаснику окремо (сервер не знає, що це група). */
-  async function sendGroup(g: Group, body: Body, to: Member[] = g.members) {
-    if (!me) return;
+  async function sendGroup(g: Group, body: Body, to: Member[] = g.members): Promise<{ failed: number; total: number }> {
+    if (!me) return { failed: 0, total: 0 };
     const raw = encode({ ...body, g: g.id } as Body);
     let failed = 0;
     for (const m of to) {
@@ -188,7 +309,9 @@
         failed++;
       }
     }
-    if (failed) error = `Не вдалося доставити ${failed} з ${to.length - 1} учасникам (спробуй пізніше).`;
+    const total = to.filter((m) => m.id !== me!.identity).length;
+    if (failed) error = `Не вдалося доставити ${failed} з ${total} учасникам (спробуй пізніше).`;
+    return { failed, total };
   }
 
   const stateBody = (g: Group): Body => ({ t: 'group', g: g.id, name: g.name, avatar: g.avatar, members: g.members, admins: g.admins, ver: g.v });
@@ -367,6 +490,10 @@
       const ids = Array.isArray(b.ids) ? b.ids.filter(validMsgId).slice(0, 500) : [];
       return ids.length && (await messagesDb.deleteIncoming(key, ids, from)) ? key : null;
     }
+    if (b.t === 'receipt') {
+      const ids = Array.isArray(b.ids) ? b.ids.filter(validMsgId).slice(0, 500) : [];
+      return ids.length && (b.s === 'd' || b.s === 'r') && (await messagesDb.receipt(key, ids, from, b.s === 'r')) ? key : null;
+    }
     if (b.t === 'react') {
       return validMsgId(b.id) && validReaction(b.e) && (await messagesDb.react(key, b.id, from, b.e)) ? key : null;
     }
@@ -379,6 +506,7 @@
     } else if (b.t === 'image' && validImage(b)) {
       await messagesDb.add({ peer: key, out: false, text: b.caption || 'Фото', at: Date.now(), kind: 'image', image: photoOf(b), mid, from });
     } else return null;
+    noteDelivered(from, mid, gid);
     if (!group || group.id !== gid) unread[key] = (unread[key] ?? 0) + 1;
     return key;
   }
@@ -657,6 +785,7 @@
     thread = await messagesDb.forPeer(c.identity);
     await tick();
     threadEl?.scrollTo({ top: threadEl.scrollHeight });
+    markRead();
   }
 
   async function saveContact(c: Contact) {
@@ -727,11 +856,8 @@
     error = '';
     try {
       const mid = newMsgId();
-      if (group) await sendGroup(group, { t: 'text', text, id: mid });
-      else await me.send(current!.identity, encode({ t: 'text', text, id: mid }));
-      await messagesDb.add({ peer: key, out: true, text, at: Date.now(), mid });
       draft = '';
-      if (chatKey === key) await reloadThread();
+      await sendOut({ peer: key, out: true, text, at: Date.now(), mid }, { t: 'text', text, id: mid });
     } catch (e) {
       fail(e);
     } finally {
@@ -746,10 +872,7 @@
     try {
       const mid = newMsgId();
       const body: Body = { t: 'voice', mime, dur, data: toBase64(await blob.arrayBuffer()), id: mid };
-      if (group) await sendGroup(group, body);
-      else await me.send(current!.identity, encode(body));
-      await messagesDb.add({ peer: key, out: true, text: '🎤 Голосове', at: Date.now(), kind: 'voice', voice: { blob, mime, dur }, mid });
-      if (chatKey === key) await reloadThread();
+      await sendOut({ peer: key, out: true, text: '🎤 Голосове', at: Date.now(), kind: 'voice', voice: { blob, mime, dur }, mid }, body);
     } catch (e) {
       fail(e);
     } finally {
@@ -773,11 +896,8 @@
       const caption = draft.trim() || undefined;
       const mid = newMsgId();
       const body: Body = { t: 'image', mime: 'image/jpeg', w, h, data: toBase64(await blob.arrayBuffer()), caption, id: mid };
-      if (group) await sendGroup(group, body);
-      else await me.send(current!.identity, encode(body));
-      await messagesDb.add({ peer: key, out: true, text: caption || 'Фото', at: Date.now(), kind: 'image', image: { blob, mime: 'image/jpeg', w, h }, mid });
       draft = '';
-      if (chatKey === key) await reloadThread();
+      await sendOut({ peer: key, out: true, text: caption || 'Фото', at: Date.now(), kind: 'image', image: { blob, mime: 'image/jpeg', w, h }, mid }, body);
     } catch (e) {
       fail(e);
     } finally {
@@ -883,6 +1003,12 @@
           if (key) changedPeers.add(key);
           return;
         }
+        if (body.t === 'receipt') {
+          const ids = Array.isArray(body.ids) ? body.ids.filter(validMsgId).slice(0, 500) : [];
+          if (known.has(m.from) && ids.length && (body.s === 'd' || body.s === 'r') && (await messagesDb.receipt(m.from, ids, m.from, body.s === 'r')))
+            changedPeers.add(m.from);
+          return;
+        }
         if (body.t === 'react') {
           if (known.has(m.from) && validMsgId(body.id) && validReaction(body.e) && (await messagesDb.react(m.from, body.id, m.from, body.e))) changedPeers.add(m.from);
           return;
@@ -939,6 +1065,7 @@
         } else {
           return; // невідомий тип (новіша версія) — пропустити
         }
+        if (body.t !== 'hello') noteDelivered(m.from, validMsgId(body.id) ? body.id : undefined);
         if (current?.identity !== m.from) unread[m.from] = (unread[m.from] ?? 0) + 1;
       });
     } catch (e) {
@@ -947,6 +1074,7 @@
     if ([...changedPeers].some((k) => k.startsWith('g:'))) await refreshGroups();
     if (changedPeers.has('contacts')) await refreshContacts();
     if (chatKey && changedPeers.has(chatKey)) await reloadThread();
+    flushAcks();
     // Новий контакт привітався — надіслати йому моє фото.
     if (newcomers.length) sendProfile(newcomers);
     if (!delivered) return;
@@ -1062,6 +1190,7 @@
     const onVisible = async () => {
       if (document.visibilityState !== 'visible') return;
       poll();
+      markRead();
       const reg = await navigator.serviceWorker?.getRegistration();
       (await reg?.getNotifications())?.forEach((n) => n.close());
     };
@@ -1078,6 +1207,12 @@
         if (!me) regMode = await registrationMode();
         myName = (await kv.get<string>('myName')) ?? '';
         myAvatar = (await kv.get<string>('myAvatar')) ?? '';
+        readReceipts = (await kv.get<boolean>('readReceipts')) ?? true;
+        await messagesDb.failStuck();
+        if (!(await kv.get<boolean>('receiptsInit'))) {
+          await messagesDb.markAllSeen();
+          await kv.set('receiptsInit', true);
+        }
         await refreshContacts();
         await refreshGroups();
         await refreshChannels();
@@ -1347,7 +1482,10 @@
                   {/each}
                 </div>
               {/if}
-              <div class="time">{new Date(m.at).toLocaleTimeString('uk', { hour: '2-digit', minute: '2-digit' })}</div>
+              <div class="time">
+                {new Date(m.at).toLocaleTimeString('uk', { hour: '2-digit', minute: '2-digit' })}
+                {#if tickOf(m)}{@const t = tickOf(m)!}<Ticks state={t.state} title={t.title} onretry={() => retry(m)} />{/if}
+              </div>
             </div>
           {:else}
             <p class="muted center-text">Повідомлень ще немає. Усе, що ви напишете, шифрується на пристрої — сервер бачить лише шифротекст.</p>
@@ -1367,6 +1505,9 @@
               <span class="muted small">Повідомлення:</span>
             {/if}
             <span class="spacer"></span>
+            {#if selected.status === 'failed'}
+              <button class="primary" onclick={() => retry(selected!)}>Надіслати ще раз</button>
+            {/if}
             <button onclick={() => deleteMessage(selected!, false)} disabled={busy}>Видалити в мене</button>
             {#if selected.out && selected.mid}
               <button class="danger" onclick={() => deleteMessage(selected!, true)} disabled={busy}>Видалити у всіх</button>
@@ -1595,6 +1736,14 @@
               <span class="muted small">Цей браузер не підтримує сповіщення.</span>
             {/if}
           </div>
+          <label class="field check">
+            <span class="label">Переглянуто</span>
+            <span class="row">
+              <input type="checkbox" checked={readReceipts} onchange={(e) => setReadReceipts(e.currentTarget.checked)} />
+              Повідомляти, що я переглянув повідомлення
+            </span>
+            <span class="small muted">Якщо вимкнути, ти теж не бачитимеш, чи переглянули твої. «Доставлено» працює завжди.</span>
+          </label>
           <div class="field">
             <span class="label">Дзвінки</span>
             <button onclick={runCallTest}>Перевірити дзвінки</button>

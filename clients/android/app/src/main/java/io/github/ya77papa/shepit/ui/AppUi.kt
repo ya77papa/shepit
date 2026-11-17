@@ -536,6 +536,38 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
     suspend fun reload() {
         messages = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { repo.db.messages(peer) }
         if (messages.isNotEmpty()) list.scrollToItem(messages.size - 1)
+        if (repo.visibleChat == peer) repo.markRead(peer)
+    }
+    // Бесіда «переглянута», лише коли застосунок на екрані й не заблокований.
+    val locked by app.lock.locked.collectAsState()
+    val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
+    val resumed by lifecycle.currentStateFlow.collectAsState()
+    val onScreen = resumed.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED) && !locked
+    LaunchedEffect(peer, onScreen) {
+        if (onScreen) { repo.visibleChat = peer; runCatching { repo.markRead(peer) } }
+        else if (repo.visibleChat == peer) repo.visibleChat = null
+    }
+    DisposableEffect(peer) { onDispose { if (repo.visibleChat == peer) repo.visibleChat = null } }
+    val readReceipts = remember { repo.readReceipts }
+    fun tickOf(m: Message): Pair<String, String>? {
+        if (!m.out || m.kind == "call") return null
+        if (m.status == "sending") return "sending" to "Надсилається"
+        if (m.status == "failed") return "failed" to "Не надіслано. Натисни, щоб повторити"
+        val others = if (group != null) group.members.map { it.id }.filter { it != myId } else listOf(peer)
+        if (others.isEmpty()) return "sent" to "Надіслано"
+        val dlv = m.dlv + m.rd
+        val nd = others.count { it in dlv }
+        val nr = others.count { it in m.rd }
+        val detail = if (group != null) " (доставлено $nd з ${others.size}${if (readReceipts) ", переглянуто $nr" else ""})" else ""
+        return when {
+            readReceipts && nr == others.size -> "read" to "Переглянуто$detail"
+            nd == others.size -> "delivered" to "Доставлено$detail"
+            else -> "sent" to (if (group != null) "Надіслано" else "На сервері, ще не доставлено") + detail
+        }
+    }
+    fun retry(m: Message) = scope.launch {
+        runCatching { repo.retry(m) }.onSuccess { failed -> if (failed > 0) toast("Не вдалося доставити $failed учасникам — спробуй пізніше") }
+            .onFailure { toast(it.message ?: "Помилка") }
     }
     LaunchedEffect(peer) {
         reload()
@@ -595,7 +627,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
         }
         LazyColumn(Modifier.weight(1f).padding(horizontal = 12.dp), state = list) {
             items(messages, key = { it.id }) { m ->
-                Bubble(m, playing == m.id, sender = if (group != null && !m.out && m.kind != "call") displayName(app, contacts, group, m.sender) else null, myId = myId, onReact = { e -> react(m, e) }, onLongPress = { actionsFor = m }, onOpen = { viewing = m }) {
+                Bubble(m, playing == m.id, sender = if (group != null && !m.out && m.kind != "call") displayName(app, contacts, group, m.sender) else null, myId = myId, onReact = { e -> react(m, e) }, onLongPress = { actionsFor = m }, onOpen = { viewing = m }, tick = tickOf(m), onRetry = { retry(m) }) {
                     VoicePlayer.toggle(ctx, m.id, m.voice ?: return@Bubble, m.voiceMime) { playing = VoicePlayer.playingId }
                     playing = VoicePlayer.playingId
                 }
@@ -666,6 +698,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
             },
             confirmButton = {
                 Column(horizontalAlignment = Alignment.End) {
+                    if (m.out && m.status == "failed") TextButton(onClick = { actionsFor = null; retry(m) }) { Text("Надіслати ще раз") }
                     if (m.out && m.mid != null) TextButton(onClick = { actionsFor = null; runOp { repo.deleteMessage(m, everywhere = true) } }) { Text("Видалити у всіх", color = Danger) }
                     TextButton(onClick = { actionsFor = null; runOp { repo.deleteMessage(m, everywhere = false) } }) { Text("Видалити в мене") }
                     if (m.kind == "text") TextButton(onClick = {
@@ -721,7 +754,8 @@ private val timeFmt = SimpleDateFormat("HH:mm", Locale("uk"))
 @Composable
 private fun Bubble(
     m: Message, playing: Boolean, sender: String? = null, myId: String? = null,
-    onReact: (String) -> Unit = {}, onLongPress: () -> Unit, onOpen: () -> Unit = {}, onPlay: () -> Unit,
+    onReact: (String) -> Unit = {}, onLongPress: () -> Unit, onOpen: () -> Unit = {},
+    tick: Pair<String, String>? = null, onRetry: () -> Unit = {}, onPlay: () -> Unit,
 ) {
     val system = m.kind == "call"
     Column(
@@ -772,8 +806,25 @@ private fun Bubble(
                 }
             }
         }
-        Text(timeFmt.format(Date(m.at)), color = Muted, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 6.dp))
+        Row(Modifier.padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(timeFmt.format(Date(m.at)), color = Muted, fontSize = 11.sp)
+            if (tick != null) Ticks(tick.first, tick.second, onRetry)
+        }
     }
+}
+
+/** Галочки (варіант A): годинник — надсилається, одна — на сервері, дві — доставлено, дві кольорові — переглянуто. */
+@Composable
+private fun Ticks(state: String, title: String, onRetry: () -> Unit) {
+    val (icon, tint) = when (state) {
+        "sending" -> Icons.Default.Schedule to Muted
+        "failed" -> Icons.Default.ErrorOutline to Danger
+        "read" -> Icons.Default.DoneAll to Accent
+        "delivered" -> Icons.Default.DoneAll to Muted
+        else -> Icons.Default.Done to Muted
+    }
+    val mod = Modifier.padding(start = 3.dp).size(15.dp)
+    Icon(icon, title, tint = tint, modifier = if (state == "failed") mod.clickable(onClick = onRetry) else mod)
 }
 
 /** Фото на весь екран: масштаб пальцями, «Зберегти» — у файл, який обере користувач. */
@@ -931,6 +982,14 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
                             FilterChip(selected = delayMs == ms, onClick = { lock.delayMs = ms; delayMs = ms }, label = { Text(label) })
                         }
                     }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Повідомляти про перегляд")
+                        Text("Якщо вимкнути, ти теж не бачитимеш, чи переглянули твої. «Доставлено» працює завжди.", color = Muted, fontSize = 12.sp)
+                    }
+                    var rr by remember { mutableStateOf(app.repo.readReceipts) }
+                    Switch(checked = rr, onCheckedChange = { app.repo.readReceipts = it; rr = it })
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {

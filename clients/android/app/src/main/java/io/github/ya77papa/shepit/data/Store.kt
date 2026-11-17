@@ -81,15 +81,25 @@ data class Message(
     val sender: String? = null,
     /** Реакції: ідентичність → емодзі (одна на людину). */
     val reactions: Map<String, String> = emptyMap(),
+    /** Вихідне: sending | sent | failed (старі — null, вважаємо «на сервері»). */
+    val status: String? = null,
+    /** Вихідне: хто підтвердив доставку / переглянув. */
+    val dlv: Set<String> = emptySet(),
+    val rd: Set<String> = emptySet(),
+    /** Вхідне: я вже переглянув. */
+    val seen: Boolean = false,
 )
 
+private const val COLS = "id, peer, out, text, at, kind, voice_mime, voice_dur, voice, mid, sender, reactions, status, dlv, rd, seen"
+
 /** Контакти, історія, дрібні налаштування — локальна SQLite у приватній теці застосунку. */
-class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 4) {
+class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 5) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE contacts(identity TEXT PRIMARY KEY, name TEXT NOT NULL, fingerprint TEXT NOT NULL, avatar TEXT)")
         db.execSQL(
             "CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT, peer TEXT NOT NULL, out INTEGER NOT NULL, " +
-                "text TEXT NOT NULL, at INTEGER NOT NULL, kind TEXT NOT NULL, voice_mime TEXT, voice_dur INTEGER, voice BLOB, mid TEXT, sender TEXT, reactions TEXT)",
+                "text TEXT NOT NULL, at INTEGER NOT NULL, kind TEXT NOT NULL, voice_mime TEXT, voice_dur INTEGER, voice BLOB, mid TEXT, sender TEXT, reactions TEXT, " +
+                "status TEXT, dlv TEXT, rd TEXT, seen INTEGER NOT NULL DEFAULT 0)",
         )
         db.execSQL("CREATE INDEX messages_peer ON messages(peer, id)")
         db.execSQL("CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT)")
@@ -110,6 +120,13 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 4) {
             createV3(db)
         }
         if (oldVersion < 4) db.execSQL("ALTER TABLE messages ADD COLUMN reactions TEXT")
+        if (oldVersion < 5) {
+            db.execSQL("ALTER TABLE messages ADD COLUMN status TEXT")
+            db.execSQL("ALTER TABLE messages ADD COLUMN dlv TEXT")
+            db.execSQL("ALTER TABLE messages ADD COLUMN rd TEXT")
+            // Стара історія вважається переглянутою — не розсилати підтвердження за минуле.
+            db.execSQL("ALTER TABLE messages ADD COLUMN seen INTEGER NOT NULL DEFAULT 1")
+        }
     }
 
     fun contacts(): List<Contact> = readableDatabase.rawQuery(
@@ -123,17 +140,60 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 4) {
     }
 
     fun messages(peer: String): List<Message> = readableDatabase.rawQuery(
-        "SELECT id, peer, out, text, at, kind, voice_mime, voice_dur, voice, mid, sender, reactions FROM messages WHERE peer = ? ORDER BY id", arrayOf(peer),
+        "SELECT $COLS FROM messages WHERE peer = ? ORDER BY id", arrayOf(peer),
     ).use { c -> generateSequence { if (c.moveToNext()) row(c) else null }.toList() }
 
     fun allMessages(): List<Message> = readableDatabase.rawQuery(
-        "SELECT id, peer, out, text, at, kind, voice_mime, voice_dur, voice, mid, sender, reactions FROM messages ORDER BY id", null,
+        "SELECT $COLS FROM messages ORDER BY id", null,
     ).use { c -> generateSequence { if (c.moveToNext()) row(c) else null }.toList() }
 
     private fun row(c: android.database.Cursor) = Message(
         c.getLong(0), c.getString(1), c.getInt(2) == 1, c.getString(3), c.getLong(4), c.getString(5),
         c.getString(6), c.getLong(7), if (c.isNull(8)) null else c.getBlob(8), c.getString(9), c.getString(10), parseReactions(c.getString(11)),
+        c.getString(12), ids(c.getString(13)), ids(c.getString(14)), c.getInt(15) != 0,
     )
+
+    private fun ids(s: String?): Set<String> = s?.split(' ')?.filter { it.isNotEmpty() }?.toSet() ?: emptySet()
+
+    fun setStatus(id: Long, status: String) {
+        writableDatabase.update("messages", ContentValues().apply { put("status", status) }, "id = ?", arrayOf(id.toString()))
+    }
+
+    /** who підтвердив доставку (і перегляд, якщо read) моїх повідомлень з mids у бесіді peer. */
+    fun receipt(peer: String, mids: List<String>, who: String, read: Boolean): Boolean {
+        if (mids.isEmpty()) return false
+        val marks = mids.joinToString(",") { "?" }
+        val rows = readableDatabase.rawQuery(
+            "SELECT id, dlv, rd FROM messages WHERE peer = ? AND out = 1 AND mid IN ($marks)", arrayOf(peer, *mids.toTypedArray()),
+        ).use { c -> generateSequence { if (c.moveToNext()) Triple(c.getLong(0), ids(c.getString(1)), ids(c.getString(2))) else null }.toList() }
+        var changed = false
+        for ((id, dlv, rd) in rows) {
+            val d = dlv + who
+            val r = if (read) rd + who else rd
+            if (d == dlv && r == rd) continue
+            writableDatabase.update("messages", ContentValues().apply {
+                put("dlv", d.joinToString(" ")); put("rd", r.joinToString(" ")); put("status", "sent")
+            }, "id = ?", arrayOf(id.toString()))
+            changed = true
+        }
+        return changed
+    }
+
+    /** Вхідні з id, які я ще не переглянув, — (відправник, mid); і позначити переглянутими. */
+    fun takeUnseen(peer: String): List<Pair<String?, String>> {
+        val rows = readableDatabase.rawQuery(
+            "SELECT id, sender, mid FROM messages WHERE peer = ? AND out = 0 AND seen = 0 AND mid IS NOT NULL AND kind != 'call'", arrayOf(peer),
+        ).use { c -> generateSequence { if (c.moveToNext()) Triple(c.getLong(0), c.getString(1), c.getString(2)) else null }.toList() }
+        if (rows.isNotEmpty()) writableDatabase.execSQL(
+            "UPDATE messages SET seen = 1 WHERE id IN (${rows.joinToString(",") { it.first.toString() }})",
+        )
+        return rows.map { it.second to it.third }
+    }
+
+    /** Після перезапуску: те, що «надсилалось», не надіслалось. */
+    fun failStuck() {
+        writableDatabase.execSQL("UPDATE messages SET status = 'failed' WHERE status = 'sending'")
+    }
 
     private fun parseReactions(s: String?): Map<String, String> = runCatching {
         val o = org.json.JSONObject(s!!)
@@ -154,6 +214,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 4) {
         put("peer", m.peer); put("out", if (m.out) 1 else 0); put("text", m.text); put("at", m.at); put("kind", m.kind)
         put("voice_mime", m.voiceMime); put("voice_dur", m.voiceDur); put("voice", m.voice); put("mid", m.mid); put("sender", m.sender)
         if (m.reactions.isNotEmpty()) put("reactions", org.json.JSONObject(m.reactions as Map<*, *>).toString())
+        put("status", m.status); put("dlv", m.dlv.joinToString(" ")); put("rd", m.rd.joinToString(" ")); put("seen", if (m.seen) 1 else 0)
     })
 
     fun deleteMessage(id: Long) {

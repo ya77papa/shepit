@@ -96,7 +96,8 @@ export async function importBackup(file: File, password: string): Promise<void> 
   for (const c of p.channels ?? []) await channelsDb.put(c);
   for (const c of p.contacts) await contactsDb.put(c);
   for (const { id: _id, voice, image, ...m } of p.messages) {
-    const msg: Message = { ...m };
+    // Відновлена історія — вже переглянута: підтвердження за минуле не розсилаємо.
+    const msg: Message = { ...m, seen: true, ...(m.status === 'sending' ? { status: 'failed' as const } : {}) };
     if (voice) msg.voice = { blob: new Blob([unb64(voice.data)], { type: voice.mime }), mime: voice.mime, dur: voice.dur, ptt: voice.ptt };
     if (image) msg.image = { blob: new Blob([unb64(image.data)], { type: image.mime }), mime: image.mime, w: image.w, h: image.h };
     await messagesDb.add(msg);
