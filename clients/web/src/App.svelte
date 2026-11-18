@@ -1451,17 +1451,16 @@
               <button class="chat-item" class:active={current?.identity === c.identity} onclick={() => openThread(c)}>
                 <!-- svelte-ignore a11y_click_events_have_key_events -->
                 <span class="avatar-btn" role="button" tabindex="-1" title="Переглянути фото" onclick={(e) => { e.stopPropagation(); bigAvatar = { name: c.name, src: c.avatar }; }}>
-                  <Avatar name={c.name} src={c.avatar} size={36} online={isOnline(c.identity)} />
+                  <Avatar name={c.name} src={c.avatar} size={36} online={isOnline(c.identity)} unread={unread[c.identity] ?? 0} ring="var(--panel)" />
                 </span>
                 <span class="item-text">
                   <span class="name">{c.name}</span>
                   {#if presence[c.identity]}
-                    <span class="sub" class:online-text={presence[c.identity]?.on}>{presenceText(presence[c.identity], presenceNow)}</span>
+                    <span class="sub presence" class:online-text={presence[c.identity]?.on}>{presenceText(presence[c.identity], presenceNow)}</span>
                   {:else}
                     <span class="sub">{short(c.fingerprint)}…</span>
                   {/if}
                 </span>
-                {#if unread[c.identity]}<span class="badge">{unread[c.identity]}</span>{/if}
               </button>
             </li>
           {/each}
@@ -1479,13 +1478,12 @@
               <button class="chat-item" class:active={group?.id === g.id} onclick={() => openGroup(g)}>
                 <!-- svelte-ignore a11y_click_events_have_key_events -->
                 <span class="avatar-btn" role="button" tabindex="-1" title="Переглянути фото" onclick={(e) => { e.stopPropagation(); bigAvatar = { name: g.name, src: g.avatar }; }}>
-                  <Avatar name={g.name} src={g.avatar} size={36} />
+                  <Avatar name={g.name} src={g.avatar} size={36} unread={unread[`g:${g.id}`] ?? 0} ring="var(--panel)" />
                 </span>
                 <span class="item-text">
                   <span class="name">{g.name}</span>
                   <span class="sub">{g.left ? 'ти не в групі' : `${g.members.length} учасн.`}</span>
                 </span>
-                {#if unread[`g:${g.id}`]}<span class="badge">{unread[`g:${g.id}`]}</span>{/if}
               </button>
             </li>
           {:else}
@@ -1506,12 +1504,11 @@
           {#each channels as c (c.id)}
             <li>
               <button class="chat-item" class:active={channel?.id === c.id} onclick={() => openChannel(c)}>
-                <Avatar name={c.name} src={c.avatar} size={36} />
+                <Avatar name={c.name} src={c.avatar} size={36} unread={channel?.id !== c.id ? Math.max(0, c.lastSeq - c.readSeq) : 0} ring="var(--panel)" />
                 <span class="item-text">
                   <span class="name">{c.name}</span>
                   <span class="sub">{c.priv ? 'мій канал' : c.public ? 'публічний' : 'зашифрований'}</span>
                 </span>
-                {#if c.lastSeq > c.readSeq && channel?.id !== c.id}<span class="badge">•</span>{/if}
               </button>
             </li>
           {:else}

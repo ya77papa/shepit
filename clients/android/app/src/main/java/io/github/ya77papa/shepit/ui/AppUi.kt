@@ -327,6 +327,13 @@ private fun ContactsScreen(
     val groups by repo.groups.collectAsState()
     val channels by repo.channels.collectAsState()
     val presence by app.repo.presence.collectAsState()
+    // Непрочитане — з бази; оновлюється з кожною зміною в бесідах.
+    var unread by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
+    LaunchedEffect(Unit) {
+        suspend fun load() { unread = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { app.repo.db.unreadCounts() } }
+        load()
+        app.repo.changed.collect { load() }
+    }
     var bigAvatar by remember { mutableStateOf<Pair<String, String?>?>(null) }
     bigAvatar?.let { (n, a) -> AvatarViewer(n, a) { bigAvatar = null } }
     var menu by remember { mutableStateOf(false) }
@@ -384,7 +391,7 @@ private fun ContactsScreen(
                 items(contacts, key = { it.identity }) { c ->
                     val p = presence[c.identity]
                     ListItem(
-                        leadingContent = { Box(Modifier.clip(CircleShape).clickable { bigAvatar = c.name to c.avatar }) { AvatarView(c.name, c.avatar, 44.dp, online = p?.on == true) } },
+                        leadingContent = { AvatarView(c.name, c.avatar, 44.dp, online = p?.on == true, unread = unread[c.identity] ?: 0) { bigAvatar = c.name to c.avatar } },
                         headlineContent = { Text(c.name, fontWeight = FontWeight.SemiBold) },
                         supportingContent = {
                             val st = io.github.ya77papa.shepit.data.PresenceText.of(p)
@@ -398,7 +405,7 @@ private fun ContactsScreen(
                 if (groups.isNotEmpty()) item { SectionLabel("Групи") }
                 items(groups, key = { "g:" + it.id }) { g ->
                     ListItem(
-                        leadingContent = { Box(Modifier.clip(CircleShape).clickable { bigAvatar = g.name to g.avatar }) { AvatarView(g.name, g.avatar, 44.dp) } },
+                        leadingContent = { AvatarView(g.name, g.avatar, 44.dp, unread = unread["g:" + g.id] ?: 0) { bigAvatar = g.name to g.avatar } },
                         headlineContent = { Text(g.name, fontWeight = FontWeight.SemiBold) },
                         supportingContent = { Text(if (g.left) "ти не в групі" else "${g.members.size} учасн.", fontSize = 12.sp, color = Muted) },
                         modifier = Modifier.clickable { onOpen("g:${g.id}") },
@@ -408,10 +415,9 @@ private fun ContactsScreen(
                 if (channels.isNotEmpty()) item { SectionLabel("Канали") }
                 items(channels, key = { "c:" + it.id }) { c ->
                     ListItem(
-                        leadingContent = { AvatarView(c.name, c.avatar, 44.dp) },
+                        leadingContent = { AvatarView(c.name, c.avatar, 44.dp, unread = (c.lastSeq - c.readSeq).coerceIn(0, 1000).toInt()) },
                         headlineContent = { Text(c.name, fontWeight = FontWeight.SemiBold) },
                         supportingContent = { Text(if (c.mine) "мій канал" else if (c.public) "публічний" else "зашифрований", fontSize = 12.sp, color = Muted) },
-                        trailingContent = { if (c.lastSeq > c.readSeq) Box(Modifier.size(10.dp).clip(CircleShape).background(Accent)) },
                         modifier = Modifier.clickable { onChannel(c) },
                         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                     )
@@ -617,7 +623,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     // Аватар — переглянути великим; ім'я — перейменувати (у групі — учасники).
                     val pres = if (isGroup) null else presence[peer]
-                    Box(Modifier.clip(CircleShape).clickable { showAvatar = true }) { AvatarView(title, group?.avatar ?: contact?.avatar, 36.dp, online = pres?.on == true) }
+                    AvatarView(title, group?.avatar ?: contact?.avatar, 36.dp, online = pres?.on == true, ring = MaterialTheme.colorScheme.surface) { showAvatar = true }
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.clickable { if (isGroup) onGroupInfo() else rename = true }) {
                         Text(title, fontWeight = FontWeight.Bold, maxLines = 1)

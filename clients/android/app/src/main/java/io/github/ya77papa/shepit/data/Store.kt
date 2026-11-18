@@ -187,11 +187,15 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 6) {
         val rows = readableDatabase.rawQuery(
             "SELECT id, sender, mid FROM messages WHERE peer = ? AND out = 0 AND seen = 0 AND mid IS NOT NULL AND kind != 'call'", arrayOf(peer),
         ).use { c -> generateSequence { if (c.moveToNext()) Triple(c.getLong(0), c.getString(1), c.getString(2)) else null }.toList() }
-        if (rows.isNotEmpty()) writableDatabase.execSQL(
-            "UPDATE messages SET seen = 1 WHERE id IN (${rows.joinToString(",") { it.first.toString() }})",
-        )
+        // Переглянуте — усе вхідне в бесіді (і без id: привітання, дзвінки), щоб лічильник обнулився.
+        writableDatabase.execSQL("UPDATE messages SET seen = 1 WHERE peer = ? AND out = 0 AND seen = 0", arrayOf(peer))
         return rows.map { it.second to it.third }
     }
+
+    /** Непрочитане: бесіда → кількість вхідних, яких я ще не бачив (без дзвінків). */
+    fun unreadCounts(): Map<String, Int> = readableDatabase.rawQuery(
+        "SELECT peer, COUNT(*) FROM messages WHERE out = 0 AND seen = 0 AND kind != 'call' GROUP BY peer", null,
+    ).use { c -> generateSequence { if (c.moveToNext()) c.getString(0) to c.getInt(1) else null }.toMap() }
 
     /** Після перезапуску: те, що «надсилалось», не надіслалось. */
     fun failStuck() {

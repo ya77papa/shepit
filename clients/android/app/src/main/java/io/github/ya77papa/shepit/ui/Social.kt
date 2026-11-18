@@ -66,16 +66,35 @@ private val avatarPalette = listOf(0xFF5B8DEF, 0xFFE0884B, 0xFF4BB38A, 0xFFB46BD
 
 /** Фото (JPEG base64) або кольорове коло з ініціалами — як у веб-версії. */
 @Composable
-fun AvatarView(name: String, b64: String?, size: Dp = 40.dp, online: Boolean = false) {
-    if (online) {
-        // Зелена кулька — людина зараз у застосунку.
+fun AvatarView(
+    name: String, b64: String?, size: Dp = 40.dp, online: Boolean = false, unread: Int = 0,
+    ring: Color = MaterialTheme.colorScheme.background, onClick: (() -> Unit)? = null,
+) {
+    if (online || unread > 0 || onClick != null) {
+        // Кулька й лічильник — поверх кола, тому клік обрізаємо лише по самому колу, не по них.
         Box(Modifier.size(size)) {
-            AvatarView(name, b64, size)
-            val d = maxOf(10.dp, size * 0.28f)
-            Box(
-                Modifier.align(Alignment.BottomEnd).size(d).clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.background).padding(2.dp).clip(CircleShape).background(OnlineGreen),
-            )
+            Box(Modifier.size(size).clip(CircleShape).then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)) {
+                AvatarView(name, b64, size)
+            }
+            if (online) {
+                // Зелена кулька — людина зараз у застосунку; обідок кольору тла відділяє її від фото.
+                val d = maxOf(12.dp, size * 0.3f)
+                Box(
+                    Modifier.align(Alignment.BottomEnd).offset(x = 2.dp, y = 2.dp).size(d)
+                        .background(ring, CircleShape).padding(2.5.dp).background(OnlineGreen, CircleShape),
+                )
+            }
+            if (unread > 0) {
+                Box(
+                    Modifier.align(Alignment.TopEnd).offset(x = 6.dp, y = (-4).dp)
+                        .background(ring, RoundedCornerShape(50)).padding(2.dp)
+                        .background(Accent, RoundedCornerShape(50)).defaultMinSize(minWidth = 18.dp, minHeight = 18.dp)
+                        .padding(horizontal = 4.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(if (unread > 99) "99+" else unread.toString(), color = Color(0xFF1B1B1B), fontSize = 11.sp, fontWeight = FontWeight.Bold, lineHeight = 11.sp)
+                }
+            }
         }
         return
     }
