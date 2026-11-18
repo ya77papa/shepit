@@ -415,7 +415,7 @@ private fun ContactsScreen(
                 if (channels.isNotEmpty()) item { SectionLabel("Канали") }
                 items(channels, key = { "c:" + it.id }) { c ->
                     ListItem(
-                        leadingContent = { AvatarView(c.name, c.avatar, 44.dp, unread = (c.lastSeq - c.readSeq).coerceIn(0, 1000).toInt()) },
+                        leadingContent = { AvatarView(c.name, c.avatar, 44.dp, unread = if (c.mine) 0 else (c.lastSeq - c.readSeq).coerceIn(0, 1000).toInt()) },
                         headlineContent = { Text(c.name, fontWeight = FontWeight.SemiBold) },
                         supportingContent = { Text(if (c.mine) "мій канал" else if (c.public) "публічний" else "зашифрований", fontSize = 12.sp, color = Muted) },
                         modifier = Modifier.clickable { onChannel(c) },

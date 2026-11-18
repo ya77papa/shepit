@@ -15,6 +15,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.*
 import androidx.core.content.ContextCompat
+import io.github.ya77papa.shepit.BuildConfig
 import io.github.ya77papa.shepit.ShepitApp
 import io.github.ya77papa.shepit.service.ShepitService
 import kotlinx.coroutines.launch
@@ -99,6 +100,7 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         app.lock.onForeground()
         applySecureFlag()
+        if (app.repo.hasAccount()) promptUpdate()
     }
 
     override fun onStop() {
@@ -133,7 +135,30 @@ class MainActivity : ComponentActivity() {
             notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
         app.repo.scope.launch { runCatching { app.repo.load(); app.repo.receive() } }
-        app.repo.scope.launch { runCatching { app.updater.checkIfDue() } }
+        promptUpdate()
+    }
+
+    /**
+     * Є нова версія — показати той самий діалог, що й «Перевірити оновлення» в налаштуваннях.
+     * Не частіше ніж раз на добу для тієї самої версії (щоб «Пізніше» не набридало); вимкнене
+     * автооновлення в налаштуваннях вимикає й це.
+     */
+    private fun promptUpdate() {
+        app.repo.scope.launch {
+            val rel = runCatching { app.updater.checkIfDue() }.getOrNull() ?: return@launch
+            if (rel.versionCode <= BuildConfig.VERSION_CODE) return@launch
+            val db = app.repo.db
+            val (code, at) = (db.get("update_prompted") ?: "0:0").split(':').let { (it.getOrNull(0)?.toIntOrNull() ?: 0) to (it.getOrNull(1)?.toLongOrNull() ?: 0L) }
+            val now = System.currentTimeMillis()
+            if (code == rel.versionCode && now - at < 24 * 3600_000L) return@launch
+            runOnUiThread {
+                // Заблоковано PIN-кодом чи вже згорнули — покажемо наступного разу.
+                if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED) && !app.lock.locked.value) {
+                    db.set("update_prompted", "${rel.versionCode}:$now")
+                    showUpdate.value = true
+                }
+            }
+        }
     }
 
     fun hasMic() = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED

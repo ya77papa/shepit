@@ -392,7 +392,8 @@ class Repo(context: Context) {
     suspend fun checkChannels() = withContext(Dispatchers.IO) {
         for (c in db.channels()) {
             val last = api.channels.lastSeq(c.id) ?: continue
-            if (last != c.lastSeq) db.putChannel(c.copy(lastSeq = last))
+            // Мій канал — пишу в нього лише я, тож свої дописи не «нові».
+            if (last != c.lastSeq || (c.mine && c.readSeq != last)) db.putChannel(c.copy(lastSeq = last, readSeq = if (c.mine) last else c.readSeq))
         }
         refreshChannels()
     }
