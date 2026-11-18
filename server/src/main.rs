@@ -31,6 +31,7 @@
 mod admin;
 mod channels;
 mod db;
+mod presence;
 #[cfg(feature = "push")]
 mod push;
 
@@ -73,6 +74,8 @@ struct App {
     started: u64,
     /// Кому вже позначено активність сьогодні (щоб не писати в базу на кожен запит).
     seen: Mutex<HashMap<String, u64>>,
+    /// «В мережі» / «востаннє…» — лише в пам'яті.
+    presence: presence::Presence,
 }
 
 const INVITE_HEADER: &str = "x-shepit-invite";
@@ -238,6 +241,42 @@ struct MyInvite {
 }
 
 /// Код запрошення для мого посилання: чинний (ще не використаний) або новий у межах ліміту.
+#[derive(serde::Deserialize)]
+struct Beat {
+    online: bool,
+    #[serde(default = "yes")]
+    share: bool,
+}
+fn yes() -> bool {
+    true
+}
+
+/// «Я тут» (застосунок на екрані) або «згорнув». Клієнт шле раз на хвилину, поки відкритий.
+async fn presence_beat(State(app): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<StatusCode, Refusal> {
+    let who = authenticate(&app, &headers, "POST /v0/presence", &body).map_err(|s| (s, ""))?;
+    app.require_account(&who)?;
+    let b: Beat = serde_json::from_slice(&body).map_err(|_| (StatusCode::BAD_REQUEST, ""))?;
+    app.touch(&who);
+    app.presence.beat(&who, b.online, b.share, now_ms());
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct PresenceQuery {
+    ids: Vec<String>,
+}
+
+/// Статуси співрозмовників (до 200 за раз).
+async fn presence_query(State(app): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Json<HashMap<String, presence::Status>>, Refusal> {
+    let who = authenticate(&app, &headers, "POST /v0/presence/query", &body).map_err(|s| (s, ""))?;
+    app.require_account(&who)?;
+    let q: PresenceQuery = serde_json::from_slice(&body).map_err(|_| (StatusCode::BAD_REQUEST, ""))?;
+    if q.ids.len() > 200 {
+        return Err((StatusCode::BAD_REQUEST, ""));
+    }
+    Ok(Json(app.presence.query(&who, &q.ids, now_ms())))
+}
+
 async fn my_invite(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<MyInvite>, Refusal> {
     let who = authenticate(&app, &headers, "POST /v0/invites/mine", b"").map_err(|s| (s, ""))?;
     app.require_account(&who)?;
@@ -539,6 +578,7 @@ fn app(issuer: Issuer, db: db::Db, shutdown: tokio::sync::watch::Receiver<bool>)
         admin: admin::Admin::default(),
         started: now_ms(),
         seen: Mutex::default(),
+        presence: Default::default(),
     });
     // Раз на годину прибирати недоставлені конверти (медіа — старші за 3 дні, решту — за 30).
     let pruner = shared.clone();
@@ -546,6 +586,7 @@ fn app(issuer: Issuer, db: db::Db, shutdown: tokio::sync::watch::Receiver<bool>)
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
             tick.tick().await;
+            pruner.presence.prune(now_ms());
             if let Ok(n @ 1..) = pruner.db.prune(now_ms()) {
                 println!("Прибрано старих конвертів: {n}");
             }
@@ -558,6 +599,8 @@ fn app(issuer: Issuer, db: db::Db, shutdown: tokio::sync::watch::Receiver<bool>)
         .route("/v0/keys/status", get(key_status))
         .route("/v0/keys/{identity}", get(get_keys))
         .route("/v0/certificate", get(certificate))
+        .route("/v0/presence", post(presence_beat))
+        .route("/v0/presence/query", post(presence_query))
         .route("/v0/send", post(send).layer(axum::extract::DefaultBodyLimit::max(MAX_SEND_BODY)))
         .route("/v0/mailbox/{id}", get(fetch))
         .route("/v0/mailbox/{id}/ack", post(ack))

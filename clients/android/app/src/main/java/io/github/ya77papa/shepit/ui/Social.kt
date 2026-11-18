@@ -66,7 +66,19 @@ private val avatarPalette = listOf(0xFF5B8DEF, 0xFFE0884B, 0xFF4BB38A, 0xFFB46BD
 
 /** Фото (JPEG base64) або кольорове коло з ініціалами — як у веб-версії. */
 @Composable
-fun AvatarView(name: String, b64: String?, size: Dp = 40.dp) {
+fun AvatarView(name: String, b64: String?, size: Dp = 40.dp, online: Boolean = false) {
+    if (online) {
+        // Зелена кулька — людина зараз у застосунку.
+        Box(Modifier.size(size)) {
+            AvatarView(name, b64, size)
+            val d = maxOf(10.dp, size * 0.28f)
+            Box(
+                Modifier.align(Alignment.BottomEnd).size(d).clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.background).padding(2.dp).clip(CircleShape).background(OnlineGreen),
+            )
+        }
+        return
+    }
     val bmp = remember(b64) {
         b64?.let { runCatching { Base64.decode(it, Base64.DEFAULT).let { b -> BitmapFactory.decodeByteArray(b, 0, b.size)?.asImageBitmap() } }.getOrNull() }
     }

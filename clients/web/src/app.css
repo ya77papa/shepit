@@ -195,3 +195,8 @@ input[type=range] { accent-color: var(--accent); border: 0; background: transpar
 .reply-bar { display: flex; align-items: center; gap: 8px; padding: 6px 10px 0; }
 .msg.flash .bubble { animation: flash 1.2s ease-out; }
 @keyframes flash { 0%, 30% { box-shadow: 0 0 0 3px var(--accent); } 100% { box-shadow: 0 0 0 0 transparent; } }
+
+/* В мережі */
+.online-text { color: #3fb950 !important; }
+.head-text { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; line-height: 1.2; }
+.head-text .small { font-size: 12px; padding-left: 6px; }

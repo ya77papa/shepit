@@ -82,6 +82,26 @@ export function onAccountChangedElsewhere(f: () => void) {
   if (tabs) tabs.onmessage = () => f();
 }
 
+export type Presence = { on?: boolean; at?: number; hidden?: boolean };
+
+/** Підпис під ім'ям: «в мережі», «востаннє 15 хв тому», «востаннє вчора о 21:40»… */
+export function presenceText(p: Presence | undefined, now = Date.now()): string {
+  if (!p) return '';
+  if (p.on) return 'в мережі';
+  if (p.hidden || !p.at) return 'востаннє нещодавно';
+  const min = Math.floor((now - p.at) / 60_000);
+  if (min < 1) return 'востаннє щойно';
+  if (min < 60) return `востаннє ${min} хв тому`;
+  const d = new Date(p.at);
+  const hm = d.toLocaleTimeString('uk', { hour: '2-digit', minute: '2-digit' });
+  const day = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round((day(new Date(now)) - day(d)) / 86_400_000);
+  if (days === 0) return `востаннє сьогодні о ${hm}`;
+  if (days === 1) return `востаннє вчора о ${hm}`;
+  const date = d.toLocaleDateString('uk', { day: 'numeric', month: 'long', ...(d.getFullYear() !== new Date(now).getFullYear() ? { year: 'numeric' } : {}) });
+  return `востаннє ${date}`;
+}
+
 export class Shepit {
   private constructor(private acc: WebAccount) {}
 
@@ -216,6 +236,29 @@ export class Shepit {
   /** Підпис запиту ключем акаунта (напр. для створення каналу). */
   signRequest(purpose: string, body: Uint8Array): string {
     return this.acc.authHeader(purpose, body);
+  }
+
+  /** «Я тут» (online) або «згорнув»; share — чи показувати іншим мій час. keepalive — щоб дійшло при закритті вкладки. */
+  async presenceBeat(online: boolean, share: boolean): Promise<void> {
+    const body = new TextEncoder().encode(JSON.stringify({ online, share }));
+    await fetch(`${API}/v0/presence`, {
+      method: 'POST', cache: 'no-store', keepalive: true,
+      headers: { [AUTH]: this.acc.authHeader('POST /v0/presence', body), 'content-type': 'application/json' },
+      body,
+    }).catch(() => {});
+  }
+
+  /** Статуси співрозмовників: on — в мережі; at — востаннє (мс); hidden — ховає час. Невідомих немає у відповіді. */
+  async presenceQuery(ids: string[]): Promise<Record<string, Presence>> {
+    if (!ids.length) return {};
+    const body = new TextEncoder().encode(JSON.stringify({ ids: ids.slice(0, 200) }));
+    const r = await fetch(`${API}/v0/presence/query`, {
+      method: 'POST', cache: 'no-store',
+      headers: { [AUTH]: this.acc.authHeader('POST /v0/presence/query', body), 'content-type': 'application/json' },
+      body,
+    });
+    if (!r.ok) return {}; // старий сервер — без статусів
+    return r.json();
   }
 
   /**

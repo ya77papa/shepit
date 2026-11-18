@@ -51,3 +51,6 @@ fun androidx.activity.ComponentActivity.darkSystemBars() {
         navigationBarStyle = androidx.activity.SystemBarStyle.dark(transparent),
     )
 }
+
+/** Зелена кулька «в мережі». */
+val OnlineGreen = androidx.compose.ui.graphics.Color(0xFF3FB950)

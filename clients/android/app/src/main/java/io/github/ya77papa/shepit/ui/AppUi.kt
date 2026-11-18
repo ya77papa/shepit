@@ -326,6 +326,7 @@ private fun ContactsScreen(
     val connected by repo.connected.collectAsState()
     val groups by repo.groups.collectAsState()
     val channels by repo.channels.collectAsState()
+    val presence by app.repo.presence.collectAsState()
     var bigAvatar by remember { mutableStateOf<Pair<String, String?>?>(null) }
     bigAvatar?.let { (n, a) -> AvatarViewer(n, a) { bigAvatar = null } }
     var menu by remember { mutableStateOf(false) }
@@ -381,10 +382,15 @@ private fun ContactsScreen(
             LazyColumn(Modifier.weight(1f)) {
                 if (contacts.isNotEmpty()) item { SectionLabel("Контакти") }
                 items(contacts, key = { it.identity }) { c ->
+                    val p = presence[c.identity]
                     ListItem(
-                        leadingContent = { Box(Modifier.clip(CircleShape).clickable { bigAvatar = c.name to c.avatar }) { AvatarView(c.name, c.avatar, 44.dp) } },
+                        leadingContent = { Box(Modifier.clip(CircleShape).clickable { bigAvatar = c.name to c.avatar }) { AvatarView(c.name, c.avatar, 44.dp, online = p?.on == true) } },
                         headlineContent = { Text(c.name, fontWeight = FontWeight.SemiBold) },
-                        supportingContent = { Text(repo.short(c.fingerprint) + "…", fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Muted) },
+                        supportingContent = {
+                            val st = io.github.ya77papa.shepit.data.PresenceText.of(p)
+                            if (st != null) Text(st, fontSize = 12.sp, color = if (p?.on == true) OnlineGreen else Muted)
+                            else Text(repo.short(c.fingerprint) + "…", fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Muted)
+                        },
                         modifier = Modifier.clickable { onOpen(c.identity) },
                         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                     )
@@ -492,6 +498,7 @@ private fun AddDialog(app: ShepitApp, onDone: (Contact?) -> Unit, toast: (String
 private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: () -> Unit, onGroupInfo: () -> Unit, toast: (String) -> Unit, initialDraft: String? = null) {
     val repo = app.repo
     val contacts by repo.contacts.collectAsState()
+    val presence by repo.presence.collectAsState()
     val groups by repo.groups.collectAsState()
     val group = groups.firstOrNull { "g:${it.id}" == peer }
     val isGroup = peer.startsWith("g:")
@@ -609,11 +616,13 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
             title = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     // Аватар — переглянути великим; ім'я — перейменувати (у групі — учасники).
-                    Box(Modifier.clip(CircleShape).clickable { showAvatar = true }) { AvatarView(title, group?.avatar ?: contact?.avatar, 36.dp) }
+                    val pres = if (isGroup) null else presence[peer]
+                    Box(Modifier.clip(CircleShape).clickable { showAvatar = true }) { AvatarView(title, group?.avatar ?: contact?.avatar, 36.dp, online = pres?.on == true) }
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.clickable { if (isGroup) onGroupInfo() else rename = true }) {
                         Text(title, fontWeight = FontWeight.Bold, maxLines = 1)
                         if (group != null) Text("${group.members.size} учасн.", fontSize = 12.sp, color = Muted)
+                        else io.github.ya77papa.shepit.data.PresenceText.of(pres)?.let { Text(it, fontSize = 12.sp, color = if (pres?.on == true) OnlineGreen else Muted) }
                     }
                 }
             },
@@ -656,7 +665,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
         LazyColumn(Modifier.weight(1f).padding(horizontal = 12.dp), state = list) {
             items(messages, key = { it.id }) { m ->
                 Bubble(m, playing == m.id, sender = if (group != null && !m.out && m.kind != "call") displayName(app, contacts, group, m.sender) else null, myId = myId, onReact = { e -> react(m, e) }, onLongPress = { actionsFor = m }, onOpen = { viewing = m }, tick = tickOf(m), onRetry = { retry(m) },
-                    quoteWho = m.re?.let { who(it.by) }, onQuote = { m.re?.let { jumpTo(it.id) } }, flash = flashId == m.id) {
+                    quoteWho = m.re?.let { who(it.by) }, onQuote = { m.re?.let { jumpTo(it.id) } }, flash = flashId == m.id, counts = group != null) {
                     VoicePlayer.toggle(ctx, m.id, m.voice ?: return@Bubble, m.voiceMime) { playing = VoicePlayer.playingId }
                     playing = VoicePlayer.playingId
                 }
@@ -794,7 +803,7 @@ private fun Bubble(
     m: Message, playing: Boolean, sender: String? = null, myId: String? = null,
     onReact: (String) -> Unit = {}, onLongPress: () -> Unit, onOpen: () -> Unit = {},
     tick: Pair<String, String>? = null, onRetry: () -> Unit = {},
-    quoteWho: String? = null, onQuote: () -> Unit = {}, flash: Boolean = false, onPlay: () -> Unit,
+    quoteWho: String? = null, onQuote: () -> Unit = {}, flash: Boolean = false, counts: Boolean = true, onPlay: () -> Unit,
 ) {
     val system = m.kind == "call"
     Column(
@@ -843,7 +852,7 @@ private fun Bubble(
                         color = if (mine) Accent.copy(alpha = 0.18f) else InBubble,
                         border = androidx.compose.foundation.BorderStroke(1.dp, if (mine) Accent else Color(0xFF243246)),
                         modifier = Modifier.clip(RoundedCornerShape(12.dp)).clickable { onReact(e) },
-                    ) { Text("$e ${who.size}", Modifier.padding(horizontal = 8.dp, vertical = 2.dp), fontSize = 13.sp) }
+                    ) { Text(if (counts) "$e ${who.size}" else e, Modifier.padding(horizontal = 8.dp, vertical = 2.dp), fontSize = 13.sp) }
                 }
             }
         }
@@ -1043,6 +1052,17 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
                     }
                     var rr by remember { mutableStateOf(app.repo.readReceipts) }
                     Switch(checked = rr, onCheckedChange = { app.repo.readReceipts = it; rr = it })
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Показувати, коли я в мережі")
+                        Text("Якщо вимкнути, інші бачитимуть лише «востаннє нещодавно», і ти так само не бачитимеш їхній час.", color = Muted, fontSize = 12.sp)
+                    }
+                    var sp by remember { mutableStateOf(app.repo.showPresence) }
+                    Switch(checked = sp, onCheckedChange = {
+                        app.repo.showPresence = it; sp = it
+                        app.repo.scope.launch { app.repo.presenceBeat(online = true); app.repo.refreshPresence() }
+                    })
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {

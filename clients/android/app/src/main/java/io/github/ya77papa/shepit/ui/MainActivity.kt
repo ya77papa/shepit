@@ -18,6 +18,8 @@ import androidx.core.content.ContextCompat
 import io.github.ya77papa.shepit.ShepitApp
 import io.github.ya77papa.shepit.service.ShepitService
 import kotlinx.coroutines.launch
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 
 class MainActivity : ComponentActivity() {
     private val app get() = application as ShepitApp
@@ -42,6 +44,19 @@ class MainActivity : ComponentActivity() {
         darkSystemBars()
         handleIntent(intent)
         applySecureFlag()
+        // Поки застосунок на екрані й розблокований: «я тут» раз на хвилину, статуси контактів — раз на 30 с.
+        lifecycleScope.launch {
+            repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.STARTED) {
+                var n = 0
+                while (true) {
+                    if (!app.lock.locked.value && app.repo.hasAccount() && runCatching { app.repo.load() }.getOrDefault(false)) {
+                        if (n++ % 2 == 0) app.repo.presenceBeat(online = true)
+                        app.repo.refreshPresence()
+                    }
+                    kotlinx.coroutines.delay(30_000)
+                }
+            }
+        }
         setContent {
             ShepitTheme {
                 val locked by app.lock.locked.collectAsState()
@@ -87,7 +102,10 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        if (!isChangingConfigurations) app.lock.onBackground()
+        if (!isChangingConfigurations) {
+            app.lock.onBackground()
+            app.repo.scope.launch { app.repo.presenceBeat(online = false) } // «згорнув»
+        }
         super.onStop()
     }
 

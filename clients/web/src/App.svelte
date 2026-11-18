@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { renderSVG } from 'uqr';
-  import { Shepit, announceAccountChange, fingerprintOf, isValidIdentity, loadWasm, normalizeInviteCode, onAccountChangedElsewhere, registrationMode, type RegistrationMode } from './lib/shepit';
+  import { Shepit, announceAccountChange, fingerprintOf, isValidIdentity, loadWasm, normalizeInviteCode, onAccountChangedElsewhere, registrationMode, presenceText, type Presence, type RegistrationMode } from './lib/shepit';
   import { channels as channelsDb, contacts as contactsDb, groups as groupsDb, kv, messages as messagesDb, wipe, type Channel, type Contact, type Group, type Member, type Message } from './lib/db';
   import { channelFromServer, fetchChannel, newChannelKeys, parseChannelLink, putMeta, searchPublic, type ChannelMeta } from './lib/channels';
   import Avatar from './Avatar.svelte';
@@ -933,6 +933,43 @@
 
   /** Тихі звуки у відкритій бесіді. */
   let chatSounds = $state(true);
+
+  // ---------- в мережі / востаннє ----------
+
+  /** Показувати іншим, коли я в мережі (як у Telegram: вимкнеш — сам теж не бачиш чужого часу). */
+  let showPresence = $state(true);
+  let presence = $state<Record<string, Presence>>({});
+  let presenceNow = $state(Date.now());
+
+  async function beat() {
+    if (!me) return;
+    await me.presenceBeat(document.visibilityState === 'visible', showPresence);
+  }
+
+  async function refreshPresence() {
+    if (!me || document.visibilityState !== 'visible') return;
+    try {
+      presence = await me.presenceQuery(contacts.map((c) => c.identity));
+      presenceNow = Date.now();
+    } catch {
+      /* сервер недоступний — лишаємо як було */
+    }
+  }
+
+  async function setShowPresence(on: boolean) {
+    showPresence = on;
+    await kv.set('showPresence', on);
+    await beat();
+    await refreshPresence();
+  }
+
+  const isOnline = (id: string | undefined) => !!id && !!presence[id]?.on;
+  // Щойно є акаунт (вхід/реєстрація) або змінився список контактів — «я тут» і свіжі статуси.
+  $effect(() => {
+    if (!me) return;
+    void contacts.length;
+    untrack(() => beat().then(refreshPresence));
+  });
   let heardIn = false;
   const chatVisible = (key: string) => chatKey === key && document.visibilityState === 'visible';
 
@@ -1227,6 +1264,7 @@
     let stopEvents: (() => void) | null = null;
     let keysTimer: ReturnType<typeof setInterval>;
     let channelsTimer: ReturnType<typeof setInterval>;
+    let presenceTimer: ReturnType<typeof setInterval>;
     const onHash = async () => {
       const inv = readInviteFromUrl();
       if (inv) invite = inv;
@@ -1239,7 +1277,9 @@
     onAccountChangedElsewhere(() => location.reload());
     // Застосунок на екрані — прибрати сповіщення (дзвінок покаже сам застосунок) і одразу перевірити пошту.
     const onVisible = async () => {
+      beat(); // «я тут» або «згорнув» — одразу
       if (document.visibilityState !== 'visible') return;
+      refreshPresence();
       poll();
       markRead();
       const reg = await navigator.serviceWorker?.getRegistration();
@@ -1260,6 +1300,7 @@
         myAvatar = (await kv.get<string>('myAvatar')) ?? '';
         readReceipts = (await kv.get<boolean>('readReceipts')) ?? true;
         chatSounds = (await kv.get<boolean>('chatSounds')) ?? true;
+        showPresence = (await kv.get<boolean>('showPresence')) ?? true;
         await messagesDb.failStuck();
         if (!(await kv.get<boolean>('receiptsInit'))) {
           await messagesDb.markAllSeen();
@@ -1285,6 +1326,13 @@
       keysTimer = setInterval(() => me?.ensureKeys().catch(fail), KEYS_CHECK_MS);
       channelsTimer = setInterval(() => me && checkChannels(), 2 * 60 * 1000);
       if (me) checkChannels();
+      // «Я тут» — раз на хвилину, поки вкладка на екрані; статуси інших — раз на 30 с.
+      let presenceN = 0;
+      presenceTimer = setInterval(() => {
+        if (document.visibilityState !== 'visible') return;
+        if (presenceN++ % 2 === 0) beat();
+        refreshPresence();
+      }, 30_000);
       if (me) stopEvents = me.listen(poll, (ok) => (streamOk = ok));
       poll();
     })();
@@ -1292,6 +1340,7 @@
       clearInterval(pollTimer);
       clearInterval(keysTimer);
       clearInterval(channelsTimer);
+      clearInterval(presenceTimer);
       stopEvents?.();
       window.removeEventListener('hashchange', onHash);
     };
@@ -1402,11 +1451,15 @@
               <button class="chat-item" class:active={current?.identity === c.identity} onclick={() => openThread(c)}>
                 <!-- svelte-ignore a11y_click_events_have_key_events -->
                 <span class="avatar-btn" role="button" tabindex="-1" title="Переглянути фото" onclick={(e) => { e.stopPropagation(); bigAvatar = { name: c.name, src: c.avatar }; }}>
-                  <Avatar name={c.name} src={c.avatar} size={36} />
+                  <Avatar name={c.name} src={c.avatar} size={36} online={isOnline(c.identity)} />
                 </span>
                 <span class="item-text">
                   <span class="name">{c.name}</span>
-                  <span class="sub">{short(c.fingerprint)}…</span>
+                  {#if presence[c.identity]}
+                    <span class="sub" class:online-text={presence[c.identity]?.on}>{presenceText(presence[c.identity], presenceNow)}</span>
+                  {:else}
+                    <span class="sub">{short(c.fingerprint)}…</span>
+                  {/if}
                 </span>
                 {#if unread[c.identity]}<span class="badge">{unread[c.identity]}</span>{/if}
               </button>
@@ -1503,9 +1556,14 @@
         {:else if current}
         <header>
           <button class="avatar-btn" title="Переглянути фото" onclick={() => (bigAvatar = { name: current!.name, src: current!.avatar })}>
-            <Avatar name={current.name} src={current.avatar} size={36} />
+            <Avatar name={current.name} src={current.avatar} size={36} online={isOnline(current.identity)} />
           </button>
-          <button class="title" onclick={rename} title="Перейменувати">{current.name} </button>
+          <span class="head-text">
+            <button class="title" onclick={rename} title="Перейменувати">{current.name} </button>
+            {#if presence[current.identity]}
+              <span class="small" class:online-text={presence[current.identity]?.on} class:muted={!presence[current.identity]?.on}>{presenceText(presence[current.identity], presenceNow)}</span>
+            {/if}
+          </span>
           <button class="ghost small" onclick={() => (showSafety = !showSafety)}>код безпеки</button>
           <span class="spacer"></span>
           <button class="ghost" title="Голосовий дзвінок" disabled={calls.state !== 'idle'} onclick={() => calls.start(current!.identity)}>Дзвінок</button>
@@ -1547,7 +1605,7 @@
               {#if m.reactions && Object.keys(m.reactions).length}
                 <div class="reactions">
                   {#each reactionChips(m) as c (c.e)}
-                    <button class="chip" class:mine={c.mine} onclick={() => react(m, c.e)} title={c.mine ? 'Прибрати мою реакцію' : 'Поставити таку саму'}>{c.e} {c.n}</button>
+                    <button class="chip" class:mine={c.mine} onclick={() => react(m, c.e)} title={c.mine ? 'Прибрати мою реакцію' : 'Поставити таку саму'}>{c.e}{#if group} {c.n}{/if}</button>
                   {/each}
                 </div>
               {/if}
@@ -1837,6 +1895,14 @@
               Повідомляти, що я переглянув повідомлення
             </span>
             <span class="small muted">Якщо вимкнути, ти теж не бачитимеш, чи переглянули твої. «Доставлено» працює завжди.</span>
+          </label>
+          <label class="field check">
+            <span class="label">В мережі</span>
+            <span class="row">
+              <input type="checkbox" checked={showPresence} onchange={(e) => setShowPresence(e.currentTarget.checked)} />
+              Показувати, коли я в мережі
+            </span>
+            <span class="small muted">Якщо вимкнути, інші бачитимуть лише «востаннє нещодавно», і ти так само не бачитимеш їхній час.</span>
           </label>
           <label class="field check">
             <span class="label">Звуки в бесіді</span>

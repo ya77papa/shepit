@@ -546,6 +546,38 @@ class Repo(context: Context) {
         batch.forEach { (k, mids) -> if (mids.isNotEmpty()) sendReceipt(k.first, mids.toList(), "d", k.second) }
     }
 
+    // ---------- в мережі / востаннє ----------
+
+    /** Показувати іншим, коли я в мережі (як у Telegram: вимкнеш — сам теж не бачиш чужого часу). */
+    var showPresence: Boolean
+        get() = db.get("showPresence") != "0"
+        set(v) = db.set("showPresence", if (v) "1" else "0")
+
+    private val _presence = MutableStateFlow<Map<String, PresenceInfo>>(emptyMap())
+    val presence = _presence.asStateFlow()
+
+    /** «Я тут» (застосунок на екрані) або «згорнув». */
+    suspend fun presenceBeat(online: Boolean) = withContext(Dispatchers.IO) {
+        val c = core ?: return@withContext
+        val body = JSONObject().put("online", online).put("share", showPresence).toString().toByteArray()
+        runCatching { api.post("/v0/presence", body, c.authHeader("POST /v0/presence", body)) }
+    }
+
+    /** Оновити статуси контактів (старий сервер — просто без статусів). */
+    suspend fun refreshPresence() = withContext(Dispatchers.IO) {
+        val c = core ?: return@withContext
+        val ids = _contacts.value.map { it.identity }.take(200)
+        if (ids.isEmpty()) return@withContext
+        val body = JSONObject().put("ids", org.json.JSONArray(ids)).toString().toByteArray()
+        runCatching {
+            val o = JSONObject(api.post("/v0/presence/query", body, c.authHeader("POST /v0/presence/query", body)))
+            _presence.value = o.keys().asSequence().associateWith { k ->
+                val p = o.getJSONObject(k)
+                PresenceInfo(p.optBoolean("on"), if (p.has("at")) p.getLong("at") else null, p.optBoolean("hidden"))
+            }
+        }
+    }
+
     /** Вихідне в бесіді peer пішло на сервер (для звуку «надіслано»). */
     private val _sent = MutableSharedFlow<String>(extraBufferCapacity = 16)
     val sent = _sent.asSharedFlow()
