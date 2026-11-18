@@ -571,11 +571,37 @@ class Repo(context: Context) {
         val body = JSONObject().put("ids", org.json.JSONArray(ids)).toString().toByteArray()
         runCatching {
             val o = JSONObject(api.post("/v0/presence/query", body, c.authHeader("POST /v0/presence/query", body)))
-            _presence.value = o.keys().asSequence().associateWith { k ->
+            val fresh = o.keys().asSequence().associateWith { k ->
                 val p = o.getJSONObject(k)
                 PresenceInfo(p.optBoolean("on"), if (p.has("at")) p.getLong("at") else null, p.optBoolean("hidden"))
             }
+            _presence.value = rememberPresence(ids, fresh)
         }
+    }
+
+    /**
+     * Сервер тримає статуси лише в пам'яті — після його перезапуску він якийсь час нічого не знає.
+     * Тому останній відомий статус кожного контакту пам'ятаємо тут, на пристрої, і показуємо
+     * «востаннє…» з нього, доки сервер знову не дізнається.
+     */
+    private fun rememberPresence(ids: List<String>, fresh: Map<String, PresenceInfo>): Map<String, PresenceInfo> {
+        val now = System.currentTimeMillis()
+        val cache = runCatching { JSONObject(db.get("presenceCache") ?: "{}") }.getOrDefault(JSONObject())
+        val out = mutableMapOf<String, PresenceInfo>()
+        for (id in ids) {
+            val f = fresh[id]
+            if (f != null) {
+                out[id] = f
+                // «В мережі» запам'ятовуємо як «востаннє зараз».
+                cache.put(id, JSONObject().apply { if (f.hidden) put("hidden", true) else put("at", if (f.on) now else f.at ?: now) })
+            } else cache.optJSONObject(id)?.let { cached ->
+                out[id] = PresenceInfo(at = if (cached.has("at")) cached.getLong("at") else null, hidden = cached.optBoolean("hidden"))
+            }
+        }
+        // Лише поточні контакти.
+        cache.keys().asSequence().toList().filter { it !in ids }.forEach { cache.remove(it) }
+        db.set("presenceCache", cache.toString())
+        return out
     }
 
     /** Вихідне в бесіді peer пішло на сервер (для звуку «надіслано»). */
