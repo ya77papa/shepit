@@ -94,6 +94,9 @@ jobs:
             cp app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/shepit-$VERSION_NAME.apk"
           fi
           rm -f "$RUNNER_TEMP/release.jks"
+          # Та сама збірка під сталою назвою — для кнопки «Завантажити APK» на сайті
+          # (…/releases/latest/download/shepit.apk завжди веде на найновішу).
+          if [ -f "$RUNNER_TEMP/shepit-$VERSION_NAME.apk" ]; then cp "$RUNNER_TEMP/shepit-$VERSION_NAME.apk" "$RUNNER_TEMP/shepit.apk"; fi
 
       - name: Відбиток сертифіката і контрольна сума
         if: steps.key.outputs.signed == 'true'
@@ -123,5 +126,7 @@ jobs:
           tag_name: android-v${{ env.VERSION_NAME }}
           name: Шепіт для Android ${{ env.VERSION_NAME }}
           body_path: ${{ runner.temp }}/notes.md
-          files: ${{ runner.temp }}/shepit-${{ env.VERSION_NAME }}.apk
+          files: |
+            ${{ runner.temp }}/shepit-${{ env.VERSION_NAME }}.apk
+            ${{ runner.temp }}/shepit.apk
           make_latest: true

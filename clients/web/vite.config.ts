@@ -21,11 +21,13 @@ function walk(dir: string): string[] {
  */
 function shepitPwa(): Plugin {
   let outDir = 'dist';
+  let mode = 'production';
   return {
     name: 'shepit-pwa',
     apply: 'build',
     configResolved(c) {
       outDir = c.build.outDir;
+      mode = c.mode;
     },
     closeBundle() {
       const files = walk(outDir)
@@ -38,7 +40,8 @@ function shepitPwa(): Plugin {
       });
       const build = createHash('sha256').update(hashes.join('\n')).digest('hex');
       const version = `${COMMIT.slice(0, 12)}-${build.slice(0, 12)}`;
-      const sw = readFileSync('sw.template.js', 'utf8')
+      // Тестовий чат-клієнт — повноцінний офлайн-кеш; публічна сторінка — лише прибирання старого.
+      const sw = readFileSync(mode === 'test' ? 'sw.app.template.js' : 'sw.template.js', 'utf8')
         .replace('__VERSION__', JSON.stringify(version))
         .replace('__FILES__', JSON.stringify(['/', ...files.filter((f) => f !== '/index.html' && !f.startsWith('/admin/')), '/index.html']));
       writeFileSync(join(outDir, 'sw.js'), sw);
@@ -54,7 +57,7 @@ export default defineConfig({
   build: {
     target: 'es2022',
     sourcemap: false,
-    // Дві сторінки: застосунок і адмін-панель (/admin/).
+    // Дві сторінки: публічна (у режимі test — чат-клієнт для наскрізних тестів) і адмін-панель (/admin/).
     rollupOptions: { input: { main: 'index.html', admin: 'admin/index.html' } },
   },
   // Розробка: API проксюємо на локальний сервер (cargo run -p shepit-server).

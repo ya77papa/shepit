@@ -1,80 +1,22 @@
-// Service worker Шепоту. Генерується під час збірки (vite.config.ts) — не редагувати dist/sw.js.
-//
-// Навіщо: код застосунку зберігається в кеші браузера і НЕ підмінюється сервером тихо
-// при кожному відкритті. Нова версія чекає (waiting), доки користувач не погодиться
-// оновитися в інтерфейсі. Обмеження браузерів: якщо закрити ВСІ вкладки Шепоту, браузер
-// може активувати нову версію сам — тоді застосунок покаже, що версія змінилась.
-
+// Веб-версію чату закрито (ADR 0011). Цей service worker лише прибирає за старою версією:
+// одразу стає активним, чистить кеші й перезавантажує відкриті вкладки — вони покажуть
+// сторінку завантаження Android-застосунку. Запитів не перехоплює (усе йде в мережу);
+// сама сторінка потім знімає його реєстрацію.
 const VERSION = __VERSION__;
 const FILES = __FILES__;
-const CACHE = `shepit-${VERSION}`;
-// Адмін-панель — окрема сторінка, завжди свіжа з мережі.
-const NO_CACHE = ['/v0/', '/health', '/sw.js', '/version.json', '/admin'];
+void VERSION;
+void FILES;
 
-self.addEventListener('install', (e) => {
-  // Без skipWaiting: нова версія не стає активною без згоди користувача.
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES)));
-});
+self.addEventListener('install', () => self.skipWaiting());
 
-self.addEventListener('activate', (e) => {
-  e.waitUntil(
-    caches.keys()
-      .then((keys) => Promise.all(keys.filter((k) => k.startsWith('shepit-') && k !== CACHE).map((k) => caches.delete(k))))
-      .then(() => self.clients.claim()),
-  );
-});
-
-self.addEventListener('message', (e) => {
-  if (e.data === 'SKIP_WAITING') self.skipWaiting();
-});
-
-// Сповіщення, коли застосунок закритий. Вміст зашифрований і містить лише тип: дзвінок чи пошта.
-self.addEventListener('push', (e) => {
-  let t = 'mail';
-  try {
-    t = e.data?.json()?.t ?? 'mail';
-  } catch {
-    /* порожнє */
-  }
-  const call = t === 'call';
-  e.waitUntil(
-    self.registration.showNotification(call ? '📞 Вхідний дзвінок у Шепоті' : 'Шепіт', {
-      body: call ? 'Торкнись, щоб відповісти' : 'Нове повідомлення',
-      tag: call ? 'call' : 'mail',
-      renotify: true,
-      requireInteraction: call,
-      vibrate: call ? [600, 300, 600, 300, 600, 300, 600] : [200],
-      icon: '/icon-192.png',
-      badge: '/icon-192.png',
-      data: { t },
-    }),
-  );
-});
-
-self.addEventListener('notificationclick', (e) => {
-  e.notification.close();
-  e.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
-      const w = list[0];
-      return w ? w.focus() : self.clients.openWindow('/');
-    }),
-  );
-});
-
-self.addEventListener('fetch', (e) => {
-  const url = new URL(e.request.url);
-  if (e.request.method !== 'GET' || url.origin !== location.origin) return;
-  if (NO_CACHE.some((p) => url.pathname.startsWith(p))) return; // API — завжди з мережі
-  e.respondWith(
-    caches.open(CACHE).then(async (c) => {
-      const hit = await c.match(e.request, { ignoreSearch: true });
-      if (hit) return hit;
-      // Будь-яка сторінка застосунку (напр. /#add=…) — це index.html з кешу.
-      if (e.request.mode === 'navigate') {
-        const index = await c.match('/index.html');
-        if (index) return index;
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    (async () => {
+      for (const k of await caches.keys()) await caches.delete(k);
+      await self.clients.claim();
+      for (const c of await self.clients.matchAll({ type: 'window', includeUncontrolled: true })) {
+        c.navigate(c.url).catch(() => {});
       }
-      return fetch(e.request);
-    }),
+    })(),
   );
 });

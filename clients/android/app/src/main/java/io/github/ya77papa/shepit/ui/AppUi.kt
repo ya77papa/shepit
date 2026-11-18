@@ -1132,7 +1132,7 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
                 }
             }
             Section("Резервна копія") {
-                Text("Файл з ключами, контактами й історією, зашифрований паролем. Сумісний з веб-версією.", color = Muted, fontSize = 13.sp)
+                Text("Файл з ключами, контактами й історією, зашифрований паролем. Підходить і для копії зі старої веб-версії.", color = Muted, fontSize = 13.sp)
                 OutlinedTextField(pw1, { pw1 = it }, label = { Text("Пароль (щонайменше ${Backup.MIN_PASSWORD} символів)") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(pw2, { pw2 = it }, label = { Text("Повтори пароль") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
                 Button(enabled = !busy && pw1.length >= Backup.MIN_PASSWORD, onClick = {
