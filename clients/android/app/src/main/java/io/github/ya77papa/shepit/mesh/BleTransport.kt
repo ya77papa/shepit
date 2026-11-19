@@ -48,11 +48,13 @@ class BleTransport(private val ctx: Context, private val runner: MeshRunner) {
     }
 
     fun start(scope: CoroutineScope) {
-        if (Build.VERSION.SDK_INT < 29 || !allowed()) return
+        if (Build.VERSION.SDK_INT < 29) { runner.log("Bluetooth: потрібен Android 10+"); return }
+        if (!allowed()) { runner.log("Bluetooth: немає дозволу або вимкнено"); return }
         this.scope = scope
         val a = adapter ?: return
-        val ss = runCatching { a.listenUsingInsecureL2capChannel() }.getOrNull() ?: return
+        val ss = runCatching { a.listenUsingInsecureL2capChannel() }.getOrElse { runner.log("Bluetooth: L2CAP-канал не відкрився: ${it.message}"); return }
         server = ss
+        runner.log("Bluetooth: канал ${ss.psm}")
         scope.launch {
             while (isActive) {
                 val s = runCatching { ss.accept() }.getOrNull() ?: break
@@ -70,13 +72,16 @@ class BleTransport(private val ctx: Context, private val runner: MeshRunner) {
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
             .setConnectable(true)
             .build()
-        val data = AdvertiseData.Builder().addServiceUuid(SERVICE).setIncludeDeviceName(false).build()
-        // Номер каналу й nonce — у відповіді на сканування (в основну рекламу 128-бітний UUID двічі не влазить).
+        // Усе в основній рекламі (17 байт із 31): 16-бітна служба + номер каналу й nonce.
+        // «Відповідь на сканування» частина телефонів застосункам не віддає.
         val info = ByteBuffer.allocate(6).putShort(psm.toShort()).put(nonce).array()
-        val resp = AdvertiseData.Builder().addServiceData(SERVICE, info).setIncludeDeviceName(false).build()
-        val cb = object : AdvertiseCallback() {}
+        val data = AdvertiseData.Builder().addServiceUuid(SERVICE).addServiceData(SERVICE, info).setIncludeDeviceName(false).setIncludeTxPowerLevel(false).build()
+        val cb = object : AdvertiseCallback() {
+            override fun onStartSuccess(s: AdvertiseSettings?) { runner.log("Bluetooth: реклама увімкнена") }
+            override fun onStartFailure(code: Int) { runner.log("Bluetooth: реклама не запустилась (код $code)") }
+        }
         advertising = cb
-        runCatching { adv.startAdvertising(settings, data, resp, cb) }
+        runCatching { adv.startAdvertising(settings, data, cb) }.onFailure { runner.log("Bluetooth: реклама: ${it.message}") }
     }
 
     private fun scan() {
@@ -84,27 +89,36 @@ class BleTransport(private val ctx: Context, private val runner: MeshRunner) {
         val cb = object : ScanCallback() {
             override fun onScanResult(type: Int, r: ScanResult) = found(r)
             override fun onBatchScanResults(rs: MutableList<ScanResult>) = rs.forEach { found(it) }
+            override fun onScanFailed(code: Int) { runner.log("Bluetooth: пошук не запустився (код $code)") }
         }
         scanning = cb
         val filters = listOf(ScanFilter.Builder().setServiceUuid(SERVICE).build())
-        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_BALANCED).build()
+        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
         runCatching { scanner.startScan(filters, settings, cb) }
+            .onSuccess { runner.log("Bluetooth: шукаю") }
+            .onFailure { runner.log("Bluetooth: пошук: ${it.message}") }
     }
 
     private fun found(r: ScanResult) {
-        val info = r.scanRecord?.getServiceData(SERVICE) ?: return
-        if (info.size < 6) return
+        val info = r.scanRecord?.getServiceData(SERVICE)
+        if (info == null || info.size < 6) {
+            val k = "raw:" + r.device.address
+            if (System.currentTimeMillis() - (lastTry[k] ?: 0) > 30_000) { lastTry[k] = System.currentTimeMillis(); runner.log("Bluetooth: телефон без даних каналу (стара версія?)") }
+            return
+        }
         val psm = ByteBuffer.wrap(info, 0, 2).short.toInt() and 0xffff
         val who = "ble:" + info.copyOfRange(2, 6).joinToString("") { "%02x".format(it) }
         if (info.copyOfRange(2, 6).contentEquals(nonce)) return
-        runner.noticed(who)
         val now = System.currentTimeMillis()
         if (now - (lastTry[who] ?: 0) < 30_000) return
         lastTry[who] = now
+        runner.log("Bluetooth: знайдено $who, канал $psm")
+        runner.noticed(who)
         val s = scope ?: return
         s.launch {
             if (Build.VERSION.SDK_INT < 29) return@launch
-            val sock = runCatching { r.device.createInsecureL2capChannel(psm).apply { connect() } }.getOrNull() ?: return@launch
+            val sock = runCatching { r.device.createInsecureL2capChannel(psm).apply { connect() } }
+                .getOrElse { runner.log("Bluetooth: не вдалося з'єднатися з $who: ${it.message}"); return@launch }
             sock.use { runner.exchange(it.inputStream, it.outputStream, initiator = true, who = who) }
         }
     }
@@ -120,7 +134,7 @@ class BleTransport(private val ctx: Context, private val runner: MeshRunner) {
     }
 
     companion object {
-        /** Служба Шепоту в рекламі BLE (випадковий 128-бітний UUID). */
-        val SERVICE: ParcelUuid = ParcelUuid(UUID.fromString("5e7b1f3a-4c2d-4b8e-9a61-0d3c5e9f2b17"))
+        /** Служба Шепоту в рекламі BLE: 16-бітний ідентифікатор 0x5E7B (у базовому UUID Bluetooth). */
+        val SERVICE: ParcelUuid = ParcelUuid(UUID.fromString("00005e7b-0000-1000-8000-00805f9b34fb"))
     }
 }

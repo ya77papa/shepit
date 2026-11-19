@@ -1320,6 +1320,19 @@ private fun MeshSection(app: ShepitApp, act: MainActivity, toast: (String) -> Un
             }
         }
     }
+    if (on) Section("Журнал (для діагностики)") {
+        val log by app.mesh.log.collectAsState()
+        val locOn = remember { runCatching { androidx.core.location.LocationManagerCompat.isLocationEnabled(ctx.getSystemService(android.location.LocationManager::class.java)) }.getOrDefault(true) }
+        if (!locOn) Text("Геолокація вимкнена. На частині телефонів пошук Bluetooth без неї нічого не знаходить — спробуй увімкнути.", color = Color(0xFFE0B45A), fontSize = 12.sp)
+        Text(if (log.isEmpty()) "Поки порожньо" else log.takeLast(25).joinToString("\n"), fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = {
+                ctx.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Шепіт: журнал mesh", "Шепіт ${BuildConfig.VERSION_NAME} · Android ${android.os.Build.VERSION.RELEASE} · ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}\n" + log.joinToString("\n")))
+                toast("Журнал скопійовано")
+            }) { Text("Копіювати") }
+            OutlinedButton(onClick = { app.mesh.stop(); app.mesh.start() }) { Text("Перезапустити пошук") }
+        }
+    }
     Section("Як це працює") {
         Text(
             "• Лише з контактами, з якими ти вже листувався через інтернет (додати нову людину без інтернету поки не можна).\n" +

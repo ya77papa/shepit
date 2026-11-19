@@ -33,7 +33,8 @@ class LanTransport(private val ctx: Context, private val runner: MeshRunner) {
     private val toResolve = LinkedBlockingQueue<NsdServiceInfo>()
 
     fun start(scope: CoroutineScope) {
-        val ss = runCatching { ServerSocket(0) }.getOrNull() ?: return
+        val ss = runCatching { ServerSocket(0) }.getOrElse { runner.log("Wi-Fi: не вдалося відкрити порт: ${it.message}"); return }
+        runner.log("Wi-Fi: слухаю порт ${ss.localPort}")
         server = ss
         multicast = runCatching {
             ctx.applicationContext.getSystemService(WifiManager::class.java).createMulticastLock("shepit-mesh").apply { setReferenceCounted(false); acquire() }
@@ -58,7 +59,7 @@ class LanTransport(private val ctx: Context, private val runner: MeshRunner) {
             while (isActive) {
                 for ((name, addr) in peers) {
                     val s = runCatching { Socket().apply { connect(addr, 5_000) } }.getOrNull()
-                    if (s == null) { peers.remove(name); continue }
+                    if (s == null) { runner.log("Wi-Fi: не вдалося з'єднатися з $name"); peers.remove(name); continue }
                     handle(s, initiator = true, who = "lan:" + addr.address.hostAddress)
                 }
                 withTimeoutOrNull(30_000) { runner.pokes.first() }
@@ -76,8 +77,8 @@ class LanTransport(private val ctx: Context, private val runner: MeshRunner) {
     private fun register(port: Int) {
         val info = NsdServiceInfo().apply { serviceName = myName; serviceType = TYPE; this.port = port }
         val l = object : NsdManager.RegistrationListener {
-            override fun onServiceRegistered(i: NsdServiceInfo) {}
-            override fun onRegistrationFailed(i: NsdServiceInfo, code: Int) {}
+            override fun onServiceRegistered(i: NsdServiceInfo) { runner.log("Wi-Fi: оголошено себе в мережі") }
+            override fun onRegistrationFailed(i: NsdServiceInfo, code: Int) { runner.log("Wi-Fi: не вдалося оголосити себе (код $code)") }
             override fun onServiceUnregistered(i: NsdServiceInfo) {}
             override fun onUnregistrationFailed(i: NsdServiceInfo, code: Int) {}
         }
@@ -88,12 +89,12 @@ class LanTransport(private val ctx: Context, private val runner: MeshRunner) {
     private fun discover() {
         val l = object : NsdManager.DiscoveryListener {
             override fun onServiceFound(i: NsdServiceInfo) {
-                if (i.serviceName != myName && i.serviceName.startsWith("shepit-")) toResolve.offer(i)
+                if (i.serviceName != myName && i.serviceName.startsWith("shepit-")) { runner.log("Wi-Fi: знайдено ${i.serviceName}"); toResolve.offer(i) }
             }
             override fun onServiceLost(i: NsdServiceInfo) { peers.remove(i.serviceName) }
             override fun onDiscoveryStarted(t: String) {}
             override fun onDiscoveryStopped(t: String) {}
-            override fun onStartDiscoveryFailed(t: String, code: Int) {}
+            override fun onStartDiscoveryFailed(t: String, code: Int) { runner.log("Wi-Fi: пошук не запустився (код $code)") }
             override fun onStopDiscoveryFailed(t: String, code: Int) {}
         }
         discovery = l

@@ -34,6 +34,15 @@ class MeshRunner(private val ctx: Context, private val repo: Repo) {
 
     val running get() = job?.isActive == true
 
+    /** Журнал для діагностики (без вмісту повідомлень): що знайдено, що не вдалося. */
+    val log = kotlinx.coroutines.flow.MutableStateFlow<List<String>>(emptyList())
+    private val fmt = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.ROOT)
+    fun log(line: String) {
+        val l = fmt.format(java.util.Date()) + " " + line
+        android.util.Log.i("ShepitMesh", line)
+        log.value = (log.value + l).takeLast(80)
+    }
+
     private val node = object : MeshNode {
         override fun offers() = repo.meshOffers()
         override fun isForMe(tag: ByteArray) = Base64.getEncoder().encodeToString(tag) in repo.meshTagsForMe()
@@ -44,6 +53,7 @@ class MeshRunner(private val ctx: Context, private val repo: Repo) {
     @Synchronized
     fun start() {
         if (running) return
+        log("старт")
         job = scope.launch {
             lan.start(this)
             ble.start(this)
@@ -59,6 +69,7 @@ class MeshRunner(private val ctx: Context, private val repo: Repo) {
 
     @Synchronized
     fun stop() {
+        if (running) log("стоп")
         lan.stop()
         ble.stop()
         job?.cancel()
@@ -78,6 +89,8 @@ class MeshRunner(private val ctx: Context, private val repo: Repo) {
         noticed(who)
         exchangeLock.withLock {
             runCatching { MeshLink(node).run(input, output, initiator) }
+                .onSuccess { log("обмін з $who: надіслано ${it.sent}, отримано ${it.received}, підтверджено ${it.delivered}") }
+                .onFailure { log("обмін з $who не вдався: ${it.javaClass.simpleName} ${it.message ?: ""}") }
         }
     }
 
