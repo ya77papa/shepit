@@ -33,6 +33,10 @@ class BleTransport(private val ctx: Context, private val runner: MeshRunner) {
     private var server: BluetoothServerSocket? = null
     private var advertising: AdvertiseCallback? = null
     private var scanning: ScanCallback? = null
+    private var scanningAll: ScanCallback? = null
+    /** Для журналу: скільки різних Bluetooth-пристроїв і скільки з Шепотом бачили за 30 с. */
+    private val seenAny = ConcurrentHashMap.newKeySet<String>()
+    private val seenOurs = ConcurrentHashMap.newKeySet<String>()
     /** Випадковий ідентифікатор цього запуску — щоб рахувати телефони поруч (адреси BLE змінюються). */
     private val nonce = ByteArray(4).also { java.security.SecureRandom().nextBytes(it) }
     /** Коли востаннє обмінювались із телефоном (за nonce): не частіше ніж раз на 30 с. */
@@ -86,21 +90,40 @@ class BleTransport(private val ctx: Context, private val runner: MeshRunner) {
 
     private fun scan() {
         val scanner = adapter?.bluetoothLeScanner ?: return
-        val cb = object : ScanCallback() {
+        fun callback(name: String) = object : ScanCallback() {
             override fun onScanResult(type: Int, r: ScanResult) = found(r)
             override fun onBatchScanResults(rs: MutableList<ScanResult>) = rs.forEach { found(it) }
-            override fun onScanFailed(code: Int) { runner.log("Bluetooth: пошук не запустився (код $code)") }
+            override fun onScanFailed(code: Int) { runner.log("Bluetooth: пошук ($name) не запустився (код $code)") }
         }
-        scanning = cb
-        val filters = listOf(ScanFilter.Builder().setServiceUuid(SERVICE).build())
         val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
-        runCatching { scanner.startScan(filters, settings, cb) }
-            .onSuccess { runner.log("Bluetooth: шукаю") }
-            .onFailure { runner.log("Bluetooth: пошук: ${it.message}") }
+        // 1) З фільтром служби Шепоту — працює й з вимкненим екраном.
+        val cb = callback("фільтр")
+        scanning = cb
+        runCatching { scanner.startScan(listOf(ScanFilter.Builder().setServiceUuid(SERVICE).build()), settings, cb) }
+            .onSuccess { runner.log("Bluetooth: шукаю (з фільтром)") }
+            .onFailure { runner.log("Bluetooth: пошук з фільтром: ${it.message}") }
+        // 2) Без фільтра, перевірка в коді: частина чипів не вміє апаратно фільтрувати чужі служби.
+        //    Android віддає такі результати лише при увімкненому екрані — для того й перший.
+        val all = callback("усі")
+        scanningAll = all
+        runCatching { scanner.startScan(null, settings, all) }
+            .onSuccess { runner.log("Bluetooth: шукаю (усі пристрої)") }
+            .onFailure { runner.log("Bluetooth: пошук усіх: ${it.message}") }
+        scope?.launch {
+            while (isActive) {
+                kotlinx.coroutines.delay(30_000)
+                runner.log("Bluetooth: за 30 с бачу пристроїв ${seenAny.size}, із Шепотом ${seenOurs.size}")
+                seenAny.clear(); seenOurs.clear()
+            }
+        }
     }
 
     private fun found(r: ScanResult) {
+        seenAny += r.device.address
+        val uuids = r.scanRecord?.serviceUuids.orEmpty()
         val info = r.scanRecord?.getServiceData(SERVICE)
+        if (info == null && SERVICE !in uuids) return // чужий пристрій
+        seenOurs += r.device.address
         if (info == null || info.size < 6) {
             val k = "raw:" + r.device.address
             if (System.currentTimeMillis() - (lastTry[k] ?: 0) > 30_000) { lastTry[k] = System.currentTimeMillis(); runner.log("Bluetooth: телефон без даних каналу (стара версія?)") }
@@ -126,7 +149,9 @@ class BleTransport(private val ctx: Context, private val runner: MeshRunner) {
     fun stop() {
         runCatching { advertising?.let { adapter?.bluetoothLeAdvertiser?.stopAdvertising(it) } }
         runCatching { scanning?.let { adapter?.bluetoothLeScanner?.stopScan(it) } }
-        advertising = null; scanning = null
+        runCatching { scanningAll?.let { adapter?.bluetoothLeScanner?.stopScan(it) } }
+        advertising = null; scanning = null; scanningAll = null
+        seenAny.clear(); seenOurs.clear()
         runCatching { server?.close() }
         server = null
         lastTry.clear()
