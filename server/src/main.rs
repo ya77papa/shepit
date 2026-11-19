@@ -277,6 +277,27 @@ async fn presence_query(State(app): State<Shared>, headers: HeaderMap, body: Byt
     Ok(Json(app.presence.query(&who, &q.ids, now_ms())))
 }
 
+/// Користувач сам видаляє свій акаунт: ключі, недоставлену пошту, підписки, запрошення.
+/// Канали, групи й бесіди застосунок прибирає перед цим сам (сервер не знає, чиї вони).
+async fn delete_my_account(State(app): State<Shared>, headers: HeaderMap) -> StatusCode {
+    let who = match authenticate(&app, &headers, "DELETE /v0/account", b"") {
+        Ok(w) => w,
+        Err(s) => return s,
+    };
+    let Ok(bytes) = hex::decode(&who) else { return StatusCode::BAD_REQUEST };
+    let mailbox = MailboxId::for_identity(&bytes);
+    match app.db.delete_account(&who, &mailbox, false, now_ms()) {
+        Ok(_) => {
+            app.bells.lock().unwrap().remove(&mailbox);
+            app.seen.lock().unwrap().remove(&who);
+            app.presence.forget(&who);
+            println!("Акаунт видалено власником: {}…", &who[..who.len().min(10)]);
+            StatusCode::NO_CONTENT
+        }
+        Err(e) => internal(e),
+    }
+}
+
 async fn my_invite(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<MyInvite>, Refusal> {
     let who = authenticate(&app, &headers, "POST /v0/invites/mine", b"").map_err(|s| (s, ""))?;
     app.require_account(&who)?;
@@ -600,6 +621,7 @@ fn app(issuer: Issuer, db: db::Db, shutdown: tokio::sync::watch::Receiver<bool>)
         .route("/v0/keys/{identity}", get(get_keys))
         .route("/v0/certificate", get(certificate))
         .route("/v0/presence", post(presence_beat))
+        .route("/v0/account", axum::routing::delete(delete_my_account))
         .route("/v0/presence/query", post(presence_query))
         .route("/v0/send", post(send).layer(axum::extract::DefaultBodyLimit::max(MAX_SEND_BODY)))
         .route("/v0/mailbox/{id}", get(fetch))
@@ -890,6 +912,7 @@ async fn admin_delete_user(
             // Закрити відкриті потоки подій цього користувача.
             app.bells.lock().unwrap().remove(&mailbox);
             app.seen.lock().unwrap().remove(&identity);
+            app.presence.forget(&identity);
             println!("Адмін: видалено акаунт {}…{}", &identity[..identity.len().min(10)], if block { " (заблоковано)" } else { "" });
             StatusCode::NO_CONTENT
         }

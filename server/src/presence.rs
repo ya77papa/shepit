@@ -67,6 +67,10 @@ impl Presence {
             .collect()
     }
 
+    pub fn forget(&self, who: &str) {
+        self.0.lock().unwrap().remove(who);
+    }
+
     pub fn prune(&self, now: u64) {
         self.0.lock().unwrap().retain(|_, e| now.saturating_sub(e.at) < KEEP_MS);
     }

@@ -951,6 +951,7 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
     var busy by remember { mutableStateOf(false) }
     var pendingBackup by remember { mutableStateOf<ByteArray?>(null) }
     var confirmLogout by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
     var battery by remember { mutableStateOf(act.ignoringBattery()) }
     val save = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
         val data = pendingBackup
@@ -1171,15 +1172,53 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
                     if (status.isNotEmpty()) Text(status, fontSize = 13.sp)
                 }
             }
-            Button(onClick = { confirmLogout = true }, colors = ButtonDefaults.buttonColors(containerColor = Danger, contentColor = Color.White), modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(onClick = { confirmLogout = true }, modifier = Modifier.fillMaxWidth()) {
                 Text("Вийти й стерти ключі з цього телефона")
+            }
+            Button(onClick = { confirmDelete = true }, colors = ButtonDefaults.buttonColors(containerColor = Danger, contentColor = Color.White), modifier = Modifier.fillMaxWidth()) {
+                Text("Видалити акаунт назавжди")
             }
         }
     }
+    if (confirmDelete) {
+        var typed by remember { mutableStateOf("") }
+        var step by remember { mutableStateOf<String?>(null) }
+        var err by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { if (step == null) confirmDelete = false },
+            title = { Text("Видалити акаунт назавжди?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Це не можна скасувати. Буде видалено:")
+                    Text("• твої канали разом з усіма дописами;\n• групи, де ти адміністратор, — для всіх учасників; з інших груп ти вийдеш;\n• бесіди з тобою — у всіх твоїх контактів;\n• акаунт і ключі на сервері й на цьому телефоні.", fontSize = 14.sp)
+                    Text("Контакти, які зараз не в мережі, отримають це, коли відкриють Шепіт.", color = Muted, fontSize = 13.sp)
+                    if (step == null) OutlinedTextField(typed, { typed = it }, label = { Text("Напиши ВИДАЛИТИ") }, singleLine = true)
+                    step?.let { Text(it) }
+                    if (err.isNotEmpty()) Text(err, color = Danger, fontSize = 13.sp)
+                }
+            },
+            confirmButton = {
+                if (step == null) TextButton(enabled = typed.trim().uppercase() == "ВИДАЛИТИ", onClick = {
+                    err = ""
+                    step = "Починаю…"
+                    scope.launch {
+                        runCatching { repo.deleteAccountForever { s -> step = s } }
+                            .onSuccess {
+                                confirmDelete = false
+                                ctx.stopService(Intent(ctx, io.github.ya77papa.shepit.service.ShepitService::class.java))
+                                onLogout()
+                            }
+                            .onFailure { err = "Не вдалося: ${it.message}. Акаунт не видалено — спробуй ще раз."; step = null }
+                    }
+                }) { Text("Видалити", color = Danger) }
+            },
+            dismissButton = { if (step == null) TextButton(onClick = { confirmDelete = false }) { Text("Скасувати") } },
+        )
+    }
     if (confirmLogout) AlertDialog(
         onDismissRequest = { confirmLogout = false },
-        title = { Text("Стерти акаунт?") },
-        text = { Text("Без резервної копії ключі буде втрачено назавжди.") },
+        title = { Text("Стерти ключі з цього телефона?") },
+        text = { Text("Акаунт лишиться на сервері, і повернутись до нього можна буде лише з резервної копії. Без неї ключі буде втрачено назавжди. Щоб прибрати акаунт зовсім — «Видалити акаунт назавжди».") },
         confirmButton = { TextButton(onClick = { repo.wipe(); confirmLogout = false; ctx.stopService(Intent(ctx, io.github.ya77papa.shepit.service.ShepitService::class.java)); onLogout() }) { Text("Стерти", color = Danger) } },
         dismissButton = { TextButton(onClick = { confirmLogout = false }) { Text("Скасувати") } },
     )

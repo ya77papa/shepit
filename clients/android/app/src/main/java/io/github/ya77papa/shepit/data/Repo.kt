@@ -27,6 +27,7 @@ import org.json.JSONObject
  * бо кожне повідомлення змінює стан сесій.
  */
 class Repo(context: Context) {
+    private val ctx: Context = context.applicationContext
     val api = Api()
     val db = Db(context)
     private val secure = SecureState(context)
@@ -294,6 +295,7 @@ class Repo(context: Context) {
         val gid = when (body) {
             is Body.GroupState -> body.g
             is Body.Leave -> body.g
+            is Body.Dissolve -> body.g
             is Body.Text -> body.g
             is Body.Voice -> body.g
             is Body.Image -> body.g
@@ -332,6 +334,14 @@ class Repo(context: Context) {
         if (local == null || local.left || local.members.none { it.id == from }) return
         val now = System.currentTimeMillis()
         val m = when (body) {
+            is Body.Dissolve -> {
+                // Лише адміністратор може розпустити групу.
+                if (from !in local.admins) return
+                withContext(Dispatchers.IO) { db.deleteGroup(local.id) }
+                refreshGroups()
+                _changed.emit(key)
+                return
+            }
             is Body.Leave -> {
                 val name = memberName(from, local)
                 val members = local.members.filter { it.id != from }
@@ -718,7 +728,7 @@ class Repo(context: Context) {
         val body = Content.decode(raw)
         // Групи: окремий шлях (і жодних нових контактів від учасників групи).
         val groupish = when (body) {
-            is Body.GroupState, is Body.Leave -> true
+            is Body.GroupState, is Body.Leave, is Body.Dissolve -> true
             is Body.Text -> body.g != null
             is Body.Voice -> body.g != null
             is Body.Image -> body.g != null
@@ -747,6 +757,15 @@ class Repo(context: Context) {
         when (body) {
             is Body.Delete -> {
                 if (db.deleteIncoming(from, body.ids) > 0) _changed.emit(from)
+                return false
+            }
+            Body.Gone -> {
+                // Співрозмовник видалив акаунт і попросив стерти наші бесіди.
+                if (db.contacts().none { it.identity == from }) return false
+                db.deleteContact(from)
+                io.github.ya77papa.shepit.service.Notifications.cancelMessages(ctx, from)
+                refreshContacts()
+                _changed.emit(from)
                 return false
             }
             Body.Clear -> {
@@ -858,6 +877,36 @@ class Repo(context: Context) {
             refreshChannels()
         }
         ensureKeys()
+    }
+
+    /**
+     * Видалити акаунт назавжди. Спершу прибрати все, що сервер не може прибрати сам
+     * (він не знає, чиї канали, групи й бесіди): мої канали — видалити; групи, де я адмін, —
+     * розпустити для всіх, з решти — вийти; контактам — стерти наші бесіди. Потім — акаунт
+     * на сервері, і лише тоді — дані на телефоні. [step] — що зараз робиться (для інтерфейсу).
+     */
+    suspend fun deleteAccountForever(step: (String) -> Unit) = withContext(Dispatchers.IO) {
+        val c = core ?: error("Немає акаунта")
+        val me = c.identity()
+        val mine = db.channels().filter { it.mine }
+        mine.forEachIndexed { i, ch ->
+            step("Видаляю канали… ${i + 1} з ${mine.size}")
+            runCatching { api.channels.delete(ch) }
+        }
+        val groups = db.groups().filter { !it.left }
+        groups.forEachIndexed { i, g ->
+            step("Групи… ${i + 1} з ${groups.size}")
+            runCatching { sendGroup(g, if (me in g.admins) Body.Dissolve(g.id) else Body.Leave(g.id)) }
+        }
+        val contacts = db.contacts()
+        contacts.forEachIndexed { i, p ->
+            step("Стираю бесіди в контактів… ${i + 1} з ${contacts.size}")
+            runCatching { send(p.identity, Body.Gone) }
+        }
+        step("Видаляю акаунт на сервері…")
+        api.delete("/v0/account", c.authHeader("DELETE /v0/account", ByteArray(0)))
+        step("Стираю дані на телефоні…")
+        withContext(Dispatchers.Main) { wipe() }
     }
 
     fun wipe() {

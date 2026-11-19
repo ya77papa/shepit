@@ -51,6 +51,10 @@ sealed interface Body {
     data class Receipt(val ids: List<String>, val s: String, val g: String? = null) : Body
     /** Очистити всю бесіду у співрозмовника. */
     data object Clear : Body
+    /** Відправник видалив акаунт: стерти бесіду з ним і сам контакт. */
+    data object Gone : Body
+    /** Адміністратор розпустив групу: у всіх учасників група й історія зникають. */
+    data class Dissolve(val g: String) : Body
     /** Тип з новішої версії — пропустити. */
     data object Unknown : Body
 }
@@ -79,6 +83,8 @@ object Content {
             is Body.Receipt -> { put("t", "receipt"); put("ids", org.json.JSONArray(b.ids)); put("s", b.s); b.g?.let { put("g", it) } }
             is Body.React -> { put("t", "react"); put("id", b.id); put("e", b.e); b.g?.let { put("g", it) } }
             Body.Clear -> put("t", "clear")
+            Body.Gone -> put("t", "gone")
+            is Body.Dissolve -> { put("t", "dissolve"); put("g", b.g) }
             Body.Unknown -> put("t", "unknown")
             is Body.Call -> {
                 put("t", "call"); put("op", b.op); put("id", b.id); put("at", b.at)
@@ -115,6 +121,8 @@ object Content {
                         return if (ids.isEmpty()) Body.Unknown else Body.Receipt(ids, s, groupId(o))
                     }
                     "clear" -> return Body.Clear
+                    "gone" -> return Body.Gone
+                    "dissolve" -> return groupId(o)?.let { Body.Dissolve(it) } ?: Body.Unknown
                     "call" -> return Body.Call(
                         o.getString("op"), o.getString("id"), o.optLong("at"),
                         if (o.has("sdp")) o.getString("sdp") else null,

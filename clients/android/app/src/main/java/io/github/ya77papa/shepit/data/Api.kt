@@ -80,6 +80,10 @@ class Api(private val base: String = BuildConfig.SERVER) {
     }
 
     /** POST з відповіддю. */
+    fun delete(path: String, auth: String? = null) {
+        exec(Request.Builder().url(url(path)).delete().apply { if (auth != null) header(AUTH, auth) }.build()).close()
+    }
+
     fun post(path: String, body: ByteArray, auth: String? = null): String =
         exec(Request.Builder().url(url(path)).post(body.toRequestBody(json)).apply { if (auth != null) header(AUTH, auth) }.build())
             .use { it.body.string() }
