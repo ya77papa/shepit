@@ -125,6 +125,31 @@ object Notifications {
         ctx.getSystemService(NotificationManager::class.java).cancel(ID_CALL)
     }
 
+    // ---------- «Шепіт на зв'язку» ----------
+
+    /** Чи видно постійне сповіщення служби (користувач міг вимкнути його канал). */
+    fun serviceVisible(ctx: Context): Boolean {
+        val nm = ctx.getSystemService(NotificationManager::class.java)
+        if (!nm.areNotificationsEnabled()) return false
+        return (nm.getNotificationChannel(CH_SERVICE)?.importance ?: NotificationManager.IMPORTANCE_LOW) != NotificationManager.IMPORTANCE_NONE
+    }
+
+    /** Системні налаштування саме сповіщення «Шепіт на зв'язку» (там його можна вимкнути). */
+    fun openServiceSettings(ctx: Context) {
+        val i = Intent(android.provider.Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+            .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+            .putExtra(android.provider.Settings.EXTRA_CHANNEL_ID, CH_SERVICE)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { ctx.startActivity(i) }.onFailure { openAppSettings(ctx) }
+    }
+
+    fun openAppSettings(ctx: Context) {
+        val i = Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+            .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { ctx.startActivity(i) }
+    }
+
     // ---------- повідомлення ----------
 
     /** Рядок у сповіщенні бесіди. sender = null — це я (відповідь зі сповіщення). */

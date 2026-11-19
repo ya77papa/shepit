@@ -645,6 +645,7 @@ fn app(issuer: Issuer, db: db::Db, shutdown: tokio::sync::watch::Receiver<bool>)
         .route("/v0/admin/invites", get(admin_invites).post(admin_create_invite))
         .route("/v0/admin/invites/{code}", axum::routing::delete(admin_revoke_invite))
         .route("/v0/admin/users", get(admin_users))
+        .route("/v0/admin/wipe", post(admin_wipe))
         .route("/v0/admin/users/{identity}", axum::routing::delete(admin_delete_user))
         .route("/v0/admin/blocked/{identity}", axum::routing::delete(admin_unblock))
         .with_state(shared)
@@ -918,6 +919,37 @@ async fn admin_delete_user(
         }
         Ok(false) => StatusCode::NOT_FOUND,
         Err(e) => internal(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct WipeReq {
+    password: String,
+}
+
+/// «Почати з чистої сторінки» — видалити всіх користувачів. Потрібна сесія адміністратора
+/// і ще раз пароль (щоб не натиснути випадково чи з чужого відкритого браузера).
+async fn admin_wipe(State(app): State<Shared>, headers: HeaderMap, Json(req): Json<WipeReq>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Err(s) = admin_guard(&app, &headers) {
+        return s.into_response();
+    }
+    let ok = tokio::task::spawn_blocking(move || admin::stored_hash(&data_dir()).is_some_and(|h| admin::verify(&h, &req.password)))
+        .await
+        .unwrap_or(false);
+    if !ok {
+        // 403, не 401: сесія жива, просто пароль не той.
+        return (StatusCode::FORBIDDEN, "wrong-password").into_response();
+    }
+    match app.db.wipe_users() {
+        Ok(n) => {
+            app.bells.lock().unwrap().clear();
+            app.seen.lock().unwrap().clear();
+            app.presence.clear();
+            println!("Адмін: чиста сторінка — видалено акаунтів: {n}");
+            Json(serde_json::json!({ "deleted": n })).into_response()
+        }
+        Err(e) => internal(e).into_response(),
     }
 }
 

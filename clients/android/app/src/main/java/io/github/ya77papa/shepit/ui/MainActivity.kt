@@ -100,13 +100,21 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         app.lock.onForeground()
         applySecureFlag()
-        if (app.repo.hasAccount()) promptUpdate()
+        if (app.repo.hasAccount()) {
+            promptUpdate()
+            // Без фонової роботи служба живе лише поки застосунок на екрані.
+            if (!app.repo.backgroundWork) ShepitService.start(this)
+        }
     }
 
     override fun onStop() {
         if (!isChangingConfigurations) {
             app.lock.onBackground()
             app.repo.scope.launch { app.repo.presenceBeat(online = false) } // «згорнув»
+            // Фонову роботу вимкнено: зупинити службу, щойно застосунок пішов з екрана (не під час дзвінка).
+            if (!app.repo.backgroundWork && app.calls.state.value == io.github.ya77papa.shepit.call.CallManager.State.IDLE) {
+                stopService(android.content.Intent(this, ShepitService::class.java))
+            }
         }
         super.onStop()
     }

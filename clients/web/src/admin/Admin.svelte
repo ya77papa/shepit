@@ -63,6 +63,36 @@
     return r;
   }
 
+  let wipePw = $state('');
+  let wiping = $state(false);
+  let wipeMsg = $state('');
+
+  async function wipeAll() {
+    if (!confirm(`Видалити ВСІХ користувачів (${users.length}), канали й запрошення? Це не можна скасувати.`)) return;
+    wiping = true;
+    wipeMsg = '';
+    try {
+      const r = await fetch('/v0/admin/wipe', {
+        method: 'POST', cache: 'no-store',
+        headers: { ...H, 'content-type': 'application/json' },
+        body: JSON.stringify({ password: wipePw }),
+      });
+      if (r.status === 403) wipeMsg = 'Неправильний пароль.';
+      else if (r.status === 401) state = 'login';
+      else if (!r.ok) wipeMsg = `Помилка: ${r.status}`;
+      else {
+        const { deleted } = await r.json();
+        wipeMsg = `Готово: видалено акаунтів — ${deleted}. Сервер порожній.`;
+        await load();
+      }
+    } catch (e) {
+      wipeMsg = e instanceof Error ? e.message : String(e);
+    } finally {
+      wipePw = '';
+      wiping = false;
+    }
+  }
+
   async function load() {
     const [o, i, u, c] = await Promise.all([api('GET', 'overview'), api('GET', 'invites'), api('GET', 'users'), api('GET', 'channels')]);
     chans = await c.json();
@@ -320,6 +350,21 @@
       {/if}
     </section>
 
+    <section class="card danger-zone">
+      <h2>Почати з чистої сторінки</h2>
+      <p class="muted small">
+        Видалити всіх користувачів ({users.length}) разом із ключами, недоставленими повідомленнями, каналами,
+        запрошеннями й списком заблокованих. Режим реєстрації, ліміти й пароль адміністратора лишаються.
+        Твій власний акаунт у застосунку теж буде видалено. Бесіди на телефонах людей лишаться в них як архів.
+      </p>
+      <label class="field">
+        <span class="small">Пароль адміністратора — ще раз</span>
+        <input type="password" bind:value={wipePw} autocomplete="current-password" />
+      </label>
+      {#if wipeMsg}<p class="small">{wipeMsg}</p>{/if}
+      <button class="danger" disabled={!wipePw || wiping} onclick={wipeAll}>{wiping ? 'Видаляю…' : 'Видалити всіх користувачів'}</button>
+    </section>
+
     <section class="card">
       <h2>Канали ({chans.length})</h2>
       <p class="small muted">Зміст зашифрованих каналів сервер не бачить — лише розмір. Групи на сервері не зберігаються взагалі.</p>
@@ -463,4 +508,7 @@
   dt { color: var(--muted); }
   dd { margin: 0; word-break: break-word; }
   a { color: var(--accent); }
+  .danger-zone { border-color: #8b2c2c; }
+  .danger-zone h2 { color: #ff7b72; }
+  button.danger { background: #8b2c2c; color: #fff; border: 0; }
 </style>

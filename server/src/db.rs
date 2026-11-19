@@ -288,6 +288,20 @@ impl Db {
         Ok(n > 0 || block)
     }
 
+    /// «Чиста сторінка»: усі користувачі з усіма їхніми даними, канали, запрошення, блокування.
+    /// Налаштування (режим реєстрації, ліміти) лишаються. Повертає, скільки акаунтів було.
+    pub fn wipe_users(&self) -> rusqlite::Result<usize> {
+        let mut c = self.0.lock().unwrap();
+        let tx = c.transaction()?;
+        let n = tx.execute("DELETE FROM accounts", [])?;
+        for t in ["keys", "envelopes", "push_subs", "invites", "blocked", "channel_posts", "channels"] {
+            tx.execute(&format!("DELETE FROM {t}"), [])?;
+        }
+        tx.commit()?;
+        let _ = c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
+        Ok(n)
+    }
+
     pub fn is_blocked(&self, identity: &str) -> rusqlite::Result<bool> {
         Ok(self.0.lock().unwrap()
             .query_row("SELECT 1 FROM blocked WHERE identity = ?1", [identity], |_| Ok(()))

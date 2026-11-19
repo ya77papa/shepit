@@ -43,6 +43,9 @@ class Api(private val base: String = BuildConfig.SERVER) {
 
     fun url(path: String) = base + path
 
+    /** Сервер відмовив (403 з кодом причини, напр. not-registered). */
+    @Volatile var onRefusal: ((String) -> Unit)? = null
+
     private fun exec(req: Request): Response {
         val r = client.newCall(req).execute()
         noteDate(r)
@@ -50,6 +53,7 @@ class Api(private val base: String = BuildConfig.SERVER) {
             val code = r.code
             val why = if (code == 403) runCatching { r.body.string().trim() }.getOrDefault("") else ""
             r.close()
+            if (why.isNotEmpty()) onRefusal?.invoke(why)
             throw HttpException(
                 code,
                 when {

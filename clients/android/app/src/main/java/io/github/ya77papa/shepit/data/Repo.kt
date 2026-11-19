@@ -28,7 +28,9 @@ import org.json.JSONObject
  */
 class Repo(context: Context) {
     private val ctx: Context = context.applicationContext
-    val api = Api()
+    val api = Api().also { a ->
+        a.onRefusal = { why -> if (why == "not-registered" || why == "account-blocked") _accountGone.value = why }
+    }
     val db = Db(context)
     private val secure = SecureState(context)
     private val lock = Mutex()
@@ -571,7 +573,8 @@ class Repo(context: Context) {
     suspend fun presenceBeat(online: Boolean) = withContext(Dispatchers.IO) {
         val c = core ?: return@withContext
         val body = JSONObject().put("online", online).put("share", showPresence).toString().toByteArray()
-        runCatching { api.post("/v0/presence", body, c.authHeader("POST /v0/presence", body)) }
+        // Пройшло — акаунт на сервері є (наприклад, у відкритому режимі знову зареєструвався сам).
+        runCatching { api.post("/v0/presence", body, c.authHeader("POST /v0/presence", body)) }.onSuccess { _accountGone.value = null }
     }
 
     /** Оновити статуси контактів (старий сервер — просто без статусів). */
@@ -618,6 +621,15 @@ class Repo(context: Context) {
     /** Вихідне в бесіді peer пішло на сервер (для звуку «надіслано»). */
     private val _sent = MutableSharedFlow<String>(extraBufferCapacity = 16)
     val sent = _sent.asSharedFlow()
+
+    /** Працювати у фоні (служба з постійним з'єднанням). Вимкнено — лише поки застосунок на екрані. */
+    var backgroundWork: Boolean
+        get() = db.get("backgroundWork") != "0"
+        set(v) = db.set("backgroundWork", if (v) "1" else "0")
+
+    /** Сервер каже, що акаунта на ньому вже немає (видалено чи заблоковано адміністратором). */
+    private val _accountGone = MutableStateFlow<String?>(null)
+    val accountGone = _accountGone.asStateFlow()
 
     /** Звуки в бесіді. */
     var chatSounds: Boolean
@@ -910,6 +922,7 @@ class Repo(context: Context) {
     }
 
     fun wipe() {
+        _accountGone.value = null
         core = null
         secure.wipe()
         db.wipe()

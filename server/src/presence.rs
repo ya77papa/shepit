@@ -67,6 +67,10 @@ impl Presence {
             .collect()
     }
 
+    pub fn clear(&self) {
+        self.0.lock().unwrap().clear();
+    }
+
     pub fn forget(&self, who: &str) {
         self.0.lock().unwrap().remove(who);
     }

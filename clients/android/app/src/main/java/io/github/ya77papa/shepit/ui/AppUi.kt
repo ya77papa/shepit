@@ -29,6 +29,7 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -241,6 +242,28 @@ private fun Main(
     // Нові дописи в каналах — раз на 2 хв, поки застосунок відкритий.
     LaunchedEffect(Unit) { while (true) { runCatching { repo.checkChannels() }; delay(120_000) } }
     LaunchedEffect(screen, peer) { MainActivity.openPeer = if (screen == Screen.CHAT) peer else null }
+
+    // Адміністратор видалив акаунт на сервері (чи «чиста сторінка») — сказати прямо й запропонувати новий.
+    val gone by repo.accountGone.collectAsState()
+    var goneDismissed by remember { mutableStateOf(false) }
+    if (gone != null && !goneDismissed) AlertDialog(
+        onDismissRequest = { goneDismissed = true },
+        title = { Text(if (gone == "account-blocked") "Акаунт заблоковано" else "Акаунт видалено на сервері") },
+        text = {
+            Text(
+                if (gone == "account-blocked") "Адміністратор сервера заблокував цей акаунт. Повідомлення не надсилаються й не приходять."
+                else "Адміністратор сервера видалив цей акаунт. Повідомлення не надсилаються й не приходять. Бесіди на телефоні лишаються, доки ти їх не стреш. Можна створити новий акаунт — контакти доведеться додати заново.",
+            )
+        },
+        confirmButton = {
+            if (gone != "account-blocked") TextButton(onClick = {
+                repo.wipe()
+                act.stopService(Intent(act, io.github.ya77papa.shepit.service.ShepitService::class.java))
+                onLogout()
+            }) { Text("Створити новий акаунт") }
+        },
+        dismissButton = { TextButton(onClick = { goneDismissed = true }) { Text("Пізніше") } },
+    )
 
     BackHandler(enabled = screen != Screen.CONTACTS) {
         when (screen) {
@@ -963,220 +986,233 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
     }
     LifecycleResume { battery = act.ignoringBattery() }
 
+    // Розділ налаштувань: null — головне меню.
+    var section by rememberSaveable { mutableStateOf<String?>(null) }
+    fun saveName() {
+        val changed = repo.myName != name.trim()
+        repo.myName = name
+        if (changed) repo.scope.launch { repo.sendProfile() } // нове ім'я — контактам
+    }
+    fun back() { if (section != null) { if (section == "profile") saveName(); section = null } else { saveName(); onBack() } }
+    BackHandler(enabled = section != null) { back() }
+    val titles = mapOf(
+        "profile" to "Профіль", "account" to "Акаунт", "security" to "Безпека", "privacy" to "Приватність",
+        "notify" to "Сповіщення і звуки", "updates" to "Оновлення", "about" to "Про Шепіт",
+    )
+
     Column(Modifier.fillMaxSize()) {
         TopAppBar(
-            navigationIcon = {
-                IconButton(onClick = {
-                    val changed = repo.myName != name.trim()
-                    repo.myName = name
-                    if (changed) repo.scope.launch { repo.sendProfile() } // нове ім'я — контактам
-                    onBack()
-                }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Назад") }
-            },
-            title = { Text("Налаштування") },
+            navigationIcon = { IconButton(onClick = { back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Назад") } },
+            title = { Text(section?.let { titles[it] } ?: "Налаштування") },
             colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
         )
         Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-            Section("Моє фото") {
-                var avatar by remember { mutableStateOf(repo.myAvatar) }
-                val pick = rememberAvatarPicker(toast) { a ->
-                    repo.myAvatar = a; avatar = a
-                    repo.sendProfile()
-                    toast("Фото оновлено і надіслано контактам")
-                }
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    AvatarView(name.ifEmpty { "?" }, avatar.ifEmpty { null }, 64.dp)
-                    OutlinedButton(onClick = pick) { Text("Обрати") }
-                    if (avatar.isNotEmpty()) TextButton(onClick = { repo.myAvatar = ""; avatar = ""; scope.launch { repo.sendProfile() } }) { Text("Прибрати") }
-                }
-                Text("Бачать лише твої контакти: фото йде їм зашифрованим, сервер його не бачить.", color = Muted, fontSize = 12.sp)
-            }
-            Section("Моє ім'я") {
-                OutlinedTextField(name, { name = it.take(60) }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                Text("Бачать лише ті, кого ти запрошуєш. Сервер його не знає.", color = Muted, fontSize = 12.sp)
-            }
-            Section("Мій ID") { Text(repo.core?.fingerprint() ?: "", fontFamily = FontFamily.Monospace) }
-            Section("Дзвінки, коли застосунок закритий") {
-                Text("Шепіт тримає з'єднання з сервером без сервісів Google (тихе сповіщення «на зв'язку»).", color = Muted, fontSize = 13.sp)
-                if (!battery) OutlinedButton(onClick = { act.askBattery() }) { Text("Дозволити працювати у фоні") } else Text("Фонова робота дозволена")
-                if (!Notifications.canFullScreen(ctx)) OutlinedButton(onClick = { act.askFullScreen() }) { Text("Дозволити дзвінки на весь екран") } else Text("Дзвінки на весь екран дозволені")
-            }
-            Section("Дзвінки: діагностика") {
-                var check by remember { mutableStateOf("") }
-                var checking by remember { mutableStateOf(false) }
-                val callLog by app.calls.log.collectAsState()
-                OutlinedButton(enabled = !checking, onClick = {
-                    checking = true; check = ""
-                    scope.launch { check = app.calls.checkRelay(); checking = false }
-                }) { Text(if (checking) "Перевіряю…" else "Перевірити ретранслятор") }
-                if (check.isNotEmpty()) Text(check, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
-                if (callLog.isNotEmpty()) {
-                    Text("Журнал останнього дзвінка (без вмісту розмови):", color = Muted, fontSize = 13.sp)
-                    Text(callLog.joinToString("\n"), fontFamily = FontFamily.Monospace, fontSize = 11.sp)
-                    OutlinedButton(onClick = {
-                        ctx.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Шепіт: журнал дзвінка", "Шепіт ${BuildConfig.VERSION_NAME}\n" + callLog.joinToString("\n")))
-                        toast("Журнал скопійовано")
-                    }) { Text("Копіювати журнал") }
-                }
-            }
-            Section("Блокування") {
-                val lock = app.lock
-                var pinOn by remember { mutableStateOf(lock.pinEnabled) }
-                var bioOn by remember { mutableStateOf(lock.bioEnabled) }
-                var delayMs by remember { mutableLongStateOf(lock.delayMs) }
-                var secure by remember { mutableStateOf(lock.secureScreen) }
-                var pinDialog by remember { mutableStateOf<String?>(null) } // set | off
-                val bioOk = remember { lock.biometricAvailable() }
-                Text("Хто тримає розблокований телефон, не відкриє Шепіт без PIN-коду чи відбитка. Вхідні дзвінки можна прийняти й без розблокування. Поки блокування увімкнене, сповіщення не показують текст повідомлень.", color = Muted, fontSize = 12.sp)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("PIN-код", Modifier.weight(1f))
-                    Switch(checked = pinOn, onCheckedChange = { pinDialog = if (it) "set" else "off" })
-                }
-                if (pinOn) TextButton(onClick = { pinDialog = "change" }) { Text("Змінити PIN-код") }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Відбиток пальця")
-                        if (!bioOk) Text("Недоступно: на телефоні немає сканера або не додано відбиток.", color = Muted, fontSize = 12.sp)
-                        else if (!pinOn) Text("Запасний варіант — блокування самого телефона.", color = Muted, fontSize = 12.sp)
-                    }
-                    Switch(enabled = bioOk, checked = bioOn, onCheckedChange = { on ->
-                        if (!on) { lock.bioEnabled = false; bioOn = false }
-                        else lock.promptBiometric(act, "Підтверди відбиток", onSuccess = { lock.bioEnabled = true; bioOn = true }, onFallback = {})
-                    })
-                }
-                if (pinOn || bioOn) {
-                    Text("Блокувати після виходу з застосунку", color = Muted, fontSize = 13.sp)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf(0L to "Одразу", 60_000L to "Через 1 хв", 300_000L to "Через 5 хв").forEach { (ms, label) ->
-                            FilterChip(selected = delayMs == ms, onClick = { lock.delayMs = ms; delayMs = ms }, label = { Text(label) })
+            when (section) {
+                null -> {
+                    // Картка профілю.
+                    Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface, modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).clickable { section = "profile" }) {
+                        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                            AvatarView(repo.myName.ifEmpty { "?" }, repo.myAvatar.ifEmpty { null }, 56.dp)
+                            Spacer(Modifier.width(14.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(repo.myName.ifEmpty { "Без імені" }, fontWeight = FontWeight.SemiBold, fontSize = 17.sp)
+                                Text("Ім'я, фото, код безпеки", color = Muted, fontSize = 13.sp)
+                            }
+                            Text("›", color = Muted, fontSize = 22.sp)
                         }
                     }
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Повідомляти про перегляд")
-                        Text("Якщо вимкнути, ти теж не бачитимеш, чи переглянули твої. «Доставлено» працює завжди.", color = Muted, fontSize = 12.sp)
-                    }
-                    var rr by remember { mutableStateOf(app.repo.readReceipts) }
-                    Switch(checked = rr, onCheckedChange = { app.repo.readReceipts = it; rr = it })
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Показувати, коли я в мережі")
-                        Text("Якщо вимкнути, інші бачитимуть лише «востаннє нещодавно», і ти так само не бачитимеш їхній час.", color = Muted, fontSize = 12.sp)
-                    }
-                    var sp by remember { mutableStateOf(app.repo.showPresence) }
-                    Switch(checked = sp, onCheckedChange = {
-                        app.repo.showPresence = it; sp = it
-                        app.repo.scope.launch { app.repo.presenceBeat(online = true); app.repo.refreshPresence() }
-                    })
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Звуки в бесіді")
-                        Text("Тихий сигнал «надіслано» й «отримано», коли бесіда відкрита. У беззвучному режимі мовчить.", color = Muted, fontSize = 12.sp)
-                    }
-                    var cs by remember { mutableStateOf(app.repo.chatSounds) }
-                    Switch(checked = cs, onCheckedChange = { app.repo.chatSounds = it; cs = it })
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Приховувати вміст")
-                        Text("У списку відкритих застосунків і на скріншотах (скріншоти Шепоту стануть неможливими).", color = Muted, fontSize = 12.sp)
-                    }
-                    Switch(checked = secure, onCheckedChange = { lock.secureScreen = it; secure = it; act.applySecureFlag() })
-                }
-                pinDialog?.let { mode ->
-                    var step by remember(mode) { mutableStateOf(if (mode == "set") "new" else "current") }
-                    var first by remember(mode) { mutableStateOf("") }
-                    var msg by remember(mode) { mutableStateOf("") }
-                    var checking by remember(mode) { mutableStateOf(false) }
-                    AlertDialog(
-                        onDismissRequest = { pinDialog = null },
-                        title = { Text(when (step) { "current" -> "Поточний PIN-код"; "new" -> "Новий PIN-код (4–8 цифр)"; else -> "Повтори PIN-код" }) },
-                        text = {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
-                                if (msg.isNotEmpty()) Text(msg, color = Danger, fontSize = 13.sp)
-                                Spacer(Modifier.height(8.dp))
-                                key(step) {
-                                    PinPad(if (step == "current") lock.pinLength else if (step == "repeat") first.length else 0, enabled = !checking) { pin ->
-                                        when (step) {
-                                            "current" -> {
-                                                checking = true
-                                                scope.launch {
-                                                    val ok = withContext(kotlinx.coroutines.Dispatchers.Default) { lock.checkPin(pin) }
-                                                    checking = false
-                                                    when {
-                                                        !ok -> msg = if (lock.waitSeconds() > 0) "Забагато спроб — зачекай ${lock.waitSeconds()} с" else "Неправильний PIN-код"
-                                                        mode == "off" -> { lock.clearPin(); pinOn = false; pinDialog = null }
-                                                        else -> { msg = ""; step = "new" }
-                                                    }
-                                                }
-                                            }
-                                            "new" -> { first = pin; msg = ""; step = "repeat" }
-                                            else -> if (pin == first) {
-                                                checking = true
-                                                scope.launch {
-                                                    withContext(kotlinx.coroutines.Dispatchers.Default) { lock.setPin(pin) }
-                                                    checking = false; pinOn = true; pinDialog = null
-                                                    toast("PIN-код збережено")
-                                                }
-                                            } else { msg = "PIN-коди не збігаються — спробуй ще раз"; first = ""; step = "new" }
-                                        }
+                    Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface, modifier = Modifier.fillMaxWidth()) {
+                        Column {
+                            val rows = listOf(
+                                Triple("account", "Акаунт", "Резервна копія, вийти, видалити"),
+                                Triple("security", "Безпека", "PIN-код і відбиток, приховування вмісту"),
+                                Triple("privacy", "Приватність", "В мережі, переглянуто"),
+                                Triple("notify", "Сповіщення і звуки", "Фонова робота, дзвінки, звуки в бесіді"),
+                                Triple("updates", "Оновлення", "Версія ${BuildConfig.VERSION_NAME}"),
+                                Triple("about", "Про Шепіт", "Сервер, вихідний код, діагностика"),
+                            )
+                            rows.forEachIndexed { i, (key, t, sub) ->
+                                if (i > 0) HorizontalDivider(color = MaterialTheme.colorScheme.background)
+                                Row(Modifier.fillMaxWidth().clickable { section = key }.padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(t)
+                                        Text(sub, color = Muted, fontSize = 12.sp)
                                     }
+                                    Text("›", color = Muted, fontSize = 22.sp)
                                 }
                             }
-                        },
-                        confirmButton = {},
-                        dismissButton = { TextButton(onClick = { pinDialog = null }) { Text("Скасувати") } },
-                    )
-                }
-            }
-            Section("Резервна копія") {
-                Text("Файл з ключами, контактами й історією, зашифрований паролем. Підходить і для копії зі старої веб-версії.", color = Muted, fontSize = 13.sp)
-                OutlinedTextField(pw1, { pw1 = it }, label = { Text("Пароль (щонайменше ${Backup.MIN_PASSWORD} символів)") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(pw2, { pw2 = it }, label = { Text("Повтори пароль") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
-                Button(enabled = !busy && pw1.length >= Backup.MIN_PASSWORD, onClick = {
-                    if (pw1 != pw2) { toast("Паролі не збігаються"); return@Button }
-                    busy = true
-                    scope.launch {
-                        runCatching { repo.exportBackup(pw1) }
-                            .onSuccess { pendingBackup = it; pw1 = ""; pw2 = ""; (ctx.applicationContext as io.github.ya77papa.shepit.ShepitApp).lock.expectReturn(); save.launch("shepit-${SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).format(Date())}.shepit-backup") }
-                            .onFailure { toast(it.message ?: "Помилка") }
-                        busy = false
-                    }
-                }) { Text(if (busy) "Шифрую…" else "Зберегти у файл") }
-            }
-            Section("Версія й оновлення") {
-                val upd = app.updater
-                val available by upd.available.collectAsState()
-                var auto by remember { mutableStateOf(upd.auto) }
-                var checking by remember { mutableStateOf(false) }
-                var status by remember { mutableStateOf("") }
-                Text("${BuildConfig.VERSION_NAME} (${BuildConfig.COMMIT.take(7)}) · відкритий код: github.com/ya77papa/shepit", color = Muted, fontSize = 13.sp)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Перевіряти оновлення автоматично", Modifier.weight(1f))
-                    Switch(checked = auto, onCheckedChange = { auto = it; upd.auto = it })
-                }
-                Text("Раз на 12 год застосунок питає GitHub про нову версію (GitHub бачить лише IP-адресу). Оновлення ставиться тільки після твого підтвердження і тільки якщо підписане тим самим ключем.", color = Muted, fontSize = 12.sp)
-                if (available != null) {
-                    Button(onClick = onUpdate) { Text("Оновити до ${available!!.versionName}") }
-                } else {
-                    OutlinedButton(enabled = !checking, onClick = {
-                        checking = true; status = ""
-                        scope.launch {
-                            status = runCatching { upd.check() }.fold({ if (it == null) "У тебе найновіша версія" else "" }, { "Не вдалося перевірити: ${it.message}" })
-                            checking = false
                         }
-                    }) { Text(if (checking) "Перевіряю…" else "Перевірити оновлення") }
-                    if (status.isNotEmpty()) Text(status, fontSize = 13.sp)
+                    }
                 }
-            }
-            OutlinedButton(onClick = { confirmLogout = true }, modifier = Modifier.fillMaxWidth()) {
-                Text("Вийти й стерти ключі з цього телефона")
-            }
-            Button(onClick = { confirmDelete = true }, colors = ButtonDefaults.buttonColors(containerColor = Danger, contentColor = Color.White), modifier = Modifier.fillMaxWidth()) {
-                Text("Видалити акаунт назавжди")
+                "profile" -> {
+                    Section("Моє фото") {
+                        var avatar by remember { mutableStateOf(repo.myAvatar) }
+                        val pick = rememberAvatarPicker(toast) { a ->
+                            repo.myAvatar = a; avatar = a
+                            repo.sendProfile()
+                            toast("Фото оновлено і надіслано контактам")
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            AvatarView(name.ifEmpty { "?" }, avatar.ifEmpty { null }, 64.dp)
+                            OutlinedButton(onClick = pick) { Text("Обрати") }
+                            if (avatar.isNotEmpty()) TextButton(onClick = { repo.myAvatar = ""; avatar = ""; scope.launch { repo.sendProfile() } }) { Text("Прибрати") }
+                        }
+                        Text("Бачать лише твої контакти: фото йде їм зашифрованим, сервер його не бачить.", color = Muted, fontSize = 12.sp)
+                    }
+                    Section("Моє ім'я") {
+                        OutlinedTextField(name, { name = it.take(60) }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                        Text("Бачать лише ті, кого ти запрошуєш. Сервер його не знає.", color = Muted, fontSize = 12.sp)
+                    }
+                    Section("Код безпеки") {
+                        Text(repo.core?.fingerprint() ?: "", fontFamily = FontFamily.Monospace)
+                        Text("Звір його з другом при зустрічі чи телефоном — так ви переконаєтесь, що між вами ніхто не підмінив ключі.", color = Muted, fontSize = 12.sp)
+                    }
+                }
+                "account" -> {
+                    Section("Резервна копія") {
+                        Text("Файл з ключами, контактами й історією, зашифрований паролем. Відновити — на екрані входу: «Відновити з резервної копії».", color = Muted, fontSize = 13.sp)
+                        OutlinedTextField(pw1, { pw1 = it }, label = { Text("Пароль (щонайменше ${Backup.MIN_PASSWORD} символів)") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+                        OutlinedTextField(pw2, { pw2 = it }, label = { Text("Повтори пароль") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+                        Button(enabled = !busy && pw1.length >= Backup.MIN_PASSWORD, onClick = {
+                            if (pw1 != pw2) { toast("Паролі не збігаються"); return@Button }
+                            busy = true
+                            scope.launch {
+                                runCatching { repo.exportBackup(pw1) }
+                                    .onSuccess { pendingBackup = it; pw1 = ""; pw2 = ""; app.lock.expectReturn(); save.launch("shepit-${SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).format(Date())}.shepit-backup") }
+                                    .onFailure { toast(it.message ?: "Помилка") }
+                                busy = false
+                            }
+                        }) { Text(if (busy) "Шифрую…" else "Зберегти у файл") }
+                    }
+                    Section("Вийти") {
+                        Text("Ключі зникнуть із цього телефона, а акаунт лишиться на сервері. Повернутись можна з резервної копії.", color = Muted, fontSize = 13.sp)
+                        OutlinedButton(onClick = { confirmLogout = true }, modifier = Modifier.fillMaxWidth()) { Text("Вийти й стерти ключі з цього телефона") }
+                    }
+                    Section("Видалити акаунт") {
+                        Text("Назавжди: канали, групи, де ти адміністратор, бесіди з тобою в контактів і сам акаунт на сервері.", color = Muted, fontSize = 13.sp)
+                        Button(onClick = { confirmDelete = true }, colors = ButtonDefaults.buttonColors(containerColor = Danger, contentColor = Color.White), modifier = Modifier.fillMaxWidth()) {
+                            Text("Видалити акаунт назавжди")
+                        }
+                    }
+                }
+                "security" -> SecuritySection(app, act, toast)
+                "privacy" -> {
+                    Section("Приватність") {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("Показувати, коли я в мережі")
+                                Text("Якщо вимкнути, інші бачитимуть лише «востаннє нещодавно», і ти так само не бачитимеш їхній час.", color = Muted, fontSize = 12.sp)
+                            }
+                            var sp by remember { mutableStateOf(repo.showPresence) }
+                            Switch(checked = sp, onCheckedChange = {
+                                repo.showPresence = it; sp = it
+                                repo.scope.launch { repo.presenceBeat(online = true); repo.refreshPresence() }
+                            })
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("Повідомляти про перегляд")
+                                Text("Якщо вимкнути, ти теж не бачитимеш, чи переглянули твої. «Доставлено» працює завжди.", color = Muted, fontSize = 12.sp)
+                            }
+                            var rr by remember { mutableStateOf(repo.readReceipts) }
+                            Switch(checked = rr, onCheckedChange = { repo.readReceipts = it; rr = it })
+                        }
+                    }
+                }
+                "notify" -> {
+                    var bg by remember { mutableStateOf(repo.backgroundWork) }
+                    var shown by remember { mutableStateOf(Notifications.serviceVisible(ctx)) }
+                    LifecycleResume { shown = Notifications.serviceVisible(ctx); battery = act.ignoringBattery() }
+                    Section("Фонова робота") {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("Працювати у фоні")
+                                Text("Повідомлення й дзвінки доходять, навіть коли Шепіт закритий. Вимкнеш — лише коли застосунок відкритий (сервісів Google Шепіт не використовує).", color = Muted, fontSize = 12.sp)
+                            }
+                            Switch(checked = bg, onCheckedChange = { on ->
+                                repo.backgroundWork = on; bg = on
+                                if (on) io.github.ya77papa.shepit.service.ShepitService.start(ctx)
+                                // Вимкнено: служба працює лише поки застосунок на екрані (зупиняється при згортанні).
+                            })
+                        }
+                        if (bg) Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("Показувати «Шепіт на зв'язку»")
+                                Text("Вимкнеш — сповіщення зникне зі шторки, а фонова робота триватиме. Відкриються системні налаштування цього сповіщення.", color = Muted, fontSize = 12.sp)
+                            }
+                            Switch(checked = shown, onCheckedChange = { app.lock.expectReturn(); Notifications.openServiceSettings(ctx) })
+                        }
+                        if (bg) {
+                            if (!battery) OutlinedButton(onClick = { act.askBattery() }) { Text("Дозволити працювати у фоні без обмежень") } else Text("Оптимізацію батареї для Шепоту вимкнено", color = Muted, fontSize = 13.sp)
+                        }
+                    }
+                    Section("Дзвінки") {
+                        if (!Notifications.canFullScreen(ctx)) OutlinedButton(onClick = { act.askFullScreen() }) { Text("Дозволити дзвінки на весь екран") } else Text("Дзвінки на весь екран дозволені", color = Muted, fontSize = 13.sp)
+                    }
+                    Section("Повідомлення") {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("Звуки в бесіді")
+                                Text("Тихий сигнал «надіслано» й «отримано», коли бесіда відкрита. У беззвучному режимі мовчить.", color = Muted, fontSize = 12.sp)
+                            }
+                            var cs by remember { mutableStateOf(repo.chatSounds) }
+                            Switch(checked = cs, onCheckedChange = { repo.chatSounds = it; cs = it })
+                        }
+                        OutlinedButton(onClick = { app.lock.expectReturn(); Notifications.openAppSettings(ctx) }) { Text("Сповіщення Android: звук, вібрація") }
+                    }
+                }
+                "updates" -> {
+                    Section("Версія й оновлення") {
+                        val upd = app.updater
+                        val available by upd.available.collectAsState()
+                        var auto by remember { mutableStateOf(upd.auto) }
+                        var checking by remember { mutableStateOf(false) }
+                        var status by remember { mutableStateOf("") }
+                        Text("${BuildConfig.VERSION_NAME} (${BuildConfig.COMMIT.take(7)})", color = Muted, fontSize = 13.sp)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Перевіряти оновлення автоматично", Modifier.weight(1f))
+                            Switch(checked = auto, onCheckedChange = { auto = it; upd.auto = it })
+                        }
+                        Text("Раз на 12 год застосунок питає GitHub про нову версію (GitHub бачить лише IP-адресу). Оновлення ставиться тільки після твого підтвердження і тільки якщо підписане тим самим ключем.", color = Muted, fontSize = 12.sp)
+                        if (available != null) {
+                            Button(onClick = onUpdate) { Text("Оновити до ${available!!.versionName}") }
+                        } else {
+                            OutlinedButton(enabled = !checking, onClick = {
+                                checking = true; status = ""
+                                scope.launch {
+                                    status = runCatching { upd.check() }.fold({ if (it == null) "У тебе найновіша версія" else "" }, { "Не вдалося перевірити: ${it.message}" })
+                                    checking = false
+                                }
+                            }) { Text(if (checking) "Перевіряю…" else "Перевірити оновлення") }
+                            if (status.isNotEmpty()) Text(status, fontSize = 13.sp)
+                        }
+                    }
+                }
+                "about" -> {
+                    Section("Шепіт") {
+                        Text("Версія ${BuildConfig.VERSION_NAME} (${BuildConfig.COMMIT.take(7)})")
+                        Text("Сервер: ${repo.api.url("").removePrefix("https://").removeSuffix("/")}", color = Muted, fontSize = 13.sp)
+                        Text("Відкритий код: github.com/ya77papa/shepit", color = Muted, fontSize = 13.sp)
+                    }
+                    Section("Дзвінки: діагностика") {
+                        var check by remember { mutableStateOf("") }
+                        var checking by remember { mutableStateOf(false) }
+                        val callLog by app.calls.log.collectAsState()
+                        OutlinedButton(enabled = !checking, onClick = {
+                            checking = true; check = ""
+                            scope.launch { check = app.calls.checkRelay(); checking = false }
+                        }) { Text(if (checking) "Перевіряю…" else "Перевірити ретранслятор") }
+                        if (check.isNotEmpty()) Text(check, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                        if (callLog.isNotEmpty()) {
+                            Text("Журнал останнього дзвінка (без вмісту розмови):", color = Muted, fontSize = 13.sp)
+                            Text(callLog.joinToString("\n"), fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                            OutlinedButton(onClick = {
+                                ctx.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Шепіт: журнал дзвінка", "Шепіт ${BuildConfig.VERSION_NAME}\n" + callLog.joinToString("\n")))
+                                toast("Журнал скопійовано")
+                            }) { Text("Копіювати журнал") }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1222,6 +1258,98 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
         confirmButton = { TextButton(onClick = { repo.wipe(); confirmLogout = false; ctx.stopService(Intent(ctx, io.github.ya77papa.shepit.service.ShepitService::class.java)); onLogout() }) { Text("Стерти", color = Danger) } },
         dismissButton = { TextButton(onClick = { confirmLogout = false }) { Text("Скасувати") } },
     )
+}
+
+/** Налаштування → Безпека: PIN-код, відбиток, автоблокування, приховування вмісту. */
+@Composable
+private fun SecuritySection(app: ShepitApp, act: MainActivity, toast: (String) -> Unit) {
+    val scope = rememberCoroutineScope()
+    Section("Блокування застосунку") {
+        val lock = app.lock
+        var pinOn by remember { mutableStateOf(lock.pinEnabled) }
+        var bioOn by remember { mutableStateOf(lock.bioEnabled) }
+        var delayMs by remember { mutableLongStateOf(lock.delayMs) }
+        var secure by remember { mutableStateOf(lock.secureScreen) }
+        var pinDialog by remember { mutableStateOf<String?>(null) } // set | off
+        val bioOk = remember { lock.biometricAvailable() }
+        Text("Хто тримає розблокований телефон, не відкриє Шепіт без PIN-коду чи відбитка. Вхідні дзвінки можна прийняти й без розблокування. Поки блокування увімкнене, сповіщення не показують текст повідомлень.", color = Muted, fontSize = 12.sp)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("PIN-код", Modifier.weight(1f))
+            Switch(checked = pinOn, onCheckedChange = { pinDialog = if (it) "set" else "off" })
+        }
+        if (pinOn) TextButton(onClick = { pinDialog = "change" }) { Text("Змінити PIN-код") }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Відбиток пальця")
+                if (!bioOk) Text("Недоступно: на телефоні немає сканера або не додано відбиток.", color = Muted, fontSize = 12.sp)
+                else if (!pinOn) Text("Запасний варіант — блокування самого телефона.", color = Muted, fontSize = 12.sp)
+            }
+            Switch(enabled = bioOk, checked = bioOn, onCheckedChange = { on ->
+                if (!on) { lock.bioEnabled = false; bioOn = false }
+                else lock.promptBiometric(act, "Підтверди відбиток", onSuccess = { lock.bioEnabled = true; bioOn = true }, onFallback = {})
+            })
+        }
+        if (pinOn || bioOn) {
+            Text("Блокувати після виходу з застосунку", color = Muted, fontSize = 13.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(0L to "Одразу", 60_000L to "Через 1 хв", 300_000L to "Через 5 хв").forEach { (ms, label) ->
+                    FilterChip(selected = delayMs == ms, onClick = { lock.delayMs = ms; delayMs = ms }, label = { Text(label) })
+                }
+            }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Приховувати вміст")
+                Text("У списку відкритих застосунків і на скріншотах (скріншоти Шепоту стануть неможливими).", color = Muted, fontSize = 12.sp)
+            }
+            Switch(checked = secure, onCheckedChange = { lock.secureScreen = it; secure = it; act.applySecureFlag() })
+        }
+        pinDialog?.let { mode ->
+            var step by remember(mode) { mutableStateOf(if (mode == "set") "new" else "current") }
+            var first by remember(mode) { mutableStateOf("") }
+            var msg by remember(mode) { mutableStateOf("") }
+            var checking by remember(mode) { mutableStateOf(false) }
+            AlertDialog(
+                onDismissRequest = { pinDialog = null },
+                title = { Text(when (step) { "current" -> "Поточний PIN-код"; "new" -> "Новий PIN-код (4–8 цифр)"; else -> "Повтори PIN-код" }) },
+                text = {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                        if (msg.isNotEmpty()) Text(msg, color = Danger, fontSize = 13.sp)
+                        Spacer(Modifier.height(8.dp))
+                        key(step) {
+                            PinPad(if (step == "current") lock.pinLength else if (step == "repeat") first.length else 0, enabled = !checking) { pin ->
+                                when (step) {
+                                    "current" -> {
+                                        checking = true
+                                        scope.launch {
+                                            val ok = withContext(kotlinx.coroutines.Dispatchers.Default) { lock.checkPin(pin) }
+                                            checking = false
+                                            when {
+                                                !ok -> msg = if (lock.waitSeconds() > 0) "Забагато спроб — зачекай ${lock.waitSeconds()} с" else "Неправильний PIN-код"
+                                                mode == "off" -> { lock.clearPin(); pinOn = false; pinDialog = null }
+                                                else -> { msg = ""; step = "new" }
+                                            }
+                                        }
+                                    }
+                                    "new" -> { first = pin; msg = ""; step = "repeat" }
+                                    else -> if (pin == first) {
+                                        checking = true
+                                        scope.launch {
+                                            withContext(kotlinx.coroutines.Dispatchers.Default) { lock.setPin(pin) }
+                                            checking = false; pinOn = true; pinDialog = null
+                                            toast("PIN-код збережено")
+                                        }
+                                    } else { msg = "PIN-коди не збігаються — спробуй ще раз"; first = ""; step = "new" }
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = {},
+                dismissButton = { TextButton(onClick = { pinDialog = null }) { Text("Скасувати") } },
+            )
+        }
+    }
 }
 
 @Composable

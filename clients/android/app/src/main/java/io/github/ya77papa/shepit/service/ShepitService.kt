@@ -99,7 +99,9 @@ class ShepitService : Service() {
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
         if (intent.action == Intent.ACTION_BOOT_COMPLETED || intent.action == Intent.ACTION_MY_PACKAGE_REPLACED) {
-            if ((ctx.applicationContext as ShepitApp).repo.hasAccount()) ShepitService.start(ctx)
+            val repo = (ctx.applicationContext as ShepitApp).repo
+            // Фонову роботу вимкнено в налаштуваннях — служба стартує лише з відкриттям застосунку.
+            if (repo.hasAccount() && repo.backgroundWork) ShepitService.start(ctx)
         }
     }
 }
