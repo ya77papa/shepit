@@ -6,6 +6,7 @@
 //! - Початок сесії: PQXDH (X25519 + ML-KEM/Kyber1024), далі Double Ratchet.
 //! - Sealed sender: відправник схований усередині шифротексту, сервер його не бачить.
 
+mod mesh;
 mod store;
 
 use std::{fs, path::Path};

@@ -124,6 +124,24 @@ impl Core {
         serde_json::to_string(&env).map_err(fail)
     }
 
+    /// Mesh: спільний секрет пари для тегів (див. docs/mesh-concept.md). Однаковий у обох.
+    pub fn mesh_secret(&self, peer: String) -> Result<Vec<u8>, CoreError> {
+        identity_bytes(&peer)?;
+        Ok(self.acc().mesh_secret(&peer).map_err(fail)?.to_vec())
+    }
+
+    /// Mesh: зашифрувати без серверного сертифіката (потрібна наявна сесія).
+    pub fn mesh_encrypt(&self, peer: String, text: String) -> Result<Vec<u8>, CoreError> {
+        identity_bytes(&peer)?;
+        self.acc().mesh_encrypt(&peer, &text).map_err(fail)
+    }
+
+    /// Mesh: розшифрувати від `peer` (визначено за тегом конверта).
+    pub fn mesh_decrypt(&self, peer: String, data: Vec<u8>) -> Result<String, CoreError> {
+        identity_bytes(&peer)?;
+        self.acc().mesh_decrypt(&peer, &data).map_err(fail)
+    }
+
     /// Розшифрувати конверт (поле `envelope` елемента скриньки).
     pub fn open_envelope(&self, envelope_json: String) -> Result<Decrypted, CoreError> {
         let env: Envelope = serde_json::from_str(&envelope_json).map_err(fail)?;

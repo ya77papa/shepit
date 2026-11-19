@@ -36,6 +36,7 @@ class ShepitService : Service() {
         if (jobs.isEmpty()) {
             val app = application as ShepitApp
             val repo = app.repo
+            if (repo.hasAccount() && repo.meshEnabled) app.mesh.start()
             jobs += repo.scope.launch {
                 if (repo.load()) repo.listenForever()
             }
@@ -67,6 +68,7 @@ class ShepitService : Service() {
     }
 
     override fun onDestroy() {
+        (application as ShepitApp).mesh.stop()
         jobs.forEach { it.cancel() }
         jobs.clear()
         super.onDestroy()

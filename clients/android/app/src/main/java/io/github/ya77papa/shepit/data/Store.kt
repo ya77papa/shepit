@@ -95,7 +95,7 @@ data class Message(
 private const val COLS = "id, peer, out, text, at, kind, voice_mime, voice_dur, voice, mid, sender, reactions, status, dlv, rd, seen, re"
 
 /** Контакти, історія, дрібні налаштування — локальна SQLite у приватній теці застосунку. */
-class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 6) {
+class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 7) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE contacts(identity TEXT PRIMARY KEY, name TEXT NOT NULL, fingerprint TEXT NOT NULL, avatar TEXT)")
         db.execSQL(
@@ -106,6 +106,12 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 6) {
         db.execSQL("CREATE INDEX messages_peer ON messages(peer, id)")
         db.execSQL("CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT)")
         createV3(db)
+        createV7(db)
+    }
+
+    /** Mesh: мої конверти, що чекають на телефон поруч (peer — кому, chat — у якій бесіді повідомлення). */
+    private fun createV7(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE mesh_out(id TEXT PRIMARY KEY, peer TEXT NOT NULL, chat TEXT NOT NULL, mid TEXT, tag BLOB NOT NULL, exp INTEGER NOT NULL, body BLOB NOT NULL)")
     }
 
     /** Групи й канали зберігаються як JSON — той самий формат, що у веб-версії й резервній копії. */
@@ -130,6 +136,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 6) {
             db.execSQL("ALTER TABLE messages ADD COLUMN seen INTEGER NOT NULL DEFAULT 1")
         }
         if (oldVersion < 6) db.execSQL("ALTER TABLE messages ADD COLUMN re TEXT")
+        if (oldVersion < 7) createV7(db)
     }
 
     fun contacts(): List<Contact> = readableDatabase.rawQuery(
@@ -290,5 +297,53 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 6) {
         writableDatabase.execSQL("DELETE FROM kv")
         writableDatabase.execSQL("DELETE FROM groups")
         writableDatabase.execSQL("DELETE FROM channels")
+        writableDatabase.execSQL("DELETE FROM mesh_out")
     }
+
+    // ---------- mesh ----------
+
+    class MeshOut(val id: String, val peer: String, val chat: String, val mid: String?, val env: io.github.ya77papa.shepit.mesh.MeshEnvelope)
+
+    fun addMeshOut(peer: String, chat: String, mid: String?, env: io.github.ya77papa.shepit.mesh.MeshEnvelope) {
+        writableDatabase.insertWithOnConflict("mesh_out", null, ContentValues().apply {
+            put("id", env.id); put("peer", peer); put("chat", chat); put("mid", mid); put("tag", env.tag); put("exp", env.expires); put("body", env.body)
+        }, SQLiteDatabase.CONFLICT_IGNORE)
+    }
+
+    /** Ще чинні; прострочені прибираємо (повертаємо їхні повідомлення, щоб позначити «не надіслано»). */
+    fun meshOut(now: Long): Pair<List<MeshOut>, List<MeshOut>> {
+        val all = readableDatabase.rawQuery("SELECT id, peer, chat, mid, tag, exp, body FROM mesh_out", null).use { c ->
+            generateSequence {
+                if (c.moveToNext()) MeshOut(c.getString(0), c.getString(1), c.getString(2), c.getString(3), io.github.ya77papa.shepit.mesh.MeshEnvelope(c.getBlob(4), c.getLong(5), c.getBlob(6))) else null
+            }.toList()
+        }
+        val (live, dead) = all.partition { it.env.expires > now }
+        if (dead.isNotEmpty()) deleteMeshOut(dead.map { it.id })
+        return live to dead
+    }
+
+    fun meshOutById(ids: List<String>): List<MeshOut> = meshOut(Long.MIN_VALUE).first.filter { it.id in ids }
+
+    fun deleteMeshOut(ids: List<String>) {
+        ids.forEach { writableDatabase.delete("mesh_out", "id = ?", arrayOf(it)) }
+    }
+
+    fun meshOutCount(chat: String, mid: String): Int =
+        readableDatabase.rawQuery("SELECT COUNT(*) FROM mesh_out WHERE chat = ? AND mid = ?", arrayOf(chat, mid)).use { it.moveToFirst(); it.getInt(0) }
+
+    fun markFailed(chat: String, mid: String) {
+        writableDatabase.update("messages", ContentValues().apply { put("status", "failed") }, "peer = ? AND mid = ? AND out = 1 AND status = 'mesh'", arrayOf(chat, mid))
+    }
+
+    fun deleteMeshOutFor(chat: String, mid: String) {
+        writableDatabase.delete("mesh_out", "chat = ? AND mid = ?", arrayOf(chat, mid))
+    }
+
+    /** Вихідні, що чекають на телефон поруч. */
+    fun meshPending(): List<Message> = readableDatabase.rawQuery("SELECT $COLS FROM messages WHERE out = 1 AND status = 'mesh' ORDER BY id", null)
+        .use { c -> generateSequence { if (c.moveToNext()) row(c) else null }.toList() }
+
+    /** Вхідне з таким id уже є (прийшло і через сервер, і через mesh). */
+    fun hasIncoming(peer: String, mid: String): Boolean =
+        readableDatabase.rawQuery("SELECT 1 FROM messages WHERE peer = ? AND mid = ? AND out = 0 LIMIT 1", arrayOf(peer, mid)).use { it.moveToFirst() }
 }

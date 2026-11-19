@@ -388,6 +388,18 @@ private fun ContactsScreen(
             },
             colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
         )
+        // Без інтернету: mesh увімкнено — показати, скільки телефонів поруч; вимкнено — підказати.
+        val online by repo.online.collectAsState()
+        val nearby by repo.meshNearby.collectAsState()
+        if (!online) {
+            Surface(color = Color(0xFF14232B), modifier = Modifier.fillMaxWidth().clickable(onClick = onSettings)) {
+                Text(
+                    if (repo.meshEnabled) "Немає інтернету · mesh: поруч ${if (nearby == 0) "нікого" else "$nearby тел."} — повідомлення передадуться через телефони поруч"
+                    else "Немає інтернету. Увімкни «Без інтернету» в налаштуваннях, щоб передавати повідомлення через телефони поруч",
+                    Modifier.padding(12.dp), fontSize = 14.sp,
+                )
+            }
+        }
         val update by app.updater.available.collectAsState()
         update?.let { u ->
             Surface(color = Color(0xFF1F2B18), modifier = Modifier.fillMaxWidth().clickable(onClick = onUpdate)) {
@@ -615,6 +627,7 @@ private fun ChatScreen(app: ShepitApp, act: MainActivity, peer: String, onBack: 
     fun tickOf(m: Message): Pair<String, String>? {
         if (!m.out || m.kind == "call") return null
         if (m.status == "sending") return "sending" to "Надсилається"
+        if (m.status == "mesh") return "mesh" to "Немає інтернету — чекає на телефон поруч (mesh) або на інтернет"
         if (m.status == "failed") return "failed" to "Не надіслано. Натисни, щоб повторити"
         val others = if (group != null) group.members.map { it.id }.filter { it != myId } else listOf(peer)
         if (others.isEmpty()) return "sent" to "Надіслано"
@@ -909,6 +922,7 @@ private fun Quote(who: String, text: String, modifier: Modifier = Modifier) {
 private fun Ticks(state: String, title: String, onRetry: () -> Unit) {
     val (icon, tint) = when (state) {
         "sending" -> Icons.Default.Schedule to Muted
+        "mesh" -> Icons.Default.Schedule to Accent
         "failed" -> Icons.Default.ErrorOutline to Danger
         "read" -> Icons.Default.DoneAll to Accent
         "delivered" -> Icons.Default.DoneAll to Muted
@@ -997,7 +1011,7 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
     BackHandler(enabled = section != null) { back() }
     val titles = mapOf(
         "profile" to "Профіль", "account" to "Акаунт", "security" to "Безпека", "privacy" to "Приватність",
-        "notify" to "Сповіщення і звуки", "updates" to "Оновлення", "about" to "Про Шепіт",
+        "notify" to "Сповіщення і звуки", "updates" to "Оновлення", "about" to "Про Шепіт", "mesh" to "Без інтернету",
     )
 
     Column(Modifier.fillMaxSize()) {
@@ -1029,6 +1043,7 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
                                 Triple("privacy", "Приватність", "В мережі, переглянуто"),
                                 Triple("notify", "Сповіщення і звуки", "Фонова робота, дзвінки, звуки в бесіді"),
                                 Triple("updates", "Оновлення", "Версія ${BuildConfig.VERSION_NAME}"),
+                                Triple("mesh", "Без інтернету", "Повідомлення через телефони поруч"),
                                 Triple("about", "Про Шепіт", "Сервер, вихідний код, діагностика"),
                             )
                             rows.forEachIndexed { i, (key, t, sub) ->
@@ -1188,6 +1203,7 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
                         }
                     }
                 }
+                "mesh" -> MeshSection(app, act, toast)
                 "about" -> {
                     Section("Шепіт") {
                         Text("Версія ${BuildConfig.VERSION_NAME} (${BuildConfig.COMMIT.take(7)})")
@@ -1258,6 +1274,63 @@ private fun SettingsScreen(app: ShepitApp, act: MainActivity, onBack: () -> Unit
         confirmButton = { TextButton(onClick = { repo.wipe(); confirmLogout = false; ctx.stopService(Intent(ctx, io.github.ya77papa.shepit.service.ShepitService::class.java)); onLogout() }) { Text("Стерти", color = Danger) } },
         dismissButton = { TextButton(onClick = { confirmLogout = false }) { Text("Скасувати") } },
     )
+}
+
+/** Налаштування → Без інтернету (mesh, етапи 1–2: локальна Wi-Fi мережа і Bluetooth). */
+@Composable
+private fun MeshSection(app: ShepitApp, act: MainActivity, toast: (String) -> Unit) {
+    val ctx = LocalContext.current
+    val repo = app.repo
+    var on by remember { mutableStateOf(repo.meshEnabled) }
+    val nearby by repo.meshNearby.collectAsState()
+    val online by repo.online.collectAsState()
+    var bleOk by remember { mutableStateOf(io.github.ya77papa.shepit.mesh.BleTransport(ctx, app.mesh).allowed()) }
+    LifecycleResume { bleOk = io.github.ya77papa.shepit.mesh.BleTransport(ctx, app.mesh).allowed() }
+    fun enable() {
+        repo.meshEnabled = true; on = true
+        io.github.ya77papa.shepit.service.ShepitService.start(ctx)
+        app.mesh.stop(); app.mesh.start() // з новими дозволами
+    }
+    val perms = if (android.os.Build.VERSION.SDK_INT >= 31) arrayOf(
+        android.Manifest.permission.BLUETOOTH_SCAN, android.Manifest.permission.BLUETOOTH_ADVERTISE, android.Manifest.permission.BLUETOOTH_CONNECT,
+    ) else arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION)
+    val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { res ->
+        if (res.values.any { !it }) toast("Без дозволу Bluetooth працюватиме лише через спільну Wi-Fi мережу")
+        enable()
+        bleOk = io.github.ya77papa.shepit.mesh.BleTransport(ctx, app.mesh).allowed()
+    }
+    Section("Без інтернету") {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Передавати через телефони поруч")
+                Text("Коли інтернету немає, повідомлення йдуть напряму на телефони поруч — через спільну Wi-Fi мережу (навіть без провайдера) або Bluetooth.", color = Muted, fontSize = 12.sp)
+            }
+            Switch(checked = on, onCheckedChange = { v ->
+                if (v) { app.lock.expectReturn(); ask.launch(perms) }
+                else { repo.meshEnabled = false; on = false; app.mesh.stop() }
+            })
+        }
+        if (on) {
+            Text("Інтернет: " + if (online) "є" else "немає", fontSize = 14.sp)
+            Text("Телефонів із Шепотом поруч: $nearby", fontSize = 14.sp)
+            when {
+                android.os.Build.VERSION.SDK_INT < 29 -> Text("Bluetooth-обмін — з Android 10. На цьому телефоні — лише через спільну Wi-Fi мережу.", color = Muted, fontSize = 12.sp)
+                !bleOk -> OutlinedButton(onClick = { app.lock.expectReturn(); ask.launch(perms) }) { Text("Дозволити Bluetooth або увімкнути його") }
+                else -> Text("Bluetooth: шукаю телефони поруч", color = Muted, fontSize = 12.sp)
+            }
+        }
+    }
+    Section("Як це працює") {
+        Text(
+            "• Лише з контактами, з якими ти вже листувався через інтернет (додати нову людину без інтернету поки не можна).\n" +
+                "• Текст, голосові й фото; у групах — кожному учаснику окремо.\n" +
+                "• Повідомлення доходить, коли телефон адресата опиниться поруч (до ~30–100 м по Bluetooth або в тій самій Wi-Fi мережі). Чекає до 7 днів.\n" +
+                "• Коли з'явиться інтернет, те, що ще не дійшло, піде звичайним шляхом.\n" +
+                "• Чужі телефони повідомлень не несуть — естафета буде пізніше.\n" +
+                "• Пошук через Bluetooth витрачає батарею — вмикай, коли зв'язку немає.",
+            fontSize = 13.sp,
+        )
+    }
 }
 
 /** Налаштування → Безпека: PIN-код, відбиток, автоблокування, приховування вмісту. */

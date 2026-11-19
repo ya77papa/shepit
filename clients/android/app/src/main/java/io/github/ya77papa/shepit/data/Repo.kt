@@ -216,7 +216,8 @@ class Repo(context: Context) {
         var failed = 0
         for (m in to) {
             if (m.id == me) continue
-            runCatching { send(m.id, body) }.onFailure { failed++ }
+            // Поставлене в mesh — не «не доставлено»: дійде через телефони поруч.
+            runCatching { send(m.id, body) }.onFailure { if (it !is MeshQueued) failed++ }
         }
         return failed
     }
@@ -376,6 +377,8 @@ class Repo(context: Context) {
             else -> return
         }
         noteDelivered(from, m.mid, gid)
+        // Те саме повідомлення могло прийти двічі: через mesh і через сервер.
+        if (m.mid != null && db.hasIncoming(key, m.mid)) return
         val id = db.addMessage(m)
         _changed.emit(key)
         _incoming.emit(m.copy(id = id))
@@ -440,6 +443,19 @@ class Repo(context: Context) {
     }
 
     suspend fun send(peer: String, body: Body, wake: String? = null) = withContext(Dispatchers.IO) {
+        try {
+            sendServer(peer, body, wake)
+            _online.value = true
+        } catch (e: java.io.IOException) {
+            // Сервер недоступний (не відмова — HttpException) — у mesh, якщо увімкнено й сесія є.
+            if (e is HttpException || !meshEnabled || wake == "call" || body is Body.Call) throw e
+            if (!queueMesh(peer, body)) throw e
+            _online.value = false
+            throw MeshQueued()
+        }
+    }
+
+    private suspend fun sendServer(peer: String, body: Body, wake: String?) {
         lock.withLock {
             val c = core ?: error("Немає акаунта")
             ensureCertificate()
@@ -476,12 +492,24 @@ class Repo(context: Context) {
         val total = if (peer.startsWith("g:")) db.group(peer.removePrefix("g:"))?.members?.count { it.id != me } ?: 0 else 1
         try {
             val failed = sendTo(peer, body)
-            val ok = total == 0 || failed < total
-            db.setStatus(id, if (ok) "sent" else "failed")
+            val mid = midOf(body(null))
+            val viaMesh = if (mid != null) db.meshOutCount(peer, mid) else 0
+            val viaServer = total - failed - viaMesh
+            val status = when {
+                total == 0 || viaServer > 0 -> "sent"
+                viaMesh > 0 -> "mesh"
+                else -> "failed"
+            }
+            db.setStatus(id, status)
             _changed.emit(peer)
-            if (ok) _sent.tryEmit(peer)
-            if (!ok) error("Не вдалося надіслати")
+            if (status != "failed") _sent.tryEmit(peer)
+            if (status == "failed") error("Не вдалося надіслати")
             return failed
+        } catch (e: MeshQueued) {
+            db.setStatus(id, "mesh")
+            _changed.emit(peer)
+            _sent.tryEmit(peer)
+            return 0
         } catch (e: Exception) {
             db.setStatus(id, "failed")
             _changed.emit(peer)
@@ -636,6 +664,120 @@ class Repo(context: Context) {
         get() = db.get("chatSounds") != "0"
         set(v) = db.set("chatSounds", if (v) "1" else "0")
 
+    // ---------- без інтернету (mesh) ----------
+
+    /** Режим «без інтернету»: шукати телефони поруч і передавати через них. */
+    var meshEnabled: Boolean
+        get() = db.get("meshEnabled") == "1"
+        set(v) = db.set("meshEnabled", if (v) "1" else "0")
+
+    /** Сервер відповідає (false — востаннє не вдалося достукатись). */
+    private val _online = MutableStateFlow(true)
+    val online = _online.asStateFlow()
+
+    /** Скільки телефонів із Шепотом поруч (за останні хвилини). */
+    val meshNearby = MutableStateFlow(0)
+
+    /** Є нові конверти для телефонів поруч — транспорти пробують обмінятись. */
+    val meshPoke = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+
+    class MeshQueued : Exception("Немає інтернету — передасться через телефони поруч")
+
+    private val meshSecrets = mutableMapOf<String, ByteArray>()
+    private fun meshSecret(c: io.github.ya77papa.shepit.core.Core, peer: String) = synchronized(meshSecrets) {
+        meshSecrets.getOrPut(peer) { c.meshSecret(peer) }
+    }
+
+    private fun midOf(b: Body): String? = when (b) {
+        is Body.Text -> b.id
+        is Body.Voice -> b.id
+        is Body.Image -> b.id
+        else -> null
+    }
+
+    private fun chatOf(peer: String, b: Body): String {
+        val g = when (b) {
+            is Body.Text -> b.g
+            is Body.Voice -> b.g
+            is Body.Image -> b.g
+            is Body.Delete -> b.g
+            is Body.React -> b.g
+            is Body.Receipt -> b.g
+            else -> null
+        }
+        return if (g != null) "g:$g" else peer
+    }
+
+    /** Зашифрувати для mesh і поставити в чергу. false — неможливо (немає сесії з цією людиною). */
+    private suspend fun queueMesh(peer: String, body: Body): Boolean = lock.withLock {
+        val c = core ?: return@withLock false
+        if (!c.hasSession(peer)) return@withLock false
+        val me = c.identity()
+        val data = runCatching { c.meshEncrypt(peer, Content.encode(body)) }.getOrElse { return@withLock false }
+        save() // стан ратчета
+        val now = System.currentTimeMillis()
+        val tag = io.github.ya77papa.shepit.mesh.MeshTags.tag(meshSecret(c, peer), me, io.github.ya77papa.shepit.mesh.MeshTags.day(now))
+        db.addMeshOut(peer, chatOf(peer, body), midOf(body), io.github.ya77papa.shepit.mesh.MeshEnvelope(tag, now + io.github.ya77papa.shepit.mesh.MeshTags.TTL_MS, data))
+        meshPoke.tryEmit(Unit)
+        true
+    }
+
+    /** Теги, адресовані мені (учора/сьогодні/завтра), → від кого. Перераховується раз на добу або при зміні контактів. */
+    private var tagCache: Triple<Long, Int, Map<String, String>>? = null
+    fun meshTagsForMe(): Map<String, String> {
+        val c = core ?: return emptyMap()
+        val now = System.currentTimeMillis()
+        val day = io.github.ya77papa.shepit.mesh.MeshTags.day(now)
+        val ids = (_contacts.value.map { it.identity } + db.groups().flatMap { g -> g.members.map { it.id } }).toSet() - c.identity()
+        tagCache?.let { (d, h, m) -> if (d == day && h == ids.hashCode()) return m }
+        val m = mutableMapOf<String, String>()
+        for (p in ids) {
+            val s = runCatching { meshSecret(c, p) }.getOrNull() ?: continue
+            for (d in io.github.ya77papa.shepit.mesh.MeshTags.window(now)) m[java.util.Base64.getEncoder().encodeToString(io.github.ya77papa.shepit.mesh.MeshTags.tag(s, p, d))] = p
+        }
+        tagCache = Triple(day, ids.hashCode(), m)
+        return m
+    }
+
+    fun meshOffers(): List<io.github.ya77papa.shepit.mesh.MeshEnvelope> {
+        val (live, dead) = db.meshOut(System.currentTimeMillis())
+        // Тиждень ніхто не зустрівся — «не надіслано».
+        dead.mapNotNull { d -> d.mid?.let { d.chat to it } }.forEach { (chat, mid) -> db.markFailed(chat, mid) }
+        return live.map { it.env }
+    }
+
+    /** Конверт для мене з телефону поруч. */
+    suspend fun meshReceive(env: io.github.ya77papa.shepit.mesh.MeshEnvelope): Boolean = withContext(Dispatchers.IO) {
+        val peer = meshTagsForMe()[java.util.Base64.getEncoder().encodeToString(env.tag)] ?: return@withContext false
+        lock.withLock {
+            val c = core ?: return@withLock false
+            // Повтор (уже прийнятий) не розшифрується — все одно підтверджуємо, щоб відправник забув.
+            val text = runCatching { c.meshDecrypt(peer, env.body) }.getOrElse { return@withLock true }
+            save()
+            deliver(peer, text)
+            true
+        }
+    }
+
+    /** Отримувач підтвердив: «доставлено» (дві галочки) і забути конверт. */
+    suspend fun meshDelivered(ids: List<String>) = withContext(Dispatchers.IO) {
+        val rows = db.meshOutById(ids)
+        db.deleteMeshOut(ids)
+        for (r in rows) {
+            if (r.mid != null && db.receipt(r.chat, listOf(r.mid), r.peer, false)) _changed.emit(r.chat)
+        }
+    }
+
+    /** Інтернет повернувся: те, що чекало на телефон поруч, надіслати ще й через сервер. */
+    private suspend fun flushMeshToServer() {
+        if (!_online.value) return
+        for (m in db.meshPending()) {
+            val mid = m.mid ?: continue
+            db.deleteMeshOutFor(m.peer, mid)
+            runCatching { retry(m) }
+        }
+    }
+
     /** Відкрита на екрані бесіда (null — жодної або застосунок не на екрані). */
     @Volatile var visibleChat: String? = null
 
@@ -708,7 +850,13 @@ class Repo(context: Context) {
      * Повертає кількість нових повідомлень.
      */
     suspend fun receive(): Int = withContext(Dispatchers.IO) {
-        val n = receiveLocked()
+        val n = try {
+            receiveLocked().also { _online.value = true }
+        } catch (e: java.io.IOException) {
+            if (e !is HttpException) _online.value = false
+            throw e
+        }
+        if (meshEnabled) runCatching { flushMeshToServer() }
         // Підтвердження — вже поза м'ютексом (send його бере).
         visibleChat?.let { markRead(it) }
         flushAcks()
@@ -815,6 +963,7 @@ class Repo(context: Context) {
             else -> return false
         }
         noteDelivered(from, m.mid, null)
+        if (m.mid != null && db.hasIncoming(from, m.mid)) return false
         val id = db.addMessage(m)
         _changed.emit(from)
         _incoming.emit(m.copy(id = id))
