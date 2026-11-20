@@ -19,6 +19,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.Request
+import io.github.ya77papa.shepit.mesh.MeshEnvelope
+import io.github.ya77papa.shepit.mesh.MeshTags
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -683,6 +685,29 @@ class Repo(context: Context) {
 
     class MeshQueued : Exception("Немає інтернету — передасться через телефони поруч")
 
+    /** «Передавати чужі повідомлення»: contacts — лише від контактів, all — від усіх, off — ні. */
+    var relayPolicy: String
+        get() = db.get("relayPolicy") ?: "contacts"
+        set(v) {
+            db.set("relayPolicy", v)
+            if (v == "off") db.clearRelay()
+        }
+
+    /** Скільки чужих конвертів зараз несу. */
+    fun relayCount() = db.relayCount()
+
+    /** Публічний ключ шлюзу сервера (беремо, поки інтернет є; без нього — лише естафета до адресата). */
+    private val gatewayKey get() = db.get("gatewayKey")?.takeIf { it.length == 130 }
+
+    private fun refreshGatewayKey() {
+        val at = db.get("gatewayKeyAt")?.toLongOrNull() ?: 0
+        if (gatewayKey != null && System.currentTimeMillis() - at < MeshTags.DAY_MS) return
+        val k = runCatching { api.getOrNull("/v0/gateway-key")?.trim() }.getOrNull() ?: return
+        if (k.length != 130) return
+        db.set("gatewayKey", k)
+        db.set("gatewayKeyAt", System.currentTimeMillis().toString())
+    }
+
     private val meshSecrets = mutableMapOf<String, ByteArray>()
     private fun meshSecret(c: io.github.ya77papa.shepit.core.Core, peer: String) = synchronized(meshSecrets) {
         meshSecrets.getOrPut(peer) { c.meshSecret(peer) }
@@ -716,8 +741,11 @@ class Repo(context: Context) {
         val data = runCatching { c.meshEncrypt(peer, Content.encode(body)) }.getOrElse { return@withLock false }
         save() // стан ратчета
         val now = System.currentTimeMillis()
-        val tag = io.github.ya77papa.shepit.mesh.MeshTags.tag(meshSecret(c, peer), me, io.github.ya77papa.shepit.mesh.MeshTags.day(now))
-        db.addMeshOut(peer, chatOf(peer, body), midOf(body), io.github.ya77papa.shepit.mesh.MeshEnvelope(tag, now + io.github.ya77papa.shepit.mesh.MeshTags.TTL_MS, data))
+        val tag = MeshTags.tag(meshSecret(c, peer), me, MeshTags.day(now))
+        val env = MeshEnvelope(tag, now + MeshTags.TTL_MS, data)
+        // Пакет для шлюзу: будь-який телефон з інтернетом донесе його до сервера.
+        val gw = gatewayKey?.let { k -> runCatching { io.github.ya77papa.shepit.mesh.Gateway.seal(k, peer, env) }.getOrNull() }
+        db.addMeshOut(peer, chatOf(peer, body), midOf(body), MeshEnvelope(env.tag, env.expires, env.body, gw))
         meshPoke.tryEmit(Unit)
         true
     }
@@ -743,24 +771,85 @@ class Repo(context: Context) {
         val (live, dead) = db.meshOut(System.currentTimeMillis())
         // Тиждень ніхто не зустрівся — «не надіслано».
         dead.mapNotNull { d -> d.mid?.let { d.chat to it } }.forEach { (chat, mid) -> db.markFailed(chat, mid) }
-        return live.map { it.env }
+        // І чужі, які несу далі (естафета).
+        return live.map { it.env } + db.relay(System.currentTimeMillis())
+    }
+
+    /** Мої ознаки «я твій контакт» для привітання — по одній на кожен контакт. */
+    fun meshHelloTokens(peerNonce: ByteArray): List<ByteArray> {
+        val c = core ?: return emptyList()
+        return _contacts.value.mapNotNull { p -> runCatching { MeshTags.hello(meshSecret(c, p.identity), peerNonce) }.getOrNull() }
+    }
+
+    fun meshIsContact(myNonce: ByteArray, tokens: List<ByteArray>): Boolean {
+        val c = core ?: return false
+        if (tokens.isEmpty()) return false
+        val theirs = tokens.map { java.util.Base64.getEncoder().encodeToString(it) }.toSet()
+        return _contacts.value.any { p ->
+            runCatching { java.util.Base64.getEncoder().encodeToString(MeshTags.hello(meshSecret(c, p.identity), myNonce)) in theirs }.getOrDefault(false)
+        }
+    }
+
+    fun meshCarries(fromContact: Boolean) = when (relayPolicy) {
+        "all" -> true
+        "contacts" -> fromContact
+        else -> false
+    }
+
+    fun meshHas(id: String) = db.hasMesh(id)
+
+    fun meshRoom(size: Int) = size <= io.github.ya77papa.shepit.mesh.MeshLink.MAX_FRAME && db.relaySize() + size <= RELAY_MAX
+
+    fun meshCarry(env: MeshEnvelope) {
+        if (db.relaySize() + env.size > RELAY_MAX) return
+        db.addRelay(env)
+    }
+
+    /** Чужі конверти з пакетом для шлюзу — на сервер, якщо інтернет є. Повертає, скільки вивантажено. */
+    suspend fun uploadCarried(): Int = withContext(Dispatchers.IO) {
+        val c = core ?: return@withContext 0
+        var n = 0
+        for (e in db.relay(System.currentTimeMillis())) {
+            val gw = e.gw ?: continue
+            val body = JSONObject().put("blob", gw.joinToString("") { "%02x".format(it) }).toString().toByteArray()
+            try {
+                api.send("POST", "/v0/gateway", body, c.authHeader("POST /v0/gateway", body))
+                db.deleteRelay(listOf(e.id)); n++
+            } catch (x: HttpException) {
+                // 410 — прострочений, 400 — зіпсований: нести далі немає сенсу. 429 — скринька адресата повна, пізніше.
+                if (x.code == 410 || x.code == 400) db.deleteRelay(listOf(e.id))
+                if (x.code == 404) break // старий сервер без шлюзу
+            } catch (x: java.io.IOException) {
+                break // інтернету немає
+            }
+        }
+        n
     }
 
     /** Конверт для мене з телефону поруч. */
-    suspend fun meshReceive(env: io.github.ya77papa.shepit.mesh.MeshEnvelope): Boolean = withContext(Dispatchers.IO) {
-        val peer = meshTagsForMe()[java.util.Base64.getEncoder().encodeToString(env.tag)] ?: return@withContext false
+    suspend fun meshReceive(env: MeshEnvelope): Boolean = withContext(Dispatchers.IO) {
         lock.withLock {
-            val c = core ?: return@withLock false
-            // Повтор (уже прийнятий) не розшифрується — все одно підтверджуємо, щоб відправник забув.
-            val text = runCatching { c.meshDecrypt(peer, env.body) }.getOrElse { return@withLock true }
-            save()
-            deliver(peer, text)
-            true
+            val (ok, opened) = meshOpen(env)
+            if (opened != null) { save(); deliver(opened.first, opened.second) }
+            ok
         }
+    }
+
+    /**
+     * Розшифрувати mesh-конверт (м'ютекс уже взято). first — чи наш (можна підтвердити),
+     * second — (від кого, текст), якщо це нове повідомлення.
+     */
+    private fun meshOpen(env: MeshEnvelope): Pair<Boolean, Pair<String, String>?> {
+        val peer = meshTagsForMe()[java.util.Base64.getEncoder().encodeToString(env.tag)] ?: return false to null
+        val c = core ?: return false to null
+        // Повтор (уже прийнятий: через шлюз і напряму) не розшифрується — все одно «наш», щоб відправник забув.
+        val text = runCatching { c.meshDecrypt(peer, env.body) }.getOrElse { return true to null }
+        return true to (peer to text)
     }
 
     /** Отримувач підтвердив: «доставлено» (дві галочки) і забути конверт. */
     suspend fun meshDelivered(ids: List<String>) = withContext(Dispatchers.IO) {
+        db.deleteRelay(ids) // чужі, що я ніс: адресат отримав
         val rows = db.meshOutById(ids)
         db.deleteMeshOut(ids)
         for (r in rows) {
@@ -857,6 +946,8 @@ class Repo(context: Context) {
             throw e
         }
         if (meshEnabled) runCatching { flushMeshToServer() }
+        runCatching { refreshGatewayKey() }
+        runCatching { uploadCarried() }
         // Підтвердження — вже поза м'ютексом (send його бере).
         visibleChat?.let { markRead(it) }
         flushAcks()
@@ -871,7 +962,15 @@ class Repo(context: Context) {
             if (items.length() == 0) return@withLock 0
             val opened = mutableListOf<Pair<String, String>>()
             for (i in 0 until items.length()) {
-                val env = items.getJSONObject(i).getJSONObject("envelope").toString()
+                val ej = items.getJSONObject(i).getJSONObject("envelope")
+                if (ej.optString("wake") == "mesh") {
+                    // Через шлюз: конверт, який приніс чужий телефон із інтернетом.
+                    val payload = runCatching { io.github.ya77papa.shepit.mesh.Gateway.hex(ej.getString("payload")) }.getOrNull() ?: continue
+                    val env = io.github.ya77papa.shepit.mesh.Gateway.unwrap(payload) ?: continue
+                    meshOpen(env).second?.let { opened += it }
+                    continue
+                }
+                val env = ej.toString()
                 runCatching { c.openEnvelope(env) }.onSuccess { opened += it.from to it.text }
             }
             save()
@@ -1080,3 +1179,6 @@ class Repo(context: Context) {
         refreshChannels()
     }
 }
+
+/** Скільки чужих конвертів (байтів) телефон готовий нести. */
+private const val RELAY_MAX = 20L * 1024 * 1024

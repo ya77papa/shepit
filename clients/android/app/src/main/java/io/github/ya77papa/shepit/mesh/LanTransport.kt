@@ -31,6 +31,7 @@ class LanTransport(private val ctx: Context, private val runner: MeshRunner) {
     private val peers = ConcurrentHashMap<String, InetSocketAddress>()
     /** До Android 14 NSD розв'язує лише одну службу за раз — черга. */
     private val toResolve = LinkedBlockingQueue<NsdServiceInfo>()
+    private val firstSeen = ConcurrentHashMap<String, Long>()
 
     fun start(scope: CoroutineScope) {
         val ss = runCatching { ServerSocket(0) }.getOrElse { runner.log("Wi-Fi: не вдалося відкрити порт: ${it.message}"); return }
@@ -58,6 +59,9 @@ class LanTransport(private val ctx: Context, private val runner: MeshRunner) {
         scope.launch {
             while (isActive) {
                 for ((name, addr) in peers) {
+                    // Підключається той, чиє ім'я менше (інший приймає) — запасне правило в shouldInitiate.
+                    val first = firstSeen.getOrPut(name) { System.currentTimeMillis() }
+                    if (!runner.shouldInitiate(myName.toByteArray(), name.toByteArray(), first)) { runner.noticed("lan:" + addr.address.hostAddress); continue }
                     val s = runCatching { Socket().apply { connect(addr, 5_000) } }.getOrNull()
                     if (s == null) { runner.log("Wi-Fi: не вдалося з'єднатися з $name"); peers.remove(name); continue }
                     handle(s, initiator = true, who = "lan:" + addr.address.hostAddress)

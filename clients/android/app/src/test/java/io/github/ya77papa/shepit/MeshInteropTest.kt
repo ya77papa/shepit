@@ -2,6 +2,7 @@ package io.github.ya77papa.shepit
 
 import io.github.ya77papa.shepit.core.Core
 import io.github.ya77papa.shepit.data.Api
+import io.github.ya77papa.shepit.mesh.Gateway
 import io.github.ya77papa.shepit.mesh.MeshEnvelope
 import io.github.ya77papa.shepit.mesh.MeshLink
 import io.github.ya77papa.shepit.mesh.MeshNode
@@ -20,27 +21,36 @@ import kotlin.concurrent.thread
  */
 class MeshInteropTest {
     /** Те, що в застосунку робить Repo: черга, теги «мені», розшифрування. */
-    class Phone(val core: Core, val contacts: List<String>) : MeshNode {
+    class Phone(val core: Core, val contacts: List<String>, val gatewayKey: String? = null, val policy: String = "contacts") : MeshNode {
         val outbox = mutableListOf<MeshEnvelope>()
+        val relay = mutableListOf<MeshEnvelope>()
         val inbox = mutableListOf<String>()
         private val me = core.identity()
         fun queue(peer: String, text: String) {
             val now = System.currentTimeMillis()
             val tag = MeshTags.tag(core.meshSecret(peer), me, MeshTags.day(now))
-            outbox += MeshEnvelope(tag, now + MeshTags.TTL_MS, core.meshEncrypt(peer, text))
+            val env = MeshEnvelope(tag, now + MeshTags.TTL_MS, core.meshEncrypt(peer, text))
+            outbox += MeshEnvelope(env.tag, env.expires, env.body, gatewayKey?.let { Gateway.seal(it, peer, env) })
         }
         private fun forMe(): Map<String, String> = contacts.flatMap { p ->
             val s = core.meshSecret(p)
             MeshTags.window(System.currentTimeMillis()).map { d -> MeshTags.tag(s, p, d).toList().toString() to p }
         }.toMap()
-        override fun offers() = outbox.toList()
+        override fun offers() = outbox.toList() + relay
+        override fun helloTokens(peerNonce: ByteArray) = contacts.map { MeshTags.hello(core.meshSecret(it), peerNonce) }
+        override fun isContact(myNonce: ByteArray, tokens: List<ByteArray>) =
+            contacts.any { c -> tokens.any { it.contentEquals(MeshTags.hello(core.meshSecret(c), myNonce)) } }
+        override fun carries(fromContact: Boolean) = policy == "all" || (policy == "contacts" && fromContact)
+        override fun has(id: String) = (outbox + relay).any { it.id == id }
+        override fun room(size: Int) = true
+        override fun carry(env: MeshEnvelope) { relay += env }
         override fun isForMe(tag: ByteArray) = tag.toList().toString() in forMe()
         override fun receive(env: MeshEnvelope): Boolean {
             val from = forMe().getValue(env.tag.toList().toString())
             inbox += core.meshDecrypt(from, env.body)
             return true
         }
-        override fun delivered(ids: List<String>) { outbox.removeAll { it.id in ids } }
+        override fun delivered(ids: List<String>) { outbox.removeAll { it.id in ids }; relay.removeAll { it.id in ids } }
     }
 
     private fun meet(a: Phone, b: Phone) {
@@ -85,5 +95,62 @@ class MeshInteropTest {
         bob.queue(a.identity(), "Прийняв, тримайтеся")
         meet(bob, alice)
         assertEquals(listOf("Прийняв, тримайтеся"), alice.inbox)
+    }
+
+    /**
+     * Етап 4: Аліса без інтернету, поруч Боб з інтернетом (її контакт), Кіра — в іншому кінці міста.
+     * Боб бере конверт, вивантажує пакет на сервер (шлюз), Кіра отримує його зі своєї скриньки.
+     */
+    @Test
+    fun gatewayAcrossTown() {
+        val server = System.getenv("SHEPIT_TEST_OPEN_SERVER")
+        assumeTrue(server != null)
+        val api = Api(server!!)
+        val root = api.get("/v0/trust-root").trim()
+        fun register(): Core = Core.create(root).also { c ->
+            val body = c.keyUploadJson()!!.toByteArray()
+            api.send("PUT", "/v0/keys", body, c.authHeader("PUT /v0/keys", body))
+        }
+        val a = register(); val b = register(); val c = register()
+        a.startSession(api.get("/v0/keys/${c.identity()}"))
+        val key = api.get("/v0/gateway-key").trim() // Аліса взяла, поки інтернет був
+        val alice = Phone(a, listOf(b.identity(), c.identity()), gatewayKey = key)
+        val bob = Phone(b, listOf(a.identity()))
+        val stranger = Phone(register(), emptyList(), policy = "contacts")
+        alice.queue(c.identity(), "Кіро, ми живі, пиши")
+
+        // Незнайомець з політикою «лише від контактів» не бере.
+        meet(alice, stranger)
+        assertEquals(0, stranger.relay.size)
+        // Боб — контакт Аліси: бере нести, але не «підтверджує» (лист не йому).
+        meet(alice, bob)
+        assertEquals(1, bob.relay.size)
+        assertEquals(1, alice.outbox.size)
+        // Повторна зустріч: Боб уже має — вдруге не бере.
+        meet(alice, bob)
+        assertEquals(1, bob.relay.size)
+
+        // У Боба є інтернет: шлюз.
+        val e = bob.relay.single()
+        val body = org.json.JSONObject().put("blob", e.gw!!.joinToString("") { "%02x".format(it) }).toString().toByteArray()
+        api.send("POST", "/v0/gateway", body, b.authHeader("POST /v0/gateway", body))
+        // Зіпсований пакет — відмова.
+        val bad = e.gw!!.copyOf().also { it[it.size - 1] = (it[it.size - 1].toInt() xor 1).toByte() }
+        val badBody = org.json.JSONObject().put("blob", bad.joinToString("") { "%02x".format(it) }).toString().toByteArray()
+        val refused = runCatching { api.send("POST", "/v0/gateway", badBody, b.authHeader("POST /v0/gateway", badBody)) }.exceptionOrNull()
+        assertEquals(400, (refused as io.github.ya77papa.shepit.data.HttpException).code)
+
+        // Кіра (будь-де, з інтернетом) забирає зі скриньки.
+        val mb = c.mailbox()
+        assertEquals(Gateway.mailbox(c.identity()), mb)
+        val items = org.json.JSONArray(api.get("/v0/mailbox/$mb", c.authHeader("GET /v0/mailbox/$mb", ByteArray(0))))
+        assertEquals(1, items.length())
+        val env = items.getJSONObject(0).getJSONObject("envelope")
+        assertEquals("mesh", env.getString("wake"))
+        val got = Gateway.unwrap(Gateway.hex(env.getString("payload")))!!
+        val kira = Phone(c, listOf(a.identity()))
+        assertEquals(true, kira.isForMe(got.tag))
+        assertEquals(true, kira.receive(got))
+        assertEquals(listOf("Кіро, ми живі, пиши"), kira.inbox)
     }
 }

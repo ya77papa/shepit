@@ -31,6 +31,7 @@
 mod admin;
 mod channels;
 mod db;
+mod gateway;
 mod presence;
 #[cfg(feature = "push")]
 mod push;
@@ -76,6 +77,8 @@ struct App {
     seen: Mutex<HashMap<String, u64>>,
     /// «В мережі» / «востаннє…» — лише в пам'яті.
     presence: presence::Presence,
+    /// Шлюз mesh: пакети від телефонів-ретрансляторів.
+    gateway: gateway::Gateway,
 }
 
 const INVITE_HEADER: &str = "x-shepit-invite";
@@ -295,6 +298,58 @@ async fn delete_my_account(State(app): State<Shared>, headers: HeaderMap) -> Sta
             StatusCode::NO_CONTENT
         }
         Err(e) => internal(e),
+    }
+}
+
+/// Публічний ключ шлюзу mesh (застосунки беруть його, поки інтернет є).
+async fn gateway_key(State(app): State<Shared>) -> String {
+    app.gateway.public_hex()
+}
+
+#[derive(serde::Deserialize)]
+struct GatewayReq {
+    blob: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GatewayInner {
+    to: String,
+    exp: u64,
+}
+
+/// Ретранслятор вивантажує пакет телефона без інтернету. Ретранслятор має бути
+/// зареєстрований (щоб шлюз не став відкритою поштовою скринькою для всього інтернету).
+async fn gateway_upload(State(app): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<StatusCode, Refusal> {
+    let who = authenticate(&app, &headers, "POST /v0/gateway", &body).map_err(|s| (s, ""))?;
+    app.require_account(&who)?;
+    let req: GatewayReq = serde_json::from_slice(&body).map_err(|_| (StatusCode::BAD_REQUEST, ""))?;
+    if req.blob.len() > MAX_PAYLOAD_HEX {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, ""));
+    }
+    let blob = hex::decode(&req.blob).map_err(|_| (StatusCode::BAD_REQUEST, ""))?;
+    let plain = app.gateway.open(&blob).ok_or((StatusCode::BAD_REQUEST, "gateway-invalid"))?;
+    let inner: GatewayInner = serde_json::from_slice(&plain).map_err(|_| (StatusCode::BAD_REQUEST, "gateway-invalid"))?;
+    if inner.exp < now_ms() {
+        return Ok(StatusCode::GONE); // прострочений — ніхто вже не чекає
+    }
+    let to = MailboxId::from_hex(&inner.to).ok_or((StatusCode::BAD_REQUEST, "gateway-invalid"))?;
+    // Конверт для адресата: його застосунок упізнає mesh за wake = "mesh" і тегом усередині.
+    let mut env = Envelope::new(to, &plain);
+    env.wake = Some("mesh".into());
+    match app.db.push(&env, MAX_QUEUE, now_ms()) {
+        Ok(true) => {
+            let listening = match app.bells.lock().unwrap().get(&env.to) {
+                Some(bell) => bell.send(()).is_ok(),
+                None => false,
+            };
+            #[cfg(feature = "push")]
+            wake_up(&app, env.to, false, listening);
+            #[cfg(not(feature = "push"))]
+            let _ = listening;
+            Ok(StatusCode::ACCEPTED)
+        }
+        Ok(false) => Ok(StatusCode::TOO_MANY_REQUESTS),
+        Err(e) => Err((internal(e), "")),
     }
 }
 
@@ -600,6 +655,7 @@ fn app(issuer: Issuer, db: db::Db, shutdown: tokio::sync::watch::Receiver<bool>)
         started: now_ms(),
         seen: Mutex::default(),
         presence: Default::default(),
+        gateway: gateway::Gateway::load(&data_dir()),
     });
     // Раз на годину прибирати недоставлені конверти (медіа — старші за 3 дні, решту — за 30).
     let pruner = shared.clone();
@@ -621,6 +677,8 @@ fn app(issuer: Issuer, db: db::Db, shutdown: tokio::sync::watch::Receiver<bool>)
         .route("/v0/keys/{identity}", get(get_keys))
         .route("/v0/certificate", get(certificate))
         .route("/v0/presence", post(presence_beat))
+        .route("/v0/gateway-key", get(gateway_key))
+        .route("/v0/gateway", post(gateway_upload).layer(axum::extract::DefaultBodyLimit::max(MAX_SEND_BODY)))
         .route("/v0/account", axum::routing::delete(delete_my_account))
         .route("/v0/presence/query", post(presence_query))
         .route("/v0/send", post(send).layer(axum::extract::DefaultBodyLimit::max(MAX_SEND_BODY)))

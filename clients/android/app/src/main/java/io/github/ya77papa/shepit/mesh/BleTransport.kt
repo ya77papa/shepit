@@ -42,6 +42,8 @@ class BleTransport(private val ctx: Context, private val runner: MeshRunner) {
     private val nonce = ByteArray(4).also { java.security.SecureRandom().nextBytes(it) }
     /** Коли востаннє обмінювались із телефоном (за nonce): не частіше ніж раз на 30 с. */
     private val lastTry = ConcurrentHashMap<String, Long>()
+    /** Коли вперше побачили телефон (для запасного правила черговості). */
+    private val firstSeen = ConcurrentHashMap<String, Long>()
     private var scope: CoroutineScope? = null
 
     fun allowed(): Boolean {
@@ -156,12 +158,16 @@ class BleTransport(private val ctx: Context, private val runner: MeshRunner) {
         }
         val psm = ByteBuffer.wrap(info, 0, 2).short.toInt() and 0xffff
         val who = "ble:" + info.copyOfRange(2, 6).joinToString("") { "%02x".format(it) }
-        if (info.copyOfRange(2, 6).contentEquals(nonce)) return
+        val theirs = info.copyOfRange(2, 6)
+        if (theirs.contentEquals(nonce)) return
         val now = System.currentTimeMillis()
+        val first = firstSeen.getOrPut(who) { now }
+        runner.noticed(who)
+        // Підключається лише один із двох — інший чекає вхідного з'єднання.
+        if (!runner.shouldInitiate(nonce, theirs, first)) return
         if (now - (lastTry[who] ?: 0) < 30_000) return
         lastTry[who] = now
         runner.log("Bluetooth: знайдено $who, канал $psm")
-        runner.noticed(who)
         val s = scope ?: return
         s.launch {
             if (Build.VERSION.SDK_INT < 29) return@launch
@@ -180,6 +186,7 @@ class BleTransport(private val ctx: Context, private val runner: MeshRunner) {
         runCatching { server?.close() }
         server = null
         lastTry.clear()
+        firstSeen.clear()
         scope = null
     }
 

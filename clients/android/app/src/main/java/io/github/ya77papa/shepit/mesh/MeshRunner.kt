@@ -20,7 +20,7 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Робота без інтернету: шукає телефони з Шепотом поруч (локальна Wi-Fi мережа, Bluetooth)
  * і обмінюється з ними зашифрованими конвертами через [MeshLink].
- * Етапи 1–2 (docs/mesh-concept.md): лише власні конверти, без естафети.
+ * Етапи 1–4 (docs/mesh-concept.md): свої конверти, естафета чужих і шлюз через телефон з інтернетом.
  */
 class MeshRunner(private val ctx: Context, private val repo: Repo) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -48,6 +48,34 @@ class MeshRunner(private val ctx: Context, private val repo: Repo) {
         override fun isForMe(tag: ByteArray) = Base64.getEncoder().encodeToString(tag) in repo.meshTagsForMe()
         override fun receive(env: MeshEnvelope) = runBlocking { repo.meshReceive(env) }
         override fun delivered(ids: List<String>) = runBlocking { repo.meshDelivered(ids) }
+        override fun helloTokens(peerNonce: ByteArray) = repo.meshHelloTokens(peerNonce)
+        override fun isContact(myNonce: ByteArray, tokens: List<ByteArray>) = repo.meshIsContact(myNonce, tokens)
+        override fun carries(fromContact: Boolean) = repo.meshCarries(fromContact)
+        override fun has(id: String) = repo.meshHas(id)
+        override fun room(size: Int) = repo.meshRoom(size)
+        override fun carry(env: MeshEnvelope) = repo.meshCarry(env)
+    }
+
+    /** Коли востаннє хтось сам підключився до нас (для черговості підключень, див. [shouldInitiate]). */
+    @Volatile var lastIncoming = 0L
+        private set
+
+    /**
+     * Підключається лише один з двох (менший nonce) — інакше обидва одночасно відкривають
+     * з'єднання й заважають одне одному. Якщо інший довго не підключається (його пошук не бачить нас) —
+     * підключаємось самі.
+     */
+    fun shouldInitiate(mine: ByteArray, theirs: ByteArray, firstSeen: Long): Boolean {
+        for (i in 0 until minOf(mine.size, theirs.size)) {
+            val a = mine[i].toInt() and 0xff; val b = theirs[i].toInt() and 0xff
+            if (a != b) return a < b || fallback(firstSeen)
+        }
+        return true
+    }
+
+    private fun fallback(firstSeen: Long): Boolean {
+        val now = System.currentTimeMillis()
+        return now - firstSeen > 45_000 && now - lastIncoming > 60_000
     }
 
     @Synchronized
@@ -104,8 +132,13 @@ class MeshRunner(private val ctx: Context, private val repo: Repo) {
                 return
             }
             try {
+                if (!initiator) lastIncoming = System.currentTimeMillis()
                 runCatching { MeshLink(node).run(input, output, initiator) }
-                    .onSuccess { log("обмін з $who: надіслано ${it.sent}, отримано ${it.received}, підтверджено ${it.delivered}") }
+                    .onSuccess {
+                        log("обмін з $who: надіслано ${it.sent}, отримано ${it.received}, підтверджено ${it.delivered}" + if (it.carried > 0) ", взято нести ${it.carried}" else "")
+                        // Узяв чужі — якщо інтернет є, одразу на сервер (шлюз).
+                        if (it.carried > 0) scope.launch { runCatching { repo.uploadCarried() }.onSuccess { n -> if (n > 0) log("шлюз: передано на сервер $n") } }
+                    }
                     .onFailure { log("обмін з $who не вдався: ${it.javaClass.simpleName} ${it.message ?: ""}") }
             } finally {
                 exchangeLock.unlock()

@@ -95,7 +95,7 @@ data class Message(
 private const val COLS = "id, peer, out, text, at, kind, voice_mime, voice_dur, voice, mid, sender, reactions, status, dlv, rd, seen, re"
 
 /** Контакти, історія, дрібні налаштування — локальна SQLite у приватній теці застосунку. */
-class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 7) {
+class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 8) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE contacts(identity TEXT PRIMARY KEY, name TEXT NOT NULL, fingerprint TEXT NOT NULL, avatar TEXT)")
         db.execSQL(
@@ -107,6 +107,13 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 7) {
         db.execSQL("CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT)")
         createV3(db)
         createV7(db)
+        createV8(db)
+    }
+
+    /** Mesh, етап 3–4: пакет для шлюзу в моїх конвертах і чужі конверти, які несу далі. */
+    private fun createV8(db: SQLiteDatabase) {
+        db.execSQL("ALTER TABLE mesh_out ADD COLUMN gw BLOB")
+        db.execSQL("CREATE TABLE mesh_relay(id TEXT PRIMARY KEY, tag BLOB NOT NULL, exp INTEGER NOT NULL, body BLOB NOT NULL, gw BLOB, size INTEGER NOT NULL, at INTEGER NOT NULL)")
     }
 
     /** Mesh: мої конверти, що чекають на телефон поруч (peer — кому, chat — у якій бесіді повідомлення). */
@@ -137,6 +144,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 7) {
         }
         if (oldVersion < 6) db.execSQL("ALTER TABLE messages ADD COLUMN re TEXT")
         if (oldVersion < 7) createV7(db)
+        if (oldVersion < 8) createV8(db)
     }
 
     fun contacts(): List<Contact> = readableDatabase.rawQuery(
@@ -176,6 +184,8 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 7) {
         val rows = readableDatabase.rawQuery(
             "SELECT id, dlv, rd FROM messages WHERE peer = ? AND out = 1 AND mid IN ($marks)", arrayOf(peer, *mids.toTypedArray()),
         ).use { c -> generateSequence { if (c.moveToNext()) Triple(c.getLong(0), ids(c.getString(1)), ids(c.getString(2))) else null }.toList() }
+        // Дійшло (через сервер чи шлюз) — конверт для телефонів поруч більше не потрібен.
+        writableDatabase.delete("mesh_out", "chat = ? AND peer = ? AND mid IN ($marks)", arrayOf(peer, who, *mids.toTypedArray()))
         var changed = false
         for ((id, dlv, rd) in rows) {
             val d = dlv + who
@@ -298,6 +308,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 7) {
         writableDatabase.execSQL("DELETE FROM groups")
         writableDatabase.execSQL("DELETE FROM channels")
         writableDatabase.execSQL("DELETE FROM mesh_out")
+        writableDatabase.execSQL("DELETE FROM mesh_relay")
     }
 
     // ---------- mesh ----------
@@ -306,15 +317,15 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 7) {
 
     fun addMeshOut(peer: String, chat: String, mid: String?, env: io.github.ya77papa.shepit.mesh.MeshEnvelope) {
         writableDatabase.insertWithOnConflict("mesh_out", null, ContentValues().apply {
-            put("id", env.id); put("peer", peer); put("chat", chat); put("mid", mid); put("tag", env.tag); put("exp", env.expires); put("body", env.body)
+            put("id", env.id); put("peer", peer); put("chat", chat); put("mid", mid); put("tag", env.tag); put("exp", env.expires); put("body", env.body); put("gw", env.gw)
         }, SQLiteDatabase.CONFLICT_IGNORE)
     }
 
     /** Ще чинні; прострочені прибираємо (повертаємо їхні повідомлення, щоб позначити «не надіслано»). */
     fun meshOut(now: Long): Pair<List<MeshOut>, List<MeshOut>> {
-        val all = readableDatabase.rawQuery("SELECT id, peer, chat, mid, tag, exp, body FROM mesh_out", null).use { c ->
+        val all = readableDatabase.rawQuery("SELECT id, peer, chat, mid, tag, exp, body, gw FROM mesh_out", null).use { c ->
             generateSequence {
-                if (c.moveToNext()) MeshOut(c.getString(0), c.getString(1), c.getString(2), c.getString(3), io.github.ya77papa.shepit.mesh.MeshEnvelope(c.getBlob(4), c.getLong(5), c.getBlob(6))) else null
+                if (c.moveToNext()) MeshOut(c.getString(0), c.getString(1), c.getString(2), c.getString(3), io.github.ya77papa.shepit.mesh.MeshEnvelope(c.getBlob(4), c.getLong(5), c.getBlob(6), c.getBlob(7))) else null
             }.toList()
         }
         val (live, dead) = all.partition { it.env.expires > now }
@@ -330,6 +341,34 @@ class Db(context: Context) : SQLiteOpenHelper(context, "shepit.db", null, 7) {
 
     fun meshOutCount(chat: String, mid: String): Int =
         readableDatabase.rawQuery("SELECT COUNT(*) FROM mesh_out WHERE chat = ? AND mid = ?", arrayOf(chat, mid)).use { it.moveToFirst(); it.getInt(0) }
+
+    /** Чужі конверти, які несу: усі чинні (прострочені — прибрати). */
+    fun relay(now: Long): List<io.github.ya77papa.shepit.mesh.MeshEnvelope> {
+        writableDatabase.delete("mesh_relay", "exp <= ?", arrayOf(now.toString()))
+        return readableDatabase.rawQuery("SELECT tag, exp, body, gw FROM mesh_relay ORDER BY at", null).use { c ->
+            generateSequence { if (c.moveToNext()) io.github.ya77papa.shepit.mesh.MeshEnvelope(c.getBlob(0), c.getLong(1), c.getBlob(2), c.getBlob(3)) else null }.toList()
+        }
+    }
+
+    fun relaySize(): Long = readableDatabase.rawQuery("SELECT COALESCE(SUM(size), 0) FROM mesh_relay", null).use { it.moveToFirst(); it.getLong(0) }
+
+    fun relayCount(): Int = readableDatabase.rawQuery("SELECT COUNT(*) FROM mesh_relay", null).use { it.moveToFirst(); it.getInt(0) }
+
+    fun hasMesh(id: String): Boolean =
+        readableDatabase.rawQuery("SELECT 1 FROM mesh_relay WHERE id = ? UNION SELECT 1 FROM mesh_out WHERE id = ?", arrayOf(id, id)).use { it.moveToFirst() }
+
+    fun addRelay(env: io.github.ya77papa.shepit.mesh.MeshEnvelope) {
+        writableDatabase.insertWithOnConflict("mesh_relay", null, ContentValues().apply {
+            put("id", env.id); put("tag", env.tag); put("exp", env.expires); put("body", env.body); put("gw", env.gw)
+            put("size", env.size); put("at", System.currentTimeMillis())
+        }, SQLiteDatabase.CONFLICT_IGNORE)
+    }
+
+    fun deleteRelay(ids: List<String>) {
+        ids.forEach { writableDatabase.delete("mesh_relay", "id = ?", arrayOf(it)) }
+    }
+
+    fun clearRelay() = writableDatabase.delete("mesh_relay", null, null)
 
     fun markFailed(chat: String, mid: String) {
         writableDatabase.update("messages", ContentValues().apply { put("status", "failed") }, "peer = ? AND mid = ? AND out = 1 AND status = 'mesh'", arrayOf(chat, mid))

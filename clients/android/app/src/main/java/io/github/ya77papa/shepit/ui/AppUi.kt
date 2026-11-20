@@ -1320,6 +1320,25 @@ private fun MeshSection(app: ShepitApp, act: MainActivity, toast: (String) -> Un
             }
         }
     }
+    if (on) Section("Передавати чужі повідомлення") {
+        var policy by remember { mutableStateOf(repo.relayPolicy) }
+        Text("Телефон може брати чужі зашифровані повідомлення й нести їх далі — до адресата або до телефона з інтернетом. Прочитати їх він не може.", color = Muted, fontSize = 12.sp)
+        listOf(
+            "contacts" to "Лише від моїх контактів",
+            "all" to "Від усіх (допомагати всім поруч)",
+            "off" to "Не передавати",
+        ).forEach { (v, label) ->
+            Row(
+                Modifier.fillMaxWidth().clickable { repo.relayPolicy = v; policy = v },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                androidx.compose.material3.RadioButton(selected = policy == v, onClick = { repo.relayPolicy = v; policy = v })
+                Text(label)
+            }
+        }
+        val carrying = remember(nearby, policy) { repo.relayCount() }
+        if (policy != "off") Text("Зараз несу чужих повідомлень: $carrying (до 20 МБ, до 7 днів)", color = Muted, fontSize = 12.sp)
+    }
     if (on) Section("Журнал (для діагностики)") {
         val log by app.mesh.log.collectAsState()
         val locOn = remember { runCatching { androidx.core.location.LocationManagerCompat.isLocationEnabled(ctx.getSystemService(android.location.LocationManager::class.java)) }.getOrDefault(true) }
@@ -1339,7 +1358,9 @@ private fun MeshSection(app: ShepitApp, act: MainActivity, toast: (String) -> Un
                 "• Текст, голосові й фото; у групах — кожному учаснику окремо.\n" +
                 "• Повідомлення доходить, коли телефон адресата опиниться поруч (до ~30–100 м по Bluetooth або в тій самій Wi-Fi мережі). Чекає до 7 днів.\n" +
                 "• Коли з'явиться інтернет, те, що ще не дійшло, піде звичайним шляхом.\n" +
-                "• Чужі телефони повідомлень не несуть — естафета буде пізніше.\n" +
+                "• Якщо поруч телефон з інтернетом, він передасть повідомлення на сервер — і воно дійде адресатові будь-де.\n" +
+                "• Повідомлення може передаватися естафетою: телефон поруч візьме його й передасть, коли зустріне адресата або інтернет.\n" +
+                "• Щоб це працювало, хоч раз відкрий Шепіт з інтернетом після оновлення.\n" +
                 "• Пошук через Bluetooth витрачає батарею — вмикай, коли зв'язку немає.",
             fontSize = 13.sp,
         )
