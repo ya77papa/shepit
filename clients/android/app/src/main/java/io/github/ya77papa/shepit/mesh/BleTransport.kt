@@ -34,6 +34,7 @@ class BleTransport(private val ctx: Context, private val runner: MeshRunner) {
     private var advertising: AdvertiseCallback? = null
     private var scanning: ScanCallback? = null
     private var scanningAll: ScanCallback? = null
+    private var scanningData: ScanCallback? = null
     /** Для журналу: скільки різних Bluetooth-пристроїв і скільки з Шепотом бачили за 30 с. */
     private val seenAny = ConcurrentHashMap.newKeySet<String>()
     private val seenOurs = ConcurrentHashMap.newKeySet<String>()
@@ -62,11 +63,30 @@ class BleTransport(private val ctx: Context, private val runner: MeshRunner) {
         scope.launch {
             while (isActive) {
                 val s = runCatching { ss.accept() }.getOrNull() ?: break
-                launch { s.use { runner.exchange(it.inputStream, it.outputStream, initiator = false, who = "ble:" + it.remoteDevice.address) } }
+                launch { s.use { runner.exchange(it.inputStream, it.outputStream, initiator = false, who = "ble:" + it.remoteDevice.address) { runCatching { s.close() } } } }
             }
         }
         advertise(ss.psm)
         scan()
+        // Android притишує тривалий пошук (через 30 хв, при вимкненому екрані) — перезапускаємо
+        // раз на 2 хв (ліміт системи — 5 запусків за 30 с, тут 3 за 2 хв).
+        scope.launch {
+            while (isActive) {
+                kotlinx.coroutines.delay(120_000)
+                stopScans()
+                scan()
+            }
+        }
+        // Нове повідомлення в черзі — одразу пробувати всіх, кого видно, не чекаючи 30 с.
+        scope.launch { runner.pokes.collect { lastTry.entries.removeIf { !it.key.startsWith("raw:") } } }
+    }
+
+    private fun stopScans() {
+        val sc = adapter?.bluetoothLeScanner
+        runCatching { scanning?.let { sc?.stopScan(it) } }
+        runCatching { scanningAll?.let { sc?.stopScan(it) } }
+        runCatching { scanningData?.let { sc?.stopScan(it) } }
+        scanning = null; scanningAll = null; scanningData = null
     }
 
     private fun advertise(psm: Int) {
@@ -100,23 +120,28 @@ class BleTransport(private val ctx: Context, private val runner: MeshRunner) {
         val cb = callback("фільтр")
         scanning = cb
         runCatching { scanner.startScan(listOf(ScanFilter.Builder().setServiceUuid(SERVICE).build()), settings, cb) }
-            .onSuccess { runner.log("Bluetooth: шукаю (з фільтром)") }
             .onFailure { runner.log("Bluetooth: пошук з фільтром: ${it.message}") }
+        // Те саме, але фільтр за даними служби — деякі чипи вміють лише такий.
+        val byData = callback("дані")
+        scanningData = byData
+        runCatching { scanner.startScan(listOf(ScanFilter.Builder().setServiceData(SERVICE, ByteArray(0), ByteArray(0)).build()), settings, byData) }
+            .onFailure { runner.log("Bluetooth: пошук за даними: ${it.message}") }
         // 2) Без фільтра, перевірка в коді: частина чипів не вміє апаратно фільтрувати чужі служби.
         //    Android віддає такі результати лише при увімкненому екрані — для того й перший.
         val all = callback("усі")
         scanningAll = all
         runCatching { scanner.startScan(null, settings, all) }
-            .onSuccess { runner.log("Bluetooth: шукаю (усі пристрої)") }
             .onFailure { runner.log("Bluetooth: пошук усіх: ${it.message}") }
-        scope?.launch {
+        runner.log("Bluetooth: шукаю")
+        if (reporter?.isActive != true) reporter = scope?.launch {
             while (isActive) {
-                kotlinx.coroutines.delay(30_000)
-                runner.log("Bluetooth: за 30 с бачу пристроїв ${seenAny.size}, із Шепотом ${seenOurs.size}")
+                kotlinx.coroutines.delay(60_000)
+                runner.log("Bluetooth: за хвилину бачу пристроїв ${seenAny.size}, із Шепотом ${seenOurs.size}")
                 seenAny.clear(); seenOurs.clear()
             }
         }
     }
+    private var reporter: kotlinx.coroutines.Job? = null
 
     private fun found(r: ScanResult) {
         seenAny += r.device.address
@@ -142,15 +167,15 @@ class BleTransport(private val ctx: Context, private val runner: MeshRunner) {
             if (Build.VERSION.SDK_INT < 29) return@launch
             val sock = runCatching { r.device.createInsecureL2capChannel(psm).apply { connect() } }
                 .getOrElse { runner.log("Bluetooth: не вдалося з'єднатися з $who: ${it.message}"); return@launch }
-            sock.use { runner.exchange(it.inputStream, it.outputStream, initiator = true, who = who) }
+            sock.use { runner.exchange(it.inputStream, it.outputStream, initiator = true, who = who) { runCatching { sock.close() } } }
         }
     }
 
     fun stop() {
         runCatching { advertising?.let { adapter?.bluetoothLeAdvertiser?.stopAdvertising(it) } }
-        runCatching { scanning?.let { adapter?.bluetoothLeScanner?.stopScan(it) } }
-        runCatching { scanningAll?.let { adapter?.bluetoothLeScanner?.stopScan(it) } }
-        advertising = null; scanning = null; scanningAll = null
+        stopScans()
+        reporter?.cancel(); reporter = null
+        advertising = null
         seenAny.clear(); seenOurs.clear()
         runCatching { server?.close() }
         server = null

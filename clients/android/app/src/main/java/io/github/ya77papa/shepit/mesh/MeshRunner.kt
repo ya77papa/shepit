@@ -84,14 +84,40 @@ class MeshRunner(private val ctx: Context, private val repo: Repo) {
         repo.meshNearby.value = seen.size
     }
 
-    /** Обмін через готовий потік. [who] — стабільний для цього телефона ідентифікатор транспорту. */
-    suspend fun exchange(input: InputStream, output: OutputStream, initiator: Boolean, who: String) {
+    /**
+     * Обмін через готовий потік. [who] — ідентифікатор телефона для журналу й лічильника.
+     * [close] закриває з'єднання: у Bluetooth-сокетів немає тайм-ауту, тож завислий обмін
+     * (телефон відійшов) ми обриваємо самі — інакше він тримав би чергу обмінів назавжди.
+     */
+    suspend fun exchange(input: InputStream, output: OutputStream, initiator: Boolean, who: String, close: () -> Unit) {
         noticed(who)
-        exchangeLock.withLock {
-            runCatching { MeshLink(node).run(input, output, initiator) }
-                .onSuccess { log("обмін з $who: надіслано ${it.sent}, отримано ${it.received}, підтверджено ${it.delivered}") }
-                .onFailure { log("обмін з $who не вдався: ${it.javaClass.simpleName} ${it.message ?: ""}") }
+        val watchdog = scope.launch {
+            delay(EXCHANGE_TIMEOUT_MS)
+            log("обмін з $who: завис, обриваю")
+            runCatching { close() }
         }
+        try {
+            // Інший обмін триває надто довго — не чекати, спробуємо наступного разу.
+            if (kotlinx.coroutines.withTimeoutOrNull(15_000) { exchangeLock.lock() } == null) {
+                log("обмін з $who: зайнято, пізніше")
+                runCatching { close() }
+                return
+            }
+            try {
+                runCatching { MeshLink(node).run(input, output, initiator) }
+                    .onSuccess { log("обмін з $who: надіслано ${it.sent}, отримано ${it.received}, підтверджено ${it.delivered}") }
+                    .onFailure { log("обмін з $who не вдався: ${it.javaClass.simpleName} ${it.message ?: ""}") }
+            } finally {
+                exchangeLock.unlock()
+            }
+        } finally {
+            watchdog.cancel()
+        }
+    }
+
+    companion object {
+        /** Найдовший обмін: фото по Bluetooth із запасом. */
+        const val EXCHANGE_TIMEOUT_MS = 45_000L
     }
 
     /** Нові конверти в черзі — транспортам варто пройтись по відомих телефонах. */

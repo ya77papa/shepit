@@ -70,7 +70,7 @@ class LanTransport(private val ctx: Context, private val runner: MeshRunner) {
     private suspend fun handle(s: Socket, initiator: Boolean, who: String) {
         s.use {
             it.soTimeout = 20_000
-            runner.exchange(it.getInputStream(), it.getOutputStream(), initiator, who)
+            runner.exchange(it.getInputStream(), it.getOutputStream(), initiator, who) { runCatching { it.close() } }
         }
     }
 
